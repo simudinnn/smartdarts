@@ -539,46 +539,33 @@ def _map_hint_to_display(
     return hx, hy
 
 
-def _draw_ellipse_hint_marker(img: np.ndarray, x: float, y: float, n: int) -> None:
-    """Numbered orange marker on the outer-ellipse rim."""
+def _draw_ellipse_hint_marker(img: np.ndarray, x: float, y: float) -> None:
+    """Orange rim marker — click target is the centre, not a label."""
     cx, cy = int(round(x)), int(round(y))
     h, w = img.shape[:2]
     if cx < 0 or cy < 0 or cx >= w or cy >= h:
         return
     color = (40, 90, 255)
-    r = max(8, int(min(h, w) * 0.032))
+    r = max(7, int(min(h, w) * 0.028))
     cv2.circle(img, (cx, cy), r, color, 2, cv2.LINE_AA)
     cv2.circle(img, (cx, cy), 3, color, -1, cv2.LINE_AA)
-    label = str(int(n))
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-    tx = min(w - tw - 2, max(2, cx + r + 2))
-    ty = min(h - 2, max(th + 2, cy - r))
-    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
 
 
 def _draw_ellipse_hint_preview(img: np.ndarray, points: List[Tuple[float, float]]) -> None:
-    """Hull + fitted ellipse from 3–4 display-space rim clicks."""
-    if len(points) < 2:
-        return
-    color = (40, 90, 255)
-    arr = np.array(points, dtype=np.float32)
-    try:
-        hull = cv2.convexHull(arr.reshape(-1, 1, 2)).reshape(-1, 2)
-    except cv2.error:
-        hull = arr
-    pts_i = [(int(round(p[0])), int(round(p[1]))) for p in hull]
-    for a, b in zip(pts_i, pts_i[1:] + pts_i[:1]):
-        cv2.line(img, a, b, color, 1, cv2.LINE_AA)
+    """Ellipse through the clicked rim points (no chords)."""
     if len(points) < 3:
         return
     try:
         from board_calibration import _ellipse_from_hint_points
 
         h, w = img.shape[:2]
-        ell = _ellipse_from_hint_points([(float(p[0]), float(p[1])) for p in points], float(min(h, w)))
+        ell = _ellipse_from_hint_points(
+            [(float(p[0]), float(p[1])) for p in points],
+            float(min(h, w)),
+            strict=False,
+        )
         if ell is not None:
-            cv2.ellipse(img, ell, color, 2, cv2.LINE_AA)
+            cv2.ellipse(img, ell, (40, 90, 255), 2, cv2.LINE_AA)
     except Exception:
         pass
 
@@ -727,11 +714,12 @@ def build_calibration_view(
             for p in (ell_pts or [])
             if p is not None and len(p) >= 2
         ][:4]
+        show_ell = bool(click_ellipse_mode) and bool(ell_pts)
 
         if frame is not None:
             # Draw hints on a copy of the displayed frame (scale if overlay size ≠ capture).
             draw_src = frame
-            if hint_pt is not None or ell_pts:
+            if hint_pt is not None or show_ell:
                 draw_src = frame.copy()
                 if hint_pt is not None:
                     hx, hy = _map_hint_to_display(
@@ -743,9 +731,9 @@ def build_calibration_view(
                         raw_frame,
                     )
                     _draw_bull_hint_marker(draw_src, hx, hy)
-                if ell_pts:
+                if show_ell:
                     mapped_ell: List[Tuple[float, float]] = []
-                    for ei, (ex, ey) in enumerate(ell_pts):
+                    for ex, ey in ell_pts:
                         mx, my = _map_hint_to_display(
                             board_calibrator,
                             int(cam_idx),
@@ -755,8 +743,9 @@ def build_calibration_view(
                             raw_frame,
                         )
                         mapped_ell.append((mx, my))
-                        _draw_ellipse_hint_marker(draw_src, mx, my, ei + 1)
                     _draw_ellipse_hint_preview(draw_src, mapped_ell)
+                    for mx, my in mapped_ell:
+                        _draw_ellipse_hint_marker(draw_src, mx, my)
             fh, fw = draw_src.shape[:2]
             scale = min(cell_w / float(fw), video_h / float(fh))
             nw = max(1, int(fw * scale))

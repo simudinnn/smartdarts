@@ -332,18 +332,15 @@ class KioskSession:
                     f"[dart] DETEKTIRAJ: stvarno bez kadra (USB/open/read): {no_signal}",
                     flush=True,
                 )
-            # Auto-uključi KLIKNI BULL da se hints mogu upisati bez dodatnog klika.
-            self.ctx["_cal_click_bull_mode"] = True
-            self.ctx["_cal_click_ellipse_mode"] = False
             print(
-                "[dart] DETEKTIRAJ: uključen KLIKNI BULL — klikni bull po kameri, pa opet KALIBRIRAJ",
+                "[dart] DETEKTIRAJ: nepotpuna — klikni BULL ili ELIPSA pa opet KALIBRIRAJ",
                 flush=True,
             )
         else:
             self.ctx["_dart_status"] = f"REF {n_ref} cam" if n_ref > 0 else "REF FAIL"
-            # Full success → clear manual bull seeds.
             self.ctx["bull_hints"] = {}
-            self.ctx["_cal_click_bull_mode"] = False
+        self.ctx["_cal_click_bull_mode"] = False
+        self.ctx["_cal_click_ellipse_mode"] = False
         if n_ref > 0:
             self.ctx["_dart_no_empty_ref_warned"] = False
         print(f"[dart] DETEKTIRAJ: kalibracija + ref ({n_ref} cam)", flush=True)
@@ -1169,12 +1166,18 @@ class KioskSession:
         if prev == "playing":
             self.resume_live_motion_after_pause()
 
+    def _cal_topdown_on(self) -> bool:
+        board_cal = self.ctx.get("board_calibrator")
+        return bool(board_cal is not None and getattr(board_cal, "show_topdown", False))
+
     def clear_bull_hints(self) -> None:
         self.ctx["bull_hints"] = {}
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_last_tick"] = 0.0
 
     def toggle_cal_click_bull_mode(self) -> None:
+        if self._cal_topdown_on():
+            return
         on = not bool(self.ctx.get("_cal_click_bull_mode"))
         self.ctx["_cal_click_bull_mode"] = on
         if on:
@@ -1186,6 +1189,8 @@ class KioskSession:
         )
 
     def toggle_cal_click_ellipse_mode(self) -> None:
+        if self._cal_topdown_on():
+            return
         on = not bool(self.ctx.get("_cal_click_ellipse_mode"))
         self.ctx["_cal_click_ellipse_mode"] = on
         if on:
@@ -1560,6 +1565,8 @@ class KioskSession:
                 board_cal.show_topdown = not board_cal.show_topdown
                 if board_cal.show_topdown:
                     board_cal.show_overlay = True
+                    self.ctx["_cal_click_bull_mode"] = False
+                    self.ctx["_cal_click_ellipse_mode"] = False
                 self.ctx["_cal_last_tick"] = 0.0
             return
         if bid.startswith("calibration_seg20_left_"):
@@ -1910,8 +1917,8 @@ class KioskSession:
             status = "Otvaranje kamera..."
         buttons: list = []
         tiles: list = []
-        click_bull = bool(self.ctx.get("_cal_click_bull_mode"))
-        click_ell = bool(self.ctx.get("_cal_click_ellipse_mode"))
+        click_bull = bool(self.ctx.get("_cal_click_bull_mode")) and not self._cal_topdown_on()
+        click_ell = bool(self.ctx.get("_cal_click_ellipse_mode")) and not self._cal_topdown_on()
         banner = ""
         if click_bull:
             try:
@@ -1952,7 +1959,7 @@ class KioskSession:
 
         bull_mode = bool(self.ctx.get("_cal_click_bull_mode"))
         ell_mode = bool(self.ctx.get("_cal_click_ellipse_mode"))
-        if not bull_mode and not ell_mode:
+        if self._cal_topdown_on() or (not bull_mode and not ell_mode):
             return
 
         tiles = self.ctx.get("_cal_tiles") or []
@@ -2366,8 +2373,14 @@ class KioskSession:
                 "device_id": get_settings().device_id,
                 "league_qr_enabled": get_settings().league_qr_enabled,
             },
-            "cal_click_bull_mode": bool(self.ctx.get("_cal_click_bull_mode")),
-            "cal_click_ellipse_mode": bool(self.ctx.get("_cal_click_ellipse_mode")),
+            "cal_click_bull_mode": bool(self.ctx.get("_cal_click_bull_mode"))
+            and not bool(
+                getattr(self.ctx.get("board_calibrator"), "show_topdown", False)
+            ),
+            "cal_click_ellipse_mode": bool(self.ctx.get("_cal_click_ellipse_mode"))
+            and not bool(
+                getattr(self.ctx.get("board_calibrator"), "show_topdown", False)
+            ),
             "cal_show_topdown": bool(
                 getattr(self.ctx.get("board_calibrator"), "show_topdown", False)
             ),

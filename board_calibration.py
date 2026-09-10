@@ -224,30 +224,61 @@ def _resample_polyline(pts: np.ndarray, n: int) -> np.ndarray:
 def _ellipse_from_hint_points(
     points: List[Tuple[float, float]],
     min_dim: float,
+    *,
+    strict: bool = True,
 ) -> Optional[Ellipse]:
-    """Gruba vanjska elipsa iz 3–4 ručnih točaka (hull + fitEllipse)."""
-    if len(points) < 3:
+    """Elipsa kroz 3–4 ručne točke na vanjskom rubu (ne kroz tetive)."""
+    pts = [
+        (float(p[0]), float(p[1]))
+        for p in points
+        if p is not None and len(p) >= 2
+    ]
+    if len(pts) < 3:
         return None
-    arr = np.array(points, dtype=np.float32)
+    arr = np.array(pts, dtype=np.float32)
     try:
         hull = cv2.convexHull(arr.reshape(-1, 1, 2)).reshape(-1, 2)
     except cv2.error:
         hull = arr
     if hull is None or len(hull) < 3:
         return None
-    sampled = _resample_polyline(hull, 24)
-    if sampled is None or len(sampled) < 5:
-        return None
+    center = hull.mean(axis=0)
+    extras: List[np.ndarray] = []
+    n = len(hull)
+    for i in range(n):
+        a = hull[i]
+        b = hull[(i + 1) % n]
+        ra = float(np.linalg.norm(a - center))
+        rb = float(np.linalg.norm(b - center))
+        mid = (a + b) * 0.5
+        vm = mid - center
+        rm = float(np.linalg.norm(vm))
+        if rm < 1e-3:
+            continue
+        # Točka na luku (isti radijus kao vrhovi), ne na tetivi unutar elipse.
+        extras.append(center + vm * ((0.5 * (ra + rb)) / rm))
+    stacked = np.repeat(hull, 12, axis=0)
+    if extras:
+        stacked = np.vstack([stacked, np.asarray(extras, dtype=np.float32)])
+    if len(stacked) < 5:
+        stacked = np.repeat(hull, 5, axis=0)
     try:
-        ellipse = cv2.fitEllipse(sampled.reshape(-1, 1, 2))
+        ellipse = cv2.fitEllipse(stacked.reshape(-1, 1, 2))
     except cv2.error:
         return None
+    ners = [normalized_ellipse_radius(ellipse, float(p[0]), float(p[1])) for p in pts]
+    mean_n = float(sum(ners) / max(1, len(ners)))
+    if mean_n > 1e-4:
+        ellipse = _scale_ellipse_axes(ellipse, mean_n)
     (_ecx, _ecy), (ew, eh), _ang = ellipse
     semi_max = 0.5 * max(float(ew), float(eh))
     semi_min = 0.5 * min(float(ew), float(eh))
-    if semi_max < min_dim * 0.10 or semi_max > min_dim * 1.25:
-        return None
-    if semi_min < min_dim * 0.06:
+    if strict:
+        if semi_max < min_dim * 0.10 or semi_max > min_dim * 1.25:
+            return None
+        if semi_min < min_dim * 0.06:
+            return None
+    elif semi_max < 4.0 or semi_min < 2.0:
         return None
     return ellipse
 

@@ -3635,15 +3635,17 @@ def main():
                     f"[dart] DETEKTIRAJ: stvarno bez kadra (USB/open/read): {no_signal}",
                     flush=True,
                 )
-            gui_ctx["_cal_click_bull_mode"] = True
+            gui_ctx["_cal_click_bull_mode"] = False
+            gui_ctx["_cal_click_ellipse_mode"] = False
             print(
-                "[dart] DETEKTIRAJ: uključen KLIKNI BULL — klikni bull po kameri, pa opet KALIBRIRAJ",
+                "[dart] DETEKTIRAJ: nepotpuna — klikni BULL ili ELIPSA pa opet KALIBRIRAJ",
                 flush=True,
             )
         else:
             gui_ctx["_dart_status"] = f"REF {n_ref} cam" if n_ref > 0 else "REF FAIL"
             gui_ctx["bull_hints"] = {}
             gui_ctx["_cal_click_bull_mode"] = False
+            gui_ctx["_cal_click_ellipse_mode"] = False
         if n_ref > 0:
             gui_ctx["_dart_no_empty_ref_warned"] = False
         print(f"[dart] DETEKTIRAJ: kalibracija + ref ({n_ref} cam)", flush=True)
@@ -4336,6 +4338,9 @@ def main():
                 _run_calibration_detect()
                 return
             if bid == "calibration_click_bull":
+                board_cal = gui_ctx.get("board_calibrator")
+                if board_cal is not None and bool(getattr(board_cal, "show_topdown", False)):
+                    return
                 _click_sound()
                 on = not bool(gui_ctx.get("_cal_click_bull_mode"))
                 gui_ctx["_cal_click_bull_mode"] = on
@@ -4344,6 +4349,9 @@ def main():
                 gui_ctx["_cal_last_tick"] = 0.0
                 return
             if bid in ("calibration_click_ellipse", "calibration_overlay"):
+                board_cal = gui_ctx.get("board_calibrator")
+                if board_cal is not None and bool(getattr(board_cal, "show_topdown", False)):
+                    return
                 _click_sound()
                 on = not bool(gui_ctx.get("_cal_click_ellipse_mode"))
                 gui_ctx["_cal_click_ellipse_mode"] = on
@@ -4358,6 +4366,8 @@ def main():
                     board_cal.show_topdown = not board_cal.show_topdown
                     if board_cal.show_topdown:
                         board_cal.show_overlay = True
+                        gui_ctx["_cal_click_bull_mode"] = False
+                        gui_ctx["_cal_click_ellipse_mode"] = False
                     gui_ctx["_cal_last_tick"] = 0.0
                 return
             if bid.startswith("calibration_seg20_left_"):
@@ -4605,8 +4615,14 @@ def main():
                 return
 
         # Manual bull / ellipse seed on calibration camera preview
-        if gui_state.get("screen") == "calibration" and (
-            gui_ctx.get("_cal_click_bull_mode") or gui_ctx.get("_cal_click_ellipse_mode")
+        board_cal_click = gui_ctx.get("board_calibrator")
+        topdown_on = bool(
+            board_cal_click is not None and getattr(board_cal_click, "show_topdown", False)
+        )
+        if (
+            gui_state.get("screen") == "calibration"
+            and not topdown_on
+            and (gui_ctx.get("_cal_click_bull_mode") or gui_ctx.get("_cal_click_ellipse_mode"))
         ):
             for tile in gui_ctx.get("_cal_tiles") or []:
                 vx1, vy1, vx2, vy2 = tile["video_rect"]
@@ -4997,8 +5013,12 @@ def main():
                         board_cal = gui_ctx.get("board_calibrator")
                         cal_buttons: List[dict] = []
                         cal_tiles: List[dict] = []
-                        click_bull = bool(gui_ctx.get("_cal_click_bull_mode"))
-                        click_ell = bool(gui_ctx.get("_cal_click_ellipse_mode"))
+                        click_bull = bool(gui_ctx.get("_cal_click_bull_mode")) and not bool(
+                            getattr(board_cal, "show_topdown", False)
+                        )
+                        click_ell = bool(gui_ctx.get("_cal_click_ellipse_mode")) and not bool(
+                            getattr(board_cal, "show_topdown", False)
+                        )
                         banner = ""
                         if click_bull:
                             try:
@@ -5134,6 +5154,8 @@ def main():
                         board_cal.show_topdown = not board_cal.show_topdown
                         if board_cal.show_topdown:
                             board_cal.show_overlay = True
+                            gui_ctx["_cal_click_bull_mode"] = False
+                            gui_ctx["_cal_click_ellipse_mode"] = False
                         gui_ctx["_cal_last_tick"] = 0.0
                 elif gui_state.get("screen") == "calibration" and key == ord("t"):
                     board_cal = gui_ctx.get("board_calibrator")
@@ -5141,13 +5163,19 @@ def main():
                         board_cal.show_topdown = not board_cal.show_topdown
                         if board_cal.show_topdown:
                             board_cal.show_overlay = True
+                            gui_ctx["_cal_click_bull_mode"] = False
+                            gui_ctx["_cal_click_ellipse_mode"] = False
                         gui_ctx["_cal_last_tick"] = 0.0
                 elif gui_state.get("screen") == "calibration" and key == ord("o"):
-                    on = not bool(gui_ctx.get("_cal_click_ellipse_mode"))
-                    gui_ctx["_cal_click_ellipse_mode"] = on
-                    if on:
-                        gui_ctx["_cal_click_bull_mode"] = False
-                    gui_ctx["_cal_last_tick"] = 0.0
+                    board_cal = gui_ctx.get("board_calibrator")
+                    if board_cal is not None and bool(getattr(board_cal, "show_topdown", False)):
+                        pass
+                    else:
+                        on = not bool(gui_ctx.get("_cal_click_ellipse_mode"))
+                        gui_ctx["_cal_click_ellipse_mode"] = on
+                        if on:
+                            gui_ctx["_cal_click_bull_mode"] = False
+                        gui_ctx["_cal_last_tick"] = 0.0
                 elif gui_state.get("screen") == "playing" and key == ord("d"):
                     _try_auto_detect_dart(force_log=True)
                 elif args.kiosk:

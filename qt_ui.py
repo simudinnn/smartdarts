@@ -6862,12 +6862,15 @@ class MainWindow(QMainWindow):
         if screen == "playing":
             self._refresh_playing(snap)
 
-    def _style_cal_toggle(self, btn, on: bool) -> None:
-        role = "Accent" if on else "Footer"
+    def _style_cal_toggle(self, btn, on: bool, *, enabled: bool = True) -> None:
+        role = "Accent" if (on and enabled) else "Footer"
         btn.setObjectName(role)
+        btn.setEnabled(enabled)
         btn.setStyleSheet(
             f"QPushButton#{role} {{ min-height: 72px; max-height: 80px; "
             f"font-size: 32px; font-weight: 800; padding: 4px 6px; }}"
+            f"QPushButton#{role}:disabled {{ background-color: #222228; "
+            f"color: #666670; border-color: #3a3a40; }}"
         )
         btn.style().unpolish(btn)
         btn.style().polish(btn)
@@ -6880,6 +6883,7 @@ class MainWindow(QMainWindow):
         click_on = bool(snap.get("cal_click_bull_mode"))
         ellipse_on = bool(snap.get("cal_click_ellipse_mode"))
         topdown_on = bool(snap.get("cal_show_topdown"))
+        click_enabled = not topdown_on
         if click_on:
             self.cal_click_banner.setText(t("click_bull_hint"))
         elif ellipse_on:
@@ -6889,10 +6893,10 @@ class MainWindow(QMainWindow):
         self.cal_click_banner.setVisible(click_on or ellipse_on)
         if hasattr(self, "cal_click_bull_btn"):
             self.cal_click_bull_btn.setText(t("click_bull"))
-            self._style_cal_toggle(self.cal_click_bull_btn, click_on)
+            self._style_cal_toggle(self.cal_click_bull_btn, click_on, enabled=click_enabled)
         if hasattr(self, "cal_click_ellipse_btn"):
             self.cal_click_ellipse_btn.setText(t("click_ellipse"))
-            self._style_cal_toggle(self.cal_click_ellipse_btn, ellipse_on)
+            self._style_cal_toggle(self.cal_click_ellipse_btn, ellipse_on, enabled=click_enabled)
         if hasattr(self, "cal_topdown_btn"):
             self._style_cal_toggle(self.cal_topdown_btn, topdown_on)
         if hasattr(self, "cal_label"):
