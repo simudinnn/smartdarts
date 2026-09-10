@@ -790,6 +790,75 @@ def _calibration_to_dict(cam_idx: int, cal: BoardCalibration) -> dict:
     return data
 
 
+def _manual_bull_hints_to_dict(hints: Dict[int, Tuple[float, float]]) -> dict:
+    out: dict = {}
+    for k, v in (hints or {}).items():
+        if v is None or len(v) < 2:
+            continue
+        try:
+            out[str(int(k))] = [float(v[0]), float(v[1])]
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _manual_bull_hints_from_dict(data: object) -> Dict[int, Tuple[float, float]]:
+    out: Dict[int, Tuple[float, float]] = {}
+    if not isinstance(data, dict):
+        return out
+    for k, v in data.items():
+        try:
+            ik = int(k)
+            if v is None or len(v) < 2:
+                continue
+            out[ik] = (float(v[0]), float(v[1]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _manual_ellipse_hints_to_dict(
+    hints: Dict[int, List[Tuple[float, float]]],
+) -> dict:
+    out: dict = {}
+    for k, pts in (hints or {}).items():
+        row: List[List[float]] = []
+        for p in (pts or [])[:4]:
+            if p is None or len(p) < 2:
+                continue
+            row.append([float(p[0]), float(p[1])])
+        if not row:
+            continue
+        try:
+            out[str(int(k))] = row
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _manual_ellipse_hints_from_dict(
+    data: object,
+) -> Dict[int, List[Tuple[float, float]]]:
+    out: Dict[int, List[Tuple[float, float]]] = {}
+    if not isinstance(data, dict):
+        return out
+    for k, pts in data.items():
+        try:
+            ik = int(k)
+        except (TypeError, ValueError):
+            continue
+        row: List[Tuple[float, float]] = []
+        if not isinstance(pts, (list, tuple)):
+            continue
+        for p in pts[:4]:
+            if p is None or len(p) < 2:
+                continue
+            row.append((float(p[0]), float(p[1])))
+        if row:
+            out[ik] = row
+    return out
+
+
 def _calibration_from_dict(data: dict) -> Optional[BoardCalibration]:
     try:
         ellipse: Optional[Ellipse] = None
@@ -2909,23 +2978,16 @@ def enrich_calibration_with_warp_rings(
         di_ratio = float(np.clip(float(s1_bands["double_inner"]) / d_o, 0.88, 0.985))
         ti_ratio = float(np.clip(float(s1_bands["triple_inner"]) / t_o, 0.82, 0.985))
 
-    if not need_s2:
-        print(
-            f"[calib] Stage2 skip (Stage1 OK) D~{d_semi:.1f} oval={_ellipse_ovality(d1):.3f}",
-            flush=True,
-        )
-        src = (float(cx_out), float(cx_out))
-        warp1_d = _circle_as_ellipse(cx_out, cx_out, board_r)
-        warp1_t = None
-    else:
-        mode = "multi" if t1 is not None else "double"
-        print(
-            f"[calib] Stage2 {mode}-align "
-            f"D~{d_semi:.1f} oval={_ellipse_ovality(d1):.3f} "
-            f"src0=({src[0]:.1f},{src[1]:.1f}) bull_off1={bull_off1:.2f} "
-            f"di={di_ratio:.4f} ti={ti_ratio:.4f}",
-            flush=True,
-        )
+    # Uvijek odradi Stage2 (i kad je Stage1 "OK") da KALIBRIRAJ može dotjerati prstene.
+    mode = "multi" if t1 is not None else "double"
+    print(
+        f"[calib] Stage2 {mode}-align "
+        f"D~{d_semi:.1f} oval={_ellipse_ovality(d1):.3f} "
+        f"src0=({src[0]:.1f},{src[1]:.1f}) bull_off1={bull_off1:.2f} "
+        f"di={di_ratio:.4f} ti={ti_ratio:.4f}"
+        f"{'' if need_s2 else ' (Stage1 already close)'}",
+        flush=True,
+    )
 
     # Residual: bull → cx_out, zatim po-kutu D/T elipse da warp sjede na idealne krugove.
     best_score = 1e9
@@ -4824,6 +4886,7 @@ def project_topdown_overlay_onto_frame(
     *,
     out_size: int = DEBUG_WARP_SIZE,
     maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    show_bull_rings: bool = False,
 ) -> np.ndarray:
     """Projiciraj Stage2 topdown overlay (fill+žice+prsteni) natrag na kameru."""
     if frame is None or frame.size == 0 or not cal.is_valid():
@@ -4895,14 +4958,15 @@ def project_topdown_overlay_onto_frame(
         br = max(2, int(round(float(rings["bull_outer"]) * 1.15)))
         _punch_bull_disk(out, before, float(c_pt[0]), float(c_pt[1]), float(br))
 
-    for key in (
-        "bull_inner",
-        "bull_outer",
+    ring_keys = (
         "triple_inner",
         "triple_outer",
         "double_inner",
         "double_outer",
-    ):
+    )
+    if show_bull_rings:
+        ring_keys = ("bull_inner", "bull_outer") + ring_keys
+    for key in ring_keys:
         ell = _fit_cam_ellipse_from_td_ring(
             map_x, map_y, cx_out, cx_out, float(rings[key]), fw=fw, fh=fh
         )
@@ -5248,6 +5312,8 @@ class BoardCalibrator:
         self._last_detect_reasons: Dict[int, str] = {}
         self.show_overlay = True
         self.show_topdown = False
+        self.bull_hints: Dict[int, Tuple[float, float]] = {}
+        self.ellipse_hints: Dict[int, List[Tuple[float, float]]] = {}
         self.load()
 
     def reset(self) -> None:
@@ -5255,6 +5321,8 @@ class BoardCalibrator:
         self._seg20_offsets.clear()
         self._warp_maps.clear()
         self._last_detect_reasons.clear()
+        self.bull_hints.clear()
+        self.ellipse_hints.clear()
 
     def invalidate_warp_cache(self, cam_idx: Optional[int] = None) -> None:
         if cam_idx is None:
@@ -5734,10 +5802,26 @@ class BoardCalibrator:
                         dirty = True
                     self._cals[int(entry["cam_idx"])] = cal
                     self._remember_segment20(int(entry["cam_idx"]), cal)
+            self.bull_hints = _manual_bull_hints_from_dict(payload.get("bull_hints"))
+            self.ellipse_hints = _manual_ellipse_hints_from_dict(payload.get("ellipse_hints"))
             if dirty:
                 self.save(fpath)
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
             pass
+
+    def sync_manual_hints(
+        self,
+        bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
+        ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        if bull_hints is not None:
+            self.bull_hints = _manual_bull_hints_from_dict(bull_hints)
+        if ellipse_hints is not None:
+            self.ellipse_hints = _manual_ellipse_hints_from_dict(ellipse_hints)
+        if persist:
+            self.save()
 
     def save(self, path: Optional[str] = None) -> None:
         fpath = path or calibration_file_path()
@@ -5746,7 +5830,9 @@ class BoardCalibrator:
                 _calibration_to_dict(cam_idx, cal)
                 for cam_idx, cal in sorted(self._cals.items())
                 if cal is not None and cal.is_valid()
-            ]
+            ],
+            "bull_hints": _manual_bull_hints_to_dict(self.bull_hints),
+            "ellipse_hints": _manual_ellipse_hints_to_dict(self.ellipse_hints),
         }
         try:
             with open(fpath, "w", encoding="utf-8") as f:
@@ -5754,7 +5840,12 @@ class BoardCalibrator:
         except OSError:
             pass
 
-    def render_frames(self, frames: Dict[int, Optional[np.ndarray]]) -> Dict[int, Optional[np.ndarray]]:
+    def render_frames(
+        self,
+        frames: Dict[int, Optional[np.ndarray]],
+        *,
+        show_bull_rings: bool = False,
+    ) -> Dict[int, Optional[np.ndarray]]:
         if self.show_topdown:
             return self.render_topdown_frames(frames)
         out: Dict[int, Optional[np.ndarray]] = {}
@@ -5770,7 +5861,7 @@ class BoardCalibrator:
                 maps = self._cached_warp_maps(int(cam_idx), frame)
                 if maps is not None:
                     out[cam_idx] = project_topdown_overlay_onto_frame(
-                        frame, cal, maps=maps
+                        frame, cal, maps=maps, show_bull_rings=show_bull_rings
                     )
                 else:
                     out[cam_idx] = draw_board_overlay(frame, cal)

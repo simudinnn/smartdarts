@@ -2210,6 +2210,12 @@ def main():
         "_cal_click_ellipse_mode": False,
         "editing_hit_slot": None,
     }
+    _bc0 = gui_ctx.get("board_calibrator")
+    if _bc0 is not None:
+        gui_ctx["bull_hints"] = dict(getattr(_bc0, "bull_hints", {}) or {})
+        gui_ctx["ellipse_hints"] = {
+            int(k): list(v) for k, v in (getattr(_bc0, "ellipse_hints", {}) or {}).items()
+        }
 
     # Keep a flat history list for debugging/consistency with camera app behavior.
     all_hits: List[DetectedHit] = []
@@ -3643,7 +3649,6 @@ def main():
             )
         else:
             gui_ctx["_dart_status"] = f"REF {n_ref} cam" if n_ref > 0 else "REF FAIL"
-            gui_ctx["bull_hints"] = {}
             gui_ctx["_cal_click_bull_mode"] = False
             gui_ctx["_cal_click_ellipse_mode"] = False
         if n_ref > 0:
@@ -3748,7 +3753,6 @@ def main():
                 gui_ctx["_clear_board_status"] = get_settings().t("cal_incomplete")
                 print(f"[dart] clear_board: kalibracija nepotpuna — {detail}", flush=True)
                 return
-            gui_ctx["bull_hints"] = {}
             gui_ctx["_cal_click_bull_mode"] = False
             print("[dart] clear_board: ploca ponovo kalibrirana (stable)", flush=True)
         else:
@@ -4672,6 +4676,12 @@ def main():
                         flush=True,
                     )
                 gui_ctx["_cal_last_tick"] = 0.0
+                board_cal_save = gui_ctx.get("board_calibrator")
+                if board_cal_save is not None:
+                    board_cal_save.sync_manual_hints(
+                        dict(gui_ctx.get("bull_hints") or {}),
+                        dict(gui_ctx.get("ellipse_hints") or {}),
+                    )
                 return
 
         # Hits / keypad area (only on playing)

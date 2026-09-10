@@ -125,6 +125,7 @@ class KioskSession:
             daemon=True,
         )
         self._bg_thread.start()
+        self._load_cal_hints()
 
     def start_qr_path(self) -> Optional[str]:
         path = start_qr_image_path(get_settings().device_id)
@@ -338,13 +339,31 @@ class KioskSession:
             )
         else:
             self.ctx["_dart_status"] = f"REF {n_ref} cam" if n_ref > 0 else "REF FAIL"
-            self.ctx["bull_hints"] = {}
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_click_ellipse_mode"] = False
+        self._persist_cal_hints()
         if n_ref > 0:
             self.ctx["_dart_no_empty_ref_warned"] = False
         print(f"[dart] DETEKTIRAJ: kalibracija + ref ({n_ref} cam)", flush=True)
         return all_ok, n_ref
+
+    def _load_cal_hints(self) -> None:
+        board_cal = self.ctx.get("board_calibrator")
+        if board_cal is None:
+            return
+        self.ctx["bull_hints"] = dict(board_cal.bull_hints)
+        self.ctx["ellipse_hints"] = {
+            int(k): list(v) for k, v in (board_cal.ellipse_hints or {}).items()
+        }
+
+    def _persist_cal_hints(self) -> None:
+        board_cal = self.ctx.get("board_calibrator")
+        if board_cal is None:
+            return
+        board_cal.sync_manual_hints(
+            dict(self.ctx.get("bull_hints") or {}),
+            dict(self.ctx.get("ellipse_hints") or {}),
+        )
 
     def start_playing_after_clear_board(self) -> None:
         self.state["screen"] = "playing"
@@ -451,8 +470,8 @@ class KioskSession:
                 self.ctx["_clear_board_status"] = get_settings().t("cal_incomplete")
                 print(f"[dart] clear_board: kalibracija nepotpuna — {detail}", flush=True)
                 return
-            self.ctx["bull_hints"] = {}
             self.ctx["_cal_click_bull_mode"] = False
+            self.ctx["_cal_click_ellipse_mode"] = False
             print("[dart] clear_board: ploca ponovo kalibrirana (stable)", flush=True)
 
         n_ref = dart_det.update_empty_board_references(
@@ -1125,8 +1144,8 @@ class KioskSession:
             self.ctx["_ingame_cal_status"] = get_settings().t("cal_incomplete")
             print(f"[dart] in-game cal: nepotpuna — {detail}", flush=True)
         else:
-            self.ctx["bull_hints"] = {}
             self.ctx["_cal_click_bull_mode"] = False
+            self.ctx["_cal_click_ellipse_mode"] = False
             self.ctx["_ingame_cal_status"] = board_cal.status_summary() or ""
             print("[dart] in-game cal: ploca kalibrirana", flush=True)
         self.ctx["_ingame_cal_phase"] = "result"
@@ -1144,6 +1163,7 @@ class KioskSession:
         self.state["screen"] = "calibration"
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_click_ellipse_mode"] = False
+        self._load_cal_hints()
         board_cal = self.ctx.get("board_calibrator")
         if board_cal is not None:
             board_cal.show_overlay = True
@@ -1174,6 +1194,7 @@ class KioskSession:
         self.ctx["bull_hints"] = {}
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_last_tick"] = 0.0
+        self._persist_cal_hints()
 
     def toggle_cal_click_bull_mode(self) -> None:
         if self._cal_topdown_on():
@@ -2027,6 +2048,7 @@ class KioskSession:
                     flush=True,
                 )
             self.ctx["_cal_last_tick"] = 0.0
+            self._persist_cal_hints()
             return
 
     def _bg_has_pending(self) -> bool:

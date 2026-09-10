@@ -691,7 +691,9 @@ def build_calibration_view(
     # Overlay is always on (topdown is a separate warp view). Clicks unwarp when needed.
     display_frames = frames
     if board_calibrator is not None:
-        display_frames = board_calibrator.render_frames(frames)
+        display_frames = board_calibrator.render_frames(
+            frames, show_bull_rings=bool(click_bull_mode)
+        )
 
     for i, cam_idx in enumerate(CAMERA_INDICES):
         x1 = margin + i * (cell_w + gap)
@@ -706,6 +708,8 @@ def build_calibration_view(
         hint_pt = hints.get(int(cam_idx))
         if hint_pt is None:
             hint_pt = hints.get(cam_idx)
+        if hint_pt is not None and not bool(click_bull_mode):
+            hint_pt = None
         ell_pts = ell_hints.get(int(cam_idx))
         if ell_pts is None:
             ell_pts = ell_hints.get(cam_idx)
