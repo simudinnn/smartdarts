@@ -4889,7 +4889,12 @@ def project_topdown_overlay_onto_frame(
             (1.0 - a20) * out[m].astype(np.float32) + a20 * solid[m].astype(np.float32)
         ).astype(np.uint8)
 
-    # Prsteni: fit elipse u kameri pa cv2.ellipse (AA), ne polyline kroz 200px warp.
+    # Bull rupa: makni fill iz bull zone, pa tek onda nacrtaj tanke prstene (uklj. bull).
+    c_pt = _map_td_point(map_x, map_y, cx_out, cx_out)
+    if c_pt is not None and 0 <= c_pt[0] < fw and 0 <= c_pt[1] < fh:
+        br = max(2, int(round(float(rings["bull_outer"]) * 1.15)))
+        _punch_bull_disk(out, before, float(c_pt[0]), float(c_pt[1]), float(br))
+
     for key in (
         "bull_inner",
         "bull_outer",
@@ -4903,7 +4908,7 @@ def project_topdown_overlay_onto_frame(
         )
         if ell is None:
             continue
-        cv2.ellipse(out, ell, color, 2, cv2.LINE_AA)
+        cv2.ellipse(out, ell, color, 1, cv2.LINE_AA)
 
     r0 = float(rings["bull_outer"])
     r1 = float(rings["double_outer"])
@@ -4918,11 +4923,6 @@ def project_topdown_overlay_onto_frame(
             continue
         cv2.line(out, p0, p1, color, 1, cv2.LINE_AA)
 
-    # Bull rupa: vrati original unutar b25 (projicirano grubo oko centra).
-    c_pt = _map_td_point(map_x, map_y, cx_out, cx_out)
-    if c_pt is not None and 0 <= c_pt[0] < fw and 0 <= c_pt[1] < fh:
-        br = max(2, int(round(float(rings["bull_outer"]) * 1.15)))
-        _punch_bull_disk(out, before, float(c_pt[0]), float(c_pt[1]), float(br))
     return out
 
 
