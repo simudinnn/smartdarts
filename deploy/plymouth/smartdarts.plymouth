@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=SmartDarts
+Description=SmartDarts boot/shutdown splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/smartdarts
+ScriptFile=/usr/share/plymouth/themes/smartdarts/smartdarts.script

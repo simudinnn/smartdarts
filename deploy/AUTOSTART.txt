@@ -1,0 +1,24 @@
+# Autostart (Raspberry Pi kiosk box)
+#
+# Jednom na Pi-ju nakon kopiranja foldera:
+#   cd ~/smartdarts
+#   sudo python3 deploy/install_splash.py   # splash + autostart (assets/splash.png)
+#   ~/.local/bin/smartdarts-kiosk           # test
+#   sudo reboot
+#
+# Ako je splash već bio (samo desktop nakon reboota) — još i:
+#   python3 deploy/install_autostart.py
+#
+# Nakon toga: uključiš u struju → boot slika → SmartDarts.
+# Ugasi aplikaciju iz postavki (UGASI) ili tipkovnicom da dođeš do desktopa.
+#
+# Pokreće se SAMO preko labwc:
+#   ~/.config/labwc/autostart
+#
+# Install gasi desktop autostart i systemd servise (user + system)
+# da se ne digne više instanci. Launcher ima i flock lock.
+#
+# Update foldera: samo zamijeni ~/smartdarts — autostart ostaje
+# (launcher je u ~/.local/bin/, ne u projektu).
+# Ponovo pokreni install_autostart.py samo ako promijeniš putanju projekta
+# ili ako opet vidiš više prozora pri bootu.

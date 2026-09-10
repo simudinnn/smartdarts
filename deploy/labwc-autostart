@@ -1,0 +1,8 @@
+#!/bin/sh
+# Kopiraj: cp deploy/labwc-autostart ~/.config/labwc/autostart && chmod +x ~/.config/labwc/autostart
+export HOME=/home/user2
+export QT_QPA_PLATFORM=wayland
+killall wf-panel-pi wf-panel lxpanel pcmanfm 2>/dev/null || true
+pcmanfm --desktop-off 2>/dev/null || true
+# Bez sleep — odmah kiosk (splash je unutar Qt dok se učitava)
+/bin/bash /home/user2/smartdarts/run.sh >> /home/user2/smartdarts/autostart.log 2>&1 &

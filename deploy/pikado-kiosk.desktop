@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SmartDarts Kiosk
+Exec=/bin/bash /home/user2/smartdarts/run.sh
+Path=/home/user2/smartdarts
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Phase=WindowManager
+StartupNotify=false

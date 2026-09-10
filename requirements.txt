@@ -1,0 +1,8 @@
+opencv-python>=4.5.0
+numpy>=1.19.0
+paho-mqtt
+qrcode>=7.4.0
+PySide6>=6.5.0
+# Optional ML tip (settings → Tip detection: ML ONNX). Not required for FitLine.
+# onnxruntime>=1.16.0
+# Training/export only: see ml_tip/requirements-ml.txt (torch, onnx, onnxruntime)

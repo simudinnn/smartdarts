@@ -1,0 +1,7 @@
+# Training / export only (not required on Pi for FitLine or ONNX infer alone).
+torch>=2.0.0
+onnx>=1.14.0
+onnxruntime>=1.16.0
+# Optional: only needed for torch.onnx modern (dynamo) exporter.
+# ml_tip.export_onnx uses the legacy path (dynamo=False) and does not require this.
+# onnxscript>=0.1.0

@@ -1,0 +1,27 @@
+# Brži autostart: user systemd (bez sleep, čim graphical-session postoji).
+#
+# Jednom (kao user2, NE sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/pikado-kiosk.user.service ~/.config/systemd/user/pikado-kiosk.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pikado-kiosk.service
+#
+# Isključi stari SYSTEM servis (spor + sleep):
+#   sudo systemctl disable --now pikado-kiosk.service
+
+[Unit]
+Description=SmartDarts Kiosk
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/user2
+Environment=QT_QPA_PLATFORM=wayland
+WorkingDirectory=/home/user2/smartdarts
+ExecStart=/bin/bash /home/user2/smartdarts/run.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

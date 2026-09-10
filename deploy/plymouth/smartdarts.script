@@ -1,0 +1,18 @@
+# Jednostavan splash: samo pozadinska slika (splash.png).
+# Gašenje koristi isti theme.
+
+wallpaper_image = Image("splash.png");
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+resized = wallpaper_image.Scale(screen_width, screen_height);
+wallpaper_sprite = Sprite(resized);
+wallpaper_sprite.SetZ(-100);
+
+# Progress točka (diskretna) — može ostati prazno vizualno
+progress = 0;
+
+fun progress_callback(progress_fraction) {
+    progress = progress_fraction;
+}
+
+Plymouth.SetBootProgressFunction(progress_callback);

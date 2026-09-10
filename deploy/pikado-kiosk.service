@@ -1,0 +1,25 @@
+# STARI system servis — spor (sleep + čeka cijeli desktop).
+# Za brzinu: disable ovaj, koristi labwc-autostart ILI pikado-kiosk.user.service
+#
+#   sudo systemctl disable --now pikado-kiosk.service
+
+[Unit]
+Description=SmartDarts Kiosk (legacy system unit — prefer user service)
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=user2
+Group=user2
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/user2/.Xauthority
+Environment=HOME=/home/user2
+Environment=QT_QPA_PLATFORM=wayland
+WorkingDirectory=/home/user2/smartdarts
+ExecStart=/bin/bash /home/user2/smartdarts/run.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target
