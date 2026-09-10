@@ -70,6 +70,9 @@ CALIBRATION_BLEND_ALPHA = 0.28
 CAL_BULL_STABLE_SHIFT_PX = 22.0
 CAL_BULL_STABLE_SHIFT_FRAC = 0.07
 CAL_BULL_REJECT_SHIFT_FRAC = 0.14
+CAL_ELLIPSE_REJECT_CENTER_FRAC = 0.12
+CAL_ELLIPSE_REJECT_SIZE_FRAC = 0.18
+_OVERLAY_MAP_LIM = 8000.0
 SEGMENT_STEP_DEG = 360.0 / SEGMENT_COUNT
 BOARD_SEGMENT_NUMBERS: Tuple[int, ...] = (
     20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5,
@@ -281,6 +284,45 @@ def _ellipse_from_hint_points(
     elif semi_max < 4.0 or semi_min < 2.0:
         return None
     return ellipse
+
+
+def _ellipse_guide_points(ellipse: Ellipse, n: int = 4) -> List[Tuple[float, float]]:
+    """4 točke na postojećoj elipsi — seed za in-game ponovnu kalibraciju."""
+    (cx, cy), (w, h), angle_deg = ellipse
+    a = max(2.0, float(w) * 0.5)
+    b = max(2.0, float(h) * 0.5)
+    rad = math.radians(float(angle_deg))
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    out: List[Tuple[float, float]] = []
+    count = max(3, int(n))
+    for i in range(count):
+        t = (2.0 * math.pi * float(i)) / float(count)
+        xr = a * math.cos(t)
+        yr = b * math.sin(t)
+        out.append((cx + xr * cos_a - yr * sin_a, cy + xr * sin_a + yr * cos_a))
+    return out
+
+
+def _ellipse_jump_too_far(
+    old: Optional["BoardCalibration"],
+    new: Optional["BoardCalibration"],
+    min_dim: float,
+) -> bool:
+    if (
+        old is None
+        or new is None
+        or old.double_ellipse is None
+        or new.double_ellipse is None
+    ):
+        return False
+    (ocx, ocy), (ow, oh), _oa = old.double_ellipse
+    (ncx, ncy), (nw, nh), _na = new.double_ellipse
+    dc = math.hypot(float(ocx) - float(ncx), float(ocy) - float(ncy))
+    osemi = 0.25 * (float(ow) + float(oh))
+    nsemi = 0.25 * (float(nw) + float(nh))
+    ds = abs(osemi - nsemi)
+    md = max(8.0, float(min_dim))
+    return dc > md * CAL_ELLIPSE_REJECT_CENTER_FRAC or ds > md * CAL_ELLIPSE_REJECT_SIZE_FRAC
 
 
 def standard_ring_radii(double_outer_r: float) -> Dict[str, float]:
@@ -4706,7 +4748,11 @@ def _sample_remap_xy(
         + map_y[y1, x0] * (1 - fx) * fy
         + map_y[y1, x1] * fx * fy
     )
-    if not (math.isfinite(sx) and math.isfinite(sy)) or sx < 0.0 or sy < 0.0:
+    if not (math.isfinite(sx) and math.isfinite(sy)):
+        return None
+    if sx < 0.0 or sy < 0.0:
+        return None
+    if abs(sx) > _OVERLAY_MAP_LIM or abs(sy) > _OVERLAY_MAP_LIM:
         return None
     return (float(sx), float(sy))
 
@@ -4717,7 +4763,11 @@ def _map_td_point(
     sample = _sample_remap_xy(map_x, map_y, tx, ty)
     if sample is None:
         return None
-    return (int(round(sample[0])), int(round(sample[1])))
+    x = int(round(sample[0]))
+    y = int(round(sample[1]))
+    if abs(x) > 1_000_000 or abs(y) > 1_000_000:
+        return None
+    return (x, y)
 
 
 def _map_td_polyline(
@@ -4737,6 +4787,35 @@ def _map_td_polyline(
     if len(pts) < 2:
         return None
     return np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+
+
+def _fit_cam_ellipse_from_td_ring(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    cx_td: float,
+    cy_td: float,
+    r: float,
+    *,
+    fw: int,
+    fh: int,
+) -> Optional[Ellipse]:
+    """Stage2 krug → glatka elipsa u kameri (fit, ne pikselirani polyline)."""
+    pts: List[Tuple[float, float]] = []
+    for a in range(0, 360, 4):
+        st, ct = _angle_sin_cos(float(a))
+        p = _sample_remap_xy(map_x, map_y, cx_td + r * st, cy_td + r * ct)
+        if p is None:
+            continue
+        px, py = p
+        if px < -float(fw) or py < -float(fh) or px > 2.0 * fw or py > 2.0 * fh:
+            continue
+        pts.append((px, py))
+    if len(pts) < 8:
+        return None
+    try:
+        return cv2.fitEllipse(np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2))
+    except cv2.error:
+        return None
 
 
 def project_topdown_overlay_onto_frame(
@@ -4810,7 +4889,7 @@ def project_topdown_overlay_onto_frame(
             (1.0 - a20) * out[m].astype(np.float32) + a20 * solid[m].astype(np.float32)
         ).astype(np.uint8)
 
-    layer = np.zeros_like(out)
+    # Prsteni: fit elipse u kameri pa cv2.ellipse (AA), ne polyline kroz 200px warp.
     for key in (
         "bull_inner",
         "bull_outer",
@@ -4819,36 +4898,29 @@ def project_topdown_overlay_onto_frame(
         "double_inner",
         "double_outer",
     ):
-        r = float(rings[key])
-        pts_td = [
-            (cx_out + r * _angle_sin_cos(float(a))[0], cx_out + r * _angle_sin_cos(float(a))[1])
-            for a in range(0, 360, 2)
-        ]
-        pts_td.append(pts_td[0])
-        poly = _map_td_polyline(map_x, map_y, pts_td)
-        if poly is not None:
-            cv2.polylines(layer, [poly], False, color, 1, cv2.LINE_AA)
+        ell = _fit_cam_ellipse_from_td_ring(
+            map_x, map_y, cx_out, cx_out, float(rings[key]), fw=fw, fh=fh
+        )
+        if ell is None:
+            continue
+        cv2.ellipse(out, ell, color, 2, cv2.LINE_AA)
 
     r0 = float(rings["bull_outer"])
     r1 = float(rings["double_outer"])
     for k in range(SEGMENT_COUNT):
         ang = (SEG20_LEFT_WIRE_DST_DEG + k * SEGMENT_STEP_DEG) % 360.0
         st, ct = _angle_sin_cos(ang)
-        pts_td = [
-            (cx_out + (r0 + (r1 - r0) * float(t)) * st, cx_out + (r0 + (r1 - r0) * float(t)) * ct)
-            for t in np.linspace(0.0, 1.0, 24)
-        ]
-        poly = _map_td_polyline(map_x, map_y, pts_td)
-        if poly is not None:
-            cv2.polylines(layer, [poly], False, color, 1, cv2.LINE_AA)
-
-    line_m = layer.max(axis=2) > 0
-    if np.any(line_m):
-        out[line_m] = layer[line_m]
+        p0 = _map_td_point(map_x, map_y, cx_out + r0 * st, cx_out + r0 * ct)
+        p1 = _map_td_point(map_x, map_y, cx_out + r1 * st, cx_out + r1 * ct)
+        if p0 is None or p1 is None:
+            continue
+        if not (0 <= p0[0] < fw and 0 <= p0[1] < fh and 0 <= p1[0] < fw and 0 <= p1[1] < fh):
+            continue
+        cv2.line(out, p0, p1, color, 1, cv2.LINE_AA)
 
     # Bull rupa: vrati original unutar b25 (projicirano grubo oko centra).
     c_pt = _map_td_point(map_x, map_y, cx_out, cx_out)
-    if c_pt is not None:
+    if c_pt is not None and 0 <= c_pt[0] < fw and 0 <= c_pt[1] < fh:
         br = max(2, int(round(float(rings["bull_outer"]) * 1.15)))
         _punch_bull_disk(out, before, float(c_pt[0]), float(c_pt[1]), float(br))
     return out
@@ -5382,6 +5454,14 @@ class BoardCalibrator:
             prior: Optional[Tuple[float, float]] = None
             if hint is None and old is not None and old.is_valid():
                 prior = (float(old.center[0]), float(old.center[1]))
+            # In-game / auto: drži se prethodne elipse ako igrač nije dao točke.
+            if (
+                not ell_hint
+                and prefer_stable
+                and old is not None
+                and old.double_ellipse is not None
+            ):
+                ell_hint = _ellipse_guide_points(old.double_ellipse)
             if hint is not None:
                 print(
                     f"[cal] detect_all cam{cam_i}: using bull hint ({hint[0]:.1f},{hint[1]:.1f})",
@@ -5483,18 +5563,29 @@ class BoardCalibrator:
                     new_cal = scale_board_calibration(new_cal, scale)
 
             if _is_calibration_complete(new_cal):
-                # Veliki skok bulla u auto-modu: primi samo ako je jasno bolji.
+                # Veliki skok bulla ili elipse u auto-modu: zadrži stari cal.
+                min_dim = float(min(frame.shape[0], frame.shape[1]))
+                ellipse_jump = _ellipse_jump_too_far(old, new_cal, min_dim)
                 if (
                     prefer_stable
                     and old is not None
                     and _is_calibration_complete(old)
-                    and bull_shift > reject_shift
-                    and _calibration_quality(new_cal)
-                    < _calibration_quality(old) * 1.12
+                    and (
+                        (
+                            bull_shift > reject_shift
+                            and _calibration_quality(new_cal)
+                            < _calibration_quality(old) * 1.12
+                        )
+                        or ellipse_jump
+                    )
                 ):
+                    why = (
+                        f"ellipse jump"
+                        if ellipse_jump
+                        else f"bull jump {bull_shift:.1f}px"
+                    )
                     print(
-                        f"[cal] detect_all cam{cam_i}: reject far jump "
-                        f"({bull_shift:.1f}px) — keep previous cal "
+                        f"[cal] detect_all cam{cam_i}: reject {why} — keep previous cal "
                         f"(q_new={_calibration_quality(new_cal):.2f} "
                         f"q_old={_calibration_quality(old):.2f})",
                         flush=True,
@@ -5675,13 +5766,23 @@ class BoardCalibrator:
             if cal is None or not cal.is_valid():
                 out[cam_idx] = frame
                 continue
-            maps = self._cached_warp_maps(int(cam_idx), frame)
-            if maps is not None:
-                out[cam_idx] = project_topdown_overlay_onto_frame(
-                    frame, cal, maps=maps
+            try:
+                maps = self._cached_warp_maps(int(cam_idx), frame)
+                if maps is not None:
+                    out[cam_idx] = project_topdown_overlay_onto_frame(
+                        frame, cal, maps=maps
+                    )
+                else:
+                    out[cam_idx] = draw_board_overlay(frame, cal)
+            except Exception as exc:
+                print(
+                    f"[cal] overlay cam{int(cam_idx)} failed ({exc}) — fallback",
+                    flush=True,
                 )
-            else:
-                out[cam_idx] = draw_board_overlay(frame, cal)
+                try:
+                    out[cam_idx] = draw_board_overlay(frame, cal)
+                except Exception:
+                    out[cam_idx] = frame
         return out
 
     def render_topdown_frames(
