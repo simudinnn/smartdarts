@@ -5273,12 +5273,26 @@ class MainWindow(QMainWindow):
                 ),
                 snap.get("league_qr_payload"),
                 bool(snap.get("cal_click_bull_mode")),
+                bool(snap.get("cal_click_ellipse_mode")),
                 bool(snap.get("cal_show_topdown")),
                 bool(snap.get("cal_show_overlay")),
                 tuple(
                     sorted(
                         (int(k), round(float(v[0]), 1), round(float(v[1]), 1))
                         for k, v in (snap.get("bull_hints") or {}).items()
+                    )
+                ),
+                tuple(
+                    sorted(
+                        (
+                            int(k),
+                            tuple(
+                                (round(float(p[0]), 1), round(float(p[1]), 1))
+                                for p in (v or [])[:4]
+                                if p is not None and len(p) >= 2
+                            ),
+                        )
+                        for k, v in (snap.get("ellipse_hints") or {}).items()
                     )
                 ),
             )
@@ -6007,16 +6021,16 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(10)
         row.setContentsMargins(0, 6, 0, 0)
-        self.cal_detect_btn = _cal_footer_btn("KALIBRIRAJ", "calibration_detect", role="Primary")
-        self.cal_click_bull_btn = _cal_footer_btn("KLIKNI BULL", "calibration_click_bull", role="Footer")
-        self.cal_overlay_btn = _cal_footer_btn("OVERLAY", "calibration_overlay", role="Footer")
+        self.cal_back_btn = _cal_footer_btn("NAZAD", "calibration_back", role="Danger")
+        self.cal_click_bull_btn = _cal_footer_btn("BULL", "calibration_click_bull", role="Footer")
+        self.cal_click_ellipse_btn = _cal_footer_btn("ELIPSA", "calibration_click_ellipse", role="Footer")
         self.cal_topdown_btn = _cal_footer_btn("TOPDOWN", "calibration_capture", role="Footer")
-        self.cal_back_btn = _cal_footer_btn("NATRAG", "calibration_back", role="Danger")
-        row.addWidget(self.cal_detect_btn, 1)
-        row.addWidget(self.cal_click_bull_btn, 1)
-        row.addWidget(self.cal_overlay_btn, 1)
-        row.addWidget(self.cal_topdown_btn, 1)
+        self.cal_detect_btn = _cal_footer_btn("KALIBRIRAJ", "calibration_detect", role="Primary")
         row.addWidget(self.cal_back_btn, 1)
+        row.addWidget(self.cal_click_bull_btn, 1)
+        row.addWidget(self.cal_click_ellipse_btn, 1)
+        row.addWidget(self.cal_topdown_btn, 1)
+        row.addWidget(self.cal_detect_btn, 1)
         lay.addLayout(row)
         return w
 
@@ -6252,10 +6266,11 @@ class MainWindow(QMainWindow):
                 self.quit_no_btn.setText(t("no"))
         if hasattr(self, "cal_detect_btn"):
             self.cal_detect_btn.setText(t("calibrate"))
-            self.cal_overlay_btn.setText(t("overlay"))
             self.cal_back_btn.setText(t("back"))
             if hasattr(self, "cal_click_bull_btn"):
                 self.cal_click_bull_btn.setText(t("click_bull"))
+            if hasattr(self, "cal_click_ellipse_btn"):
+                self.cal_click_ellipse_btn.setText(t("click_ellipse"))
             if hasattr(self, "cal_click_banner"):
                 self.cal_click_banner.setText(t("click_bull_hint"))
         if hasattr(self, "standby_start_btn"):
@@ -6863,20 +6878,27 @@ class MainWindow(QMainWindow):
             return
         t = get_settings().t
         click_on = bool(snap.get("cal_click_bull_mode"))
-        overlay_on = bool(snap.get("cal_show_overlay")) and not bool(snap.get("cal_show_topdown"))
+        ellipse_on = bool(snap.get("cal_click_ellipse_mode"))
         topdown_on = bool(snap.get("cal_show_topdown"))
-        self.cal_click_banner.setText(t("click_bull_hint"))
-        self.cal_click_banner.setVisible(click_on)
+        if click_on:
+            self.cal_click_banner.setText(t("click_bull_hint"))
+        elif ellipse_on:
+            self.cal_click_banner.setText(t("click_ellipse_hint"))
+        else:
+            self.cal_click_banner.setText("")
+        self.cal_click_banner.setVisible(click_on or ellipse_on)
         if hasattr(self, "cal_click_bull_btn"):
             self.cal_click_bull_btn.setText(t("click_bull"))
             self._style_cal_toggle(self.cal_click_bull_btn, click_on)
-        if hasattr(self, "cal_overlay_btn"):
-            self.cal_overlay_btn.setText(t("overlay"))
-            self._style_cal_toggle(self.cal_overlay_btn, overlay_on)
+        if hasattr(self, "cal_click_ellipse_btn"):
+            self.cal_click_ellipse_btn.setText(t("click_ellipse"))
+            self._style_cal_toggle(self.cal_click_ellipse_btn, ellipse_on)
         if hasattr(self, "cal_topdown_btn"):
             self._style_cal_toggle(self.cal_topdown_btn, topdown_on)
         if hasattr(self, "cal_label"):
-            self.cal_label.setCursor(Qt.CrossCursor if click_on else Qt.ArrowCursor)
+            self.cal_label.setCursor(
+                Qt.CrossCursor if (click_on or ellipse_on) else Qt.ArrowCursor
+            )
 
     def _sync_cal_click_bull_ui(self, snap: dict) -> None:
         self._sync_cal_toolbar_ui(snap)

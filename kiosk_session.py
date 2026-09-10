@@ -101,7 +101,9 @@ class KioskSession:
             "_cal_buttons": [],
             "_cal_tiles": [],
             "bull_hints": {},
+            "ellipse_hints": {},
             "_cal_click_bull_mode": False,
+            "_cal_click_ellipse_mode": False,
             "_ingame_cal_open": False,
             "_ingame_cal_phase": "",
             "_ingame_cal_status": "",
@@ -305,11 +307,16 @@ class KioskSession:
         incomplete: List[int] = []
         # Max 3 pokušaja na 320x240 — softverski upscale je u calibrate_board.
         hints = dict(self.ctx.get("bull_hints") or {})
+        ell_hints = dict(self.ctx.get("ellipse_hints") or {})
         for _attempt in range(3):
             if cam_mgr is not None and cam_mgr.active:
                 frames = cam_mgr.grab_frames(flush=2)
                 self.ctx["_last_cal_frames"] = frames
-            incomplete = board_cal.detect_all(frames, bull_hints=hints or None)
+            incomplete = board_cal.detect_all(
+                frames,
+                bull_hints=hints or None,
+                ellipse_hints=ell_hints or None,
+            )
             if not incomplete:
                 break
             time.sleep(0.08)
@@ -327,6 +334,7 @@ class KioskSession:
                 )
             # Auto-uključi KLIKNI BULL da se hints mogu upisati bez dodatnog klika.
             self.ctx["_cal_click_bull_mode"] = True
+            self.ctx["_cal_click_ellipse_mode"] = False
             print(
                 "[dart] DETEKTIRAJ: uključen KLIKNI BULL — klikni bull po kameri, pa opet KALIBRIRAJ",
                 flush=True,
@@ -426,6 +434,7 @@ class KioskSession:
                 lambda flush=1: cam_mgr.grab_frames(flush=flush),
                 attempts=4,
                 bull_hints=hints or None,
+                ellipse_hints=dict(self.ctx.get("ellipse_hints") or {}) or None,
             )
             if incomplete:
                 # Još jedan prolaz ako je bio samo "nema signala".
@@ -438,6 +447,7 @@ class KioskSession:
                         lambda flush=1: cam_mgr.grab_frames(flush=flush),
                         attempts=3,
                         bull_hints=hints or None,
+                        ellipse_hints=dict(self.ctx.get("ellipse_hints") or {}) or None,
                     )
             if incomplete:
                 detail = board_cal.format_incomplete_status(incomplete)
@@ -1079,10 +1089,12 @@ class KioskSession:
             time.sleep(0.05)
             frames = cam_mgr.grab_frames(flush=1)
         hints = dict(self.ctx.get("bull_hints") or {})
+        ell_hints = dict(self.ctx.get("ellipse_hints") or {}) or None
         incomplete, frames = board_cal.recalibrate_for_play(
             lambda flush=1: cam_mgr.grab_frames(flush=flush),
             attempts=4,
             bull_hints=hints or None,
+            ellipse_hints=ell_hints,
         )
         if incomplete:
             no_sig = board_cal.incomplete_no_signal(incomplete)
@@ -1094,6 +1106,7 @@ class KioskSession:
                     lambda flush=1: cam_mgr.grab_frames(flush=flush),
                     attempts=3,
                     bull_hints=hints or None,
+                    ellipse_hints=ell_hints,
                 )
         old_ov = bool(board_cal.show_overlay)
         old_td = bool(board_cal.show_topdown)
@@ -1133,6 +1146,10 @@ class KioskSession:
             cam_mgr.wait_for_frames(timeout_sec=8.0, min_cams=len(CAMERA_INDICES))
         self.state["screen"] = "calibration"
         self.ctx["_cal_click_bull_mode"] = False
+        self.ctx["_cal_click_ellipse_mode"] = False
+        board_cal = self.ctx.get("board_calibrator")
+        if board_cal is not None:
+            board_cal.show_overlay = True
 
     def exit_calibration(self) -> None:
         if self.state.get("screen") != "calibration":
@@ -1142,6 +1159,7 @@ class KioskSession:
             cam_mgr.stop()
         self.ctx["_last_cal_frames"] = {}
         self.ctx["_cal_click_bull_mode"] = False
+        self.ctx["_cal_click_ellipse_mode"] = False
         board_cal = self.ctx.get("board_calibrator")
         if board_cal is not None:
             board_cal.save()
@@ -1159,9 +1177,22 @@ class KioskSession:
     def toggle_cal_click_bull_mode(self) -> None:
         on = not bool(self.ctx.get("_cal_click_bull_mode"))
         self.ctx["_cal_click_bull_mode"] = on
+        if on:
+            self.ctx["_cal_click_ellipse_mode"] = False
         self.ctx["_cal_last_tick"] = 0.0
         print(
-            f"[dart] KLIKNI BULL: {'ON — klikni otprilike na bull po kameri' if on else 'OFF'}",
+            f"[dart] BULL: {'ON — klikni otprilike na bull po kameri' if on else 'OFF'}",
+            flush=True,
+        )
+
+    def toggle_cal_click_ellipse_mode(self) -> None:
+        on = not bool(self.ctx.get("_cal_click_ellipse_mode"))
+        self.ctx["_cal_click_ellipse_mode"] = on
+        if on:
+            self.ctx["_cal_click_bull_mode"] = False
+        self.ctx["_cal_last_tick"] = 0.0
+        print(
+            f"[dart] ELIPSA: {'ON — klikni do 4 tocke na vanjskom rubu' if on else 'OFF'}",
             flush=True,
         )
 
@@ -1510,6 +1541,14 @@ class KioskSession:
             mm._click_sound()
             self.toggle_cal_click_bull_mode()
             return
+        if bid == "calibration_click_ellipse":
+            mm._click_sound()
+            self.toggle_cal_click_ellipse_mode()
+            return
+        if bid == "calibration_overlay":
+            mm._click_sound()
+            self.toggle_cal_click_ellipse_mode()
+            return
         if bid == "calibration_clear_bull_hints":
             mm._click_sound()
             self.clear_bull_hints()
@@ -1521,17 +1560,6 @@ class KioskSession:
                 board_cal.show_topdown = not board_cal.show_topdown
                 if board_cal.show_topdown:
                     board_cal.show_overlay = True
-                self.ctx["_cal_last_tick"] = 0.0
-            return
-        if bid == "calibration_overlay":
-            mm._click_sound()
-            board_cal = self.ctx.get("board_calibrator")
-            if board_cal is not None:
-                if board_cal.show_topdown:
-                    board_cal.show_topdown = False
-                    board_cal.show_overlay = True
-                else:
-                    board_cal.show_overlay = not board_cal.show_overlay
                 self.ctx["_cal_last_tick"] = 0.0
             return
         if bid.startswith("calibration_seg20_left_"):
@@ -1882,13 +1910,19 @@ class KioskSession:
             status = "Otvaranje kamera..."
         buttons: list = []
         tiles: list = []
-        click_mode = bool(self.ctx.get("_cal_click_bull_mode"))
+        click_bull = bool(self.ctx.get("_cal_click_bull_mode"))
+        click_ell = bool(self.ctx.get("_cal_click_ellipse_mode"))
         banner = ""
-        if click_mode:
+        if click_bull:
             try:
                 banner = get_settings().t("click_bull_hint")
             except Exception:
                 banner = "Klikni otprilike na bull"
+        elif click_ell:
+            try:
+                banner = get_settings().t("click_ellipse_hint")
+            except Exception:
+                banner = "Klikni do 4 tocke na vanjskom rubu"
         img = build_calibration_view(
             width,
             height,
@@ -1898,16 +1932,17 @@ class KioskSession:
             buttons_out=buttons,
             draw_action_buttons=False,
             bull_hints=dict(self.ctx.get("bull_hints") or {}),
+            ellipse_hints=dict(self.ctx.get("ellipse_hints") or {}),
             tiles_out=tiles,
-            click_bull_mode=click_mode,
+            click_bull_mode=click_bull,
             click_bull_banner=banner,
+            click_ellipse_mode=click_ell,
         )
         self._bg_cal_pack = {"img": img, "buttons": buttons, "tiles": tiles}
         return img
 
     def handle_calibration_click(self, x: int, y: int, width: int, height: int) -> None:
-        """Map click on calibration QLabel (widget coords) to OpenCV button ids / bull hint."""
-        # Seg.20 / overlay buttons first (even in click-bull mode).
+        """Map click on calibration QLabel to bull / ellipse hints."""
         buttons = self.ctx.get("_cal_buttons") or []
         for btn in buttons:
             x1, y1, x2, y2 = btn["rect"]
@@ -1915,7 +1950,9 @@ class KioskSession:
                 self.handle_action(btn["id"])
                 return
 
-        if not self.ctx.get("_cal_click_bull_mode"):
+        bull_mode = bool(self.ctx.get("_cal_click_bull_mode"))
+        ell_mode = bool(self.ctx.get("_cal_click_ellipse_mode"))
+        if not bull_mode and not ell_mode:
             return
 
         tiles = self.ctx.get("_cal_tiles") or []
@@ -1927,7 +1964,6 @@ class KioskSession:
             dw, dh = tile.get("display_size") or (fw, fh)
             vw = max(1, vx2 - vx1)
             vh = max(1, vy2 - vy1)
-            # video_rect → display-frame coords → capture-frame coords
             dx = (float(x - vx1) / float(vw)) * float(dw)
             dy = (float(y - vy1) / float(vh)) * float(dh)
             cam_idx = int(tile["cam_idx"])
@@ -1951,14 +1987,39 @@ class KioskSession:
                 fy = dy * (float(fh) / float(dh))
             fx = max(0.0, min(float(fw - 1), fx))
             fy = max(0.0, min(float(fh - 1), fy))
-            hints = dict(self.ctx.get("bull_hints") or {})
-            hints[cam_idx] = (fx, fy)
-            self.ctx["bull_hints"] = hints
+            if bull_mode:
+                hints = dict(self.ctx.get("bull_hints") or {})
+                hints[cam_idx] = (fx, fy)
+                self.ctx["bull_hints"] = hints
+                print(
+                    f"[dart] bull hint cam{cam_idx}: ({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
+                    flush=True,
+                )
+            else:
+                raw = dict(self.ctx.get("ellipse_hints") or {})
+                pts = list(raw.get(cam_idx) or raw.get(str(cam_idx)) or [])
+                pts = [(float(p[0]), float(p[1])) for p in pts if p is not None and len(p) >= 2]
+                near = max(18.0, min(float(fw), float(fh)) * 0.10)
+                moved = False
+                if pts:
+                    dists = [
+                        ((fx - px) ** 2 + (fy - py) ** 2) ** 0.5
+                        for px, py in pts
+                    ]
+                    best = int(min(range(len(dists)), key=lambda i: dists[i]))
+                    if dists[best] <= near or len(pts) >= 4:
+                        pts[best] = (fx, fy)
+                        moved = True
+                if not moved and len(pts) < 4:
+                    pts.append((fx, fy))
+                raw[cam_idx] = pts[:4]
+                self.ctx["ellipse_hints"] = raw
+                print(
+                    f"[dart] ellipse hint cam{cam_idx}: n={len(pts)} "
+                    f"last=({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
+                    flush=True,
+                )
             self.ctx["_cal_last_tick"] = 0.0
-            print(
-                f"[dart] bull hint cam{cam_idx}: ({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
-                flush=True,
-            )
             return
 
     def _bg_has_pending(self) -> bool:
@@ -2306,16 +2367,23 @@ class KioskSession:
                 "league_qr_enabled": get_settings().league_qr_enabled,
             },
             "cal_click_bull_mode": bool(self.ctx.get("_cal_click_bull_mode")),
+            "cal_click_ellipse_mode": bool(self.ctx.get("_cal_click_ellipse_mode")),
             "cal_show_topdown": bool(
                 getattr(self.ctx.get("board_calibrator"), "show_topdown", False)
             ),
-            "cal_show_overlay": bool(
-                getattr(self.ctx.get("board_calibrator"), "show_overlay", False)
-            ),
+            "cal_show_overlay": True,
             "bull_hints": {
                 int(k): (float(v[0]), float(v[1]))
                 for k, v in (self.ctx.get("bull_hints") or {}).items()
                 if v is not None and len(v) >= 2
+            },
+            "ellipse_hints": {
+                int(k): [
+                    (float(p[0]), float(p[1]))
+                    for p in (v or [])
+                    if p is not None and len(p) >= 2
+                ][:4]
+                for k, v in (self.ctx.get("ellipse_hints") or {}).items()
             },
             "undo_pending_tags": [
                 mm._hit_tag(h)

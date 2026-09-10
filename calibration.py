@@ -505,6 +505,84 @@ def _draw_bull_hint_marker(img: np.ndarray, x: float, y: float) -> None:
     )
 
 
+def _map_hint_to_display(
+    board_calibrator: Optional[BoardCalibrator],
+    cam_idx: int,
+    hx: float,
+    hy: float,
+    display_frame: np.ndarray,
+    raw_frame: Optional[np.ndarray],
+) -> Tuple[float, float]:
+    """Capture-frame hint → currently displayed frame (overlay or topdown)."""
+    fh_d, fw_d = display_frame.shape[:2]
+    if (
+        board_calibrator is not None
+        and board_calibrator.show_topdown
+        and raw_frame is not None
+    ):
+        mapped = board_calibrator.map_camera_to_topdown_display(
+            int(cam_idx),
+            hx,
+            hy,
+            display_size=(int(fw_d), int(fh_d)),
+        )
+        if mapped is not None:
+            return float(mapped[0]), float(mapped[1])
+        fh_raw, fw_raw = raw_frame.shape[:2]
+        if fw_raw > 0 and fh_raw > 0 and (fw_raw != fw_d or fh_raw != fh_d):
+            return hx * (fw_d / float(fw_raw)), hy * (fh_d / float(fh_raw))
+        return hx, hy
+    if raw_frame is not None:
+        fh_raw, fw_raw = raw_frame.shape[:2]
+        if fw_raw > 0 and fh_raw > 0 and (fw_raw != fw_d or fh_raw != fh_d):
+            return hx * (fw_d / float(fw_raw)), hy * (fh_d / float(fh_raw))
+    return hx, hy
+
+
+def _draw_ellipse_hint_marker(img: np.ndarray, x: float, y: float, n: int) -> None:
+    """Numbered orange marker on the outer-ellipse rim."""
+    cx, cy = int(round(x)), int(round(y))
+    h, w = img.shape[:2]
+    if cx < 0 or cy < 0 or cx >= w or cy >= h:
+        return
+    color = (40, 90, 255)
+    r = max(8, int(min(h, w) * 0.032))
+    cv2.circle(img, (cx, cy), r, color, 2, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy), 3, color, -1, cv2.LINE_AA)
+    label = str(int(n))
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    tx = min(w - tw - 2, max(2, cx + r + 2))
+    ty = min(h - 2, max(th + 2, cy - r))
+    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+
+def _draw_ellipse_hint_preview(img: np.ndarray, points: List[Tuple[float, float]]) -> None:
+    """Hull + fitted ellipse from 3–4 display-space rim clicks."""
+    if len(points) < 2:
+        return
+    color = (40, 90, 255)
+    arr = np.array(points, dtype=np.float32)
+    try:
+        hull = cv2.convexHull(arr.reshape(-1, 1, 2)).reshape(-1, 2)
+    except cv2.error:
+        hull = arr
+    pts_i = [(int(round(p[0])), int(round(p[1]))) for p in hull]
+    for a, b in zip(pts_i, pts_i[1:] + pts_i[:1]):
+        cv2.line(img, a, b, color, 1, cv2.LINE_AA)
+    if len(points) < 3:
+        return
+    try:
+        from board_calibration import _ellipse_from_hint_points
+
+        h, w = img.shape[:2]
+        ell = _ellipse_from_hint_points([(float(p[0]), float(p[1])) for p in points], float(min(h, w)))
+        if ell is not None:
+            cv2.ellipse(img, ell, color, 2, cv2.LINE_AA)
+    except Exception:
+        pass
+
+
 def build_calibration_view(
     width: int,
     height: int,
@@ -515,14 +593,17 @@ def build_calibration_view(
     buttons_out: Optional[list] = None,
     draw_action_buttons: bool = True,
     bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
+    ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
     tiles_out: Optional[list] = None,
     click_bull_mode: bool = False,
     click_bull_banner: str = "",
+    click_ellipse_mode: bool = False,
 ) -> np.ndarray:
-    """Render calibration screen with 3 camera previews and optional board overlay."""
+    """Render calibration screen with 3 camera previews and board overlay."""
     panel = np.zeros((height, width, 3), dtype=np.uint8)
     panel[:] = (0, 0, 0)
     hints = bull_hints or {}
+    ell_hints = ellipse_hints or {}
 
     margin = max(16, int(min(width, height) * 0.025))
     title = "KALIBRACIJA KAMERA I PLOCE"
@@ -531,12 +612,17 @@ def build_calibration_view(
     title_y = margin + th
     cv2.putText(panel, title, ((width - tw) // 2, title_y), cv2.FONT_HERSHEY_DUPLEX, title_scale, (235, 235, 235), 2)
 
-    hint = f"2/ESC izlaz  |  B kalibriraj  |  O overlay  |  T topdown  |  < > seg.20"
-    if click_bull_mode and click_bull_banner:
+    hint = f"2/ESC izlaz  |  B kalibriraj  |  O elipsa  |  T topdown  |  < > seg.20"
+    if (click_bull_mode or click_ellipse_mode) and click_bull_banner:
         hint = click_bull_banner
     hint_scale = max(0.36, min(0.48, width / 1500.0))
     (hw, hh), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, hint_scale, 1)
-    hint_color = (0, 220, 255) if click_bull_mode else (130, 130, 130)
+    if click_bull_mode:
+        hint_color = (0, 220, 255)
+    elif click_ellipse_mode:
+        hint_color = (40, 90, 255)
+    else:
+        hint_color = (130, 130, 130)
     cv2.putText(
         panel,
         hint,
@@ -579,11 +665,11 @@ def build_calibration_view(
         )
 
     btn_specs = [
-        ("calibration_detect", "KALIBRIRAJ"),
-        ("calibration_click_bull", "KLIKNI BULL"),
-        ("calibration_overlay", "OVERLAY"),
+        ("calibration_back", "NAZAD"),
+        ("calibration_click_bull", "BULL"),
+        ("calibration_click_ellipse", "ELIPSA"),
         ("calibration_capture", "TOPDOWN"),
-        ("calibration_back", "NATRAG"),
+        ("calibration_detect", "KALIBRIRAJ"),
     ]
     btn_w = max(100, int((width - 2 * margin - btn_gap * (len(btn_specs) - 1)) / len(btn_specs)))
     if buttons_out is not None:
@@ -596,12 +682,12 @@ def build_calibration_view(
             bx1 = margin + i * (btn_w + btn_gap)
             bx2 = min(width - margin, bx1 + btn_w)
             active = False
-            if board_calibrator is not None and bid == "calibration_overlay":
-                active = board_calibrator.show_overlay and not board_calibrator.show_topdown
             if board_calibrator is not None and bid == "calibration_capture":
                 active = bool(board_calibrator.show_topdown)
             if bid == "calibration_click_bull":
                 active = bool(click_bull_mode)
+            if bid == "calibration_click_ellipse":
+                active = bool(click_ellipse_mode)
             _draw_button(panel, bx1, btn_y1, bx2, btn_y2, blabel, active=active)
             if buttons_out is not None:
                 buttons_out.append({"id": bid, "rect": (bx1, btn_y1, bx2, btn_y2)})
@@ -615,11 +701,10 @@ def build_calibration_view(
     arrow_gap = max(8, int(cell_w * 0.05))
     video_h = max(1, avail_h - arrow_h - 8)
 
-    # Overlay / topdown stay independent of KLIKNI BULL (clicks unwarp when needed).
+    # Overlay is always on (topdown is a separate warp view). Clicks unwarp when needed.
     display_frames = frames
     if board_calibrator is not None:
-        if board_calibrator.show_topdown or board_calibrator.show_overlay:
-            display_frames = board_calibrator.render_frames(frames)
+        display_frames = board_calibrator.render_frames(frames)
 
     for i, cam_idx in enumerate(CAMERA_INDICES):
         x1 = margin + i * (cell_w + gap)
@@ -634,38 +719,44 @@ def build_calibration_view(
         hint_pt = hints.get(int(cam_idx))
         if hint_pt is None:
             hint_pt = hints.get(cam_idx)
+        ell_pts = ell_hints.get(int(cam_idx))
+        if ell_pts is None:
+            ell_pts = ell_hints.get(cam_idx)
+        ell_pts = [
+            (float(p[0]), float(p[1]))
+            for p in (ell_pts or [])
+            if p is not None and len(p) >= 2
+        ][:4]
 
         if frame is not None:
-            # Draw hint on a copy of the displayed frame (scale if overlay size ≠ capture).
+            # Draw hints on a copy of the displayed frame (scale if overlay size ≠ capture).
             draw_src = frame
-            if hint_pt is not None:
+            if hint_pt is not None or ell_pts:
                 draw_src = frame.copy()
-                hx, hy = float(hint_pt[0]), float(hint_pt[1])
-                fh_d, fw_d = frame.shape[:2]
-                if (
-                    board_calibrator is not None
-                    and board_calibrator.show_topdown
-                    and raw_frame is not None
-                ):
-                    mapped = board_calibrator.map_camera_to_topdown_display(
+                if hint_pt is not None:
+                    hx, hy = _map_hint_to_display(
+                        board_calibrator,
                         int(cam_idx),
-                        hx,
-                        hy,
-                        display_size=(int(fw_d), int(fh_d)),
+                        float(hint_pt[0]),
+                        float(hint_pt[1]),
+                        draw_src,
+                        raw_frame,
                     )
-                    if mapped is not None:
-                        hx, hy = mapped
-                    else:
-                        fh_raw, fw_raw = raw_frame.shape[:2]
-                        if fw_raw > 0 and fh_raw > 0 and (fw_raw != fw_d or fh_raw != fh_d):
-                            hx *= fw_d / float(fw_raw)
-                            hy *= fh_d / float(fh_raw)
-                elif raw_frame is not None:
-                    fh_raw, fw_raw = raw_frame.shape[:2]
-                    if fw_raw > 0 and fh_raw > 0 and (fw_raw != fw_d or fh_raw != fh_d):
-                        hx *= fw_d / float(fw_raw)
-                        hy *= fh_d / float(fh_raw)
-                _draw_bull_hint_marker(draw_src, hx, hy)
+                    _draw_bull_hint_marker(draw_src, hx, hy)
+                if ell_pts:
+                    mapped_ell: List[Tuple[float, float]] = []
+                    for ei, (ex, ey) in enumerate(ell_pts):
+                        mx, my = _map_hint_to_display(
+                            board_calibrator,
+                            int(cam_idx),
+                            ex,
+                            ey,
+                            draw_src,
+                            raw_frame,
+                        )
+                        mapped_ell.append((mx, my))
+                        _draw_ellipse_hint_marker(draw_src, mx, my, ei + 1)
+                    _draw_ellipse_hint_preview(draw_src, mapped_ell)
             fh, fw = draw_src.shape[:2]
             scale = min(cell_w / float(fw), video_h / float(fh))
             nw = max(1, int(fw * scale))

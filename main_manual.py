@@ -2205,7 +2205,9 @@ def main():
         "_cal_canvas_disp": None,
         "_cal_tiles": [],
         "bull_hints": {},
+        "ellipse_hints": {},
         "_cal_click_bull_mode": False,
+        "_cal_click_ellipse_mode": False,
         "editing_hit_slot": None,
     }
 
@@ -3613,7 +3615,11 @@ def main():
             if cam_mgr is not None and cam_mgr.active:
                 frames = cam_mgr.grab_frames(flush=2)
                 gui_ctx["_last_cal_frames"] = frames
-            incomplete = board_cal.detect_all(frames, bull_hints=hints or None)
+            incomplete = board_cal.detect_all(
+                frames,
+                bull_hints=hints or None,
+                ellipse_hints=dict(gui_ctx.get("ellipse_hints") or {}) or None,
+            )
             if not incomplete:
                 break
             time.sleep(0.08)
@@ -3721,6 +3727,7 @@ def main():
                 lambda flush=1: cam_mgr.grab_frames(flush=flush),
                 attempts=4,
                 bull_hints=hints or None,
+                ellipse_hints=dict(gui_ctx.get("ellipse_hints") or {}) or None,
             )
             if incomplete:
                 no_sig = board_cal.incomplete_no_signal(incomplete)
@@ -3732,6 +3739,7 @@ def main():
                         lambda flush=1: cam_mgr.grab_frames(flush=flush),
                         attempts=3,
                         bull_hints=hints or None,
+                        ellipse_hints=dict(gui_ctx.get("ellipse_hints") or {}) or None,
                     )
             if incomplete:
                 detail = board_cal.format_incomplete_status(incomplete)
@@ -4331,6 +4339,16 @@ def main():
                 _click_sound()
                 on = not bool(gui_ctx.get("_cal_click_bull_mode"))
                 gui_ctx["_cal_click_bull_mode"] = on
+                if on:
+                    gui_ctx["_cal_click_ellipse_mode"] = False
+                gui_ctx["_cal_last_tick"] = 0.0
+                return
+            if bid in ("calibration_click_ellipse", "calibration_overlay"):
+                _click_sound()
+                on = not bool(gui_ctx.get("_cal_click_ellipse_mode"))
+                gui_ctx["_cal_click_ellipse_mode"] = on
+                if on:
+                    gui_ctx["_cal_click_bull_mode"] = False
                 gui_ctx["_cal_last_tick"] = 0.0
                 return
             if bid == "calibration_capture":
@@ -4341,16 +4359,6 @@ def main():
                     if board_cal.show_topdown:
                         board_cal.show_overlay = True
                     gui_ctx["_cal_last_tick"] = 0.0
-                return
-            if bid == "calibration_overlay":
-                _click_sound()
-                board_cal = gui_ctx.get("board_calibrator")
-                if board_cal is not None:
-                    if board_cal.show_topdown:
-                        board_cal.show_topdown = False
-                        board_cal.show_overlay = True
-                    else:
-                        board_cal.show_overlay = not board_cal.show_overlay
                 return
             if bid.startswith("calibration_seg20_left_"):
                 _click_sound()
@@ -4596,8 +4604,10 @@ def main():
                 _force_advance_past_board_clear(update_empty_ref=True)
                 return
 
-        # Manual bull seed on calibration camera preview
-        if gui_state.get("screen") == "calibration" and gui_ctx.get("_cal_click_bull_mode"):
+        # Manual bull / ellipse seed on calibration camera preview
+        if gui_state.get("screen") == "calibration" and (
+            gui_ctx.get("_cal_click_bull_mode") or gui_ctx.get("_cal_click_ellipse_mode")
+        ):
             for tile in gui_ctx.get("_cal_tiles") or []:
                 vx1, vy1, vx2, vy2 = tile["video_rect"]
                 if not (vx1 <= x_canvas < vx2 and vy1 <= y_canvas < vy2):
@@ -4616,14 +4626,36 @@ def main():
                 fx = max(0.0, min(float(fw - 1), fx))
                 fy = max(0.0, min(float(fh - 1), fy))
                 cam_idx = int(tile["cam_idx"])
-                hints = dict(gui_ctx.get("bull_hints") or {})
-                hints[cam_idx] = (fx, fy)
-                gui_ctx["bull_hints"] = hints
+                if gui_ctx.get("_cal_click_bull_mode"):
+                    hints = dict(gui_ctx.get("bull_hints") or {})
+                    hints[cam_idx] = (fx, fy)
+                    gui_ctx["bull_hints"] = hints
+                    print(
+                        f"[dart] bull hint cam{cam_idx}: ({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
+                        flush=True,
+                    )
+                else:
+                    raw = dict(gui_ctx.get("ellipse_hints") or {})
+                    pts = list(raw.get(cam_idx) or raw.get(str(cam_idx)) or [])
+                    pts = [(float(p[0]), float(p[1])) for p in pts if p is not None and len(p) >= 2]
+                    near = max(18.0, min(float(fw), float(fh)) * 0.10)
+                    moved = False
+                    if pts:
+                        dists = [((fx - px) ** 2 + (fy - py) ** 2) ** 0.5 for px, py in pts]
+                        best = int(min(range(len(dists)), key=lambda i: dists[i]))
+                        if dists[best] <= near or len(pts) >= 4:
+                            pts[best] = (fx, fy)
+                            moved = True
+                    if not moved and len(pts) < 4:
+                        pts.append((fx, fy))
+                    raw[cam_idx] = pts[:4]
+                    gui_ctx["ellipse_hints"] = raw
+                    print(
+                        f"[dart] ellipse hint cam{cam_idx}: n={len(pts)} "
+                        f"last=({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
+                        flush=True,
+                    )
                 gui_ctx["_cal_last_tick"] = 0.0
-                print(
-                    f"[dart] bull hint cam{cam_idx}: ({fx:.1f},{fy:.1f}) — ponovo KALIBRIRAJ",
-                    flush=True,
-                )
                 return
 
         # Hits / keypad area (only on playing)
@@ -4965,15 +4997,23 @@ def main():
                         board_cal = gui_ctx.get("board_calibrator")
                         cal_buttons: List[dict] = []
                         cal_tiles: List[dict] = []
-                        click_mode = bool(gui_ctx.get("_cal_click_bull_mode"))
+                        click_bull = bool(gui_ctx.get("_cal_click_bull_mode"))
+                        click_ell = bool(gui_ctx.get("_cal_click_ellipse_mode"))
                         banner = ""
-                        if click_mode:
+                        if click_bull:
                             try:
                                 from kiosk_settings import get_settings
 
                                 banner = get_settings().t("click_bull_hint")
                             except Exception:
                                 banner = "Klikni otprilike na bull"
+                        elif click_ell:
+                            try:
+                                from kiosk_settings import get_settings
+
+                                banner = get_settings().t("click_ellipse_hint")
+                            except Exception:
+                                banner = "Klikni do 4 tocke na vanjskom rubu"
                         cal_img = build_calibration_view(
                             avail_w,
                             avail_h,
@@ -4982,9 +5022,11 @@ def main():
                             board_calibrator=board_cal,
                             buttons_out=cal_buttons,
                             bull_hints=dict(gui_ctx.get("bull_hints") or {}),
+                            ellipse_hints=dict(gui_ctx.get("ellipse_hints") or {}),
                             tiles_out=cal_tiles,
-                            click_bull_mode=click_mode,
+                            click_bull_mode=click_bull,
                             click_bull_banner=banner,
+                            click_ellipse_mode=click_ell,
                         )
                         gui_ctx["buttons"] = cal_buttons
                         gui_ctx["_cal_tiles"] = cal_tiles
@@ -5101,14 +5143,11 @@ def main():
                             board_cal.show_overlay = True
                         gui_ctx["_cal_last_tick"] = 0.0
                 elif gui_state.get("screen") == "calibration" and key == ord("o"):
-                    board_cal = gui_ctx.get("board_calibrator")
-                    if board_cal is not None:
-                        if board_cal.show_topdown:
-                            board_cal.show_topdown = False
-                            board_cal.show_overlay = True
-                        else:
-                            board_cal.show_overlay = not board_cal.show_overlay
-                        gui_ctx["_cal_last_tick"] = 0.0
+                    on = not bool(gui_ctx.get("_cal_click_ellipse_mode"))
+                    gui_ctx["_cal_click_ellipse_mode"] = on
+                    if on:
+                        gui_ctx["_cal_click_bull_mode"] = False
+                    gui_ctx["_cal_last_tick"] = 0.0
                 elif gui_state.get("screen") == "playing" and key == ord("d"):
                     _try_auto_detect_dart(force_log=True)
                 elif args.kiosk:

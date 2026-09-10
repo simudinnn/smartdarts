@@ -200,15 +200,56 @@ def normalized_ellipse_radius(ellipse: Ellipse, px: float, py: float) -> float:
     return float(math.sqrt((xr / a) ** 2 + (yr / b) ** 2))
 
 
-def is_point_outside_playable_board(
-    ellipse: Ellipse,
-    px: float,
-    py: float,
-    *,
-    inner_margin: float = 0.98,
-) -> bool:
-    """True za surround i potpuno izvan ploce (izvan double prstena)."""
-    return normalized_ellipse_radius(ellipse, px, py) > inner_margin
+def _resample_polyline(pts: np.ndarray, n: int) -> np.ndarray:
+    """pts (N,2) → n točaka duž zatvorenog oboda."""
+    if pts is None or len(pts) < 2:
+        return pts
+    closed = np.vstack([pts, pts[0:1]])
+    segs = np.sqrt(((closed[1:] - closed[:-1]) ** 2).sum(axis=1))
+    total = float(segs.sum())
+    if total < 1e-3:
+        return pts.astype(np.float32, copy=False)
+    d = np.concatenate([[0.0], np.cumsum(segs)])
+    out: List[np.ndarray] = []
+    for i in range(max(5, int(n))):
+        t = (float(i) / float(n)) * total
+        j = int(np.searchsorted(d, t, side="right") - 1)
+        j = max(0, min(len(segs) - 1, j))
+        span = float(segs[j]) if segs[j] > 1e-6 else 1.0
+        u = (t - float(d[j])) / span
+        out.append(closed[j] * (1.0 - u) + closed[j + 1] * u)
+    return np.asarray(out, dtype=np.float32)
+
+
+def _ellipse_from_hint_points(
+    points: List[Tuple[float, float]],
+    min_dim: float,
+) -> Optional[Ellipse]:
+    """Gruba vanjska elipsa iz 3–4 ručnih točaka (hull + fitEllipse)."""
+    if len(points) < 3:
+        return None
+    arr = np.array(points, dtype=np.float32)
+    try:
+        hull = cv2.convexHull(arr.reshape(-1, 1, 2)).reshape(-1, 2)
+    except cv2.error:
+        hull = arr
+    if hull is None or len(hull) < 3:
+        return None
+    sampled = _resample_polyline(hull, 24)
+    if sampled is None or len(sampled) < 5:
+        return None
+    try:
+        ellipse = cv2.fitEllipse(sampled.reshape(-1, 1, 2))
+    except cv2.error:
+        return None
+    (_ecx, _ecy), (ew, eh), _ang = ellipse
+    semi_max = 0.5 * max(float(ew), float(eh))
+    semi_min = 0.5 * min(float(ew), float(eh))
+    if semi_max < min_dim * 0.10 or semi_max > min_dim * 1.25:
+        return None
+    if semi_min < min_dim * 0.06:
+        return None
+    return ellipse
 
 
 def standard_ring_radii(double_outer_r: float) -> Dict[str, float]:
@@ -4005,16 +4046,26 @@ def _detect_double_ellipse(
     bull: Tuple[float, float],
     bull_r: float,
     min_dim: float,
+    extra_points: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[Optional[Ellipse], float]:
     cx, cy = bull
     points = _sample_ellipse_fit_points(red, green, cx, cy, bull_r)
+    extra = [p for p in (extra_points or []) if p is not None and len(p) >= 2]
+    if extra:
+        # Ručne točke na vanjskom rubu — ponovi da nadvladaju šum surrounda.
+        boost = extra * 10
+        points = list(points) + boost
     if len(points) < 12:
         points = _contour_double_points(red, green, bull, bull_r)
+        if extra:
+            points = list(points) + extra * 10
     ellipse, conf = _fit_double_ellipse(points, bull, bull_r, min_dim)
     if ellipse is not None:
         return _refine_ellipse_to_outer_double(ellipse, bull, bull_r, red, green), conf
 
     outer = _contour_double_points(red, green, bull, bull_r)
+    if extra:
+        outer = list(outer) + extra * 10
     ellipse, conf = _fit_double_ellipse(outer, bull, bull_r, min_dim)
     if ellipse is not None:
         return _refine_ellipse_to_outer_double(ellipse, bull, bull_r, red, green), conf
@@ -4228,6 +4279,7 @@ def calibrate_board(
     segment20_offset: int = 0,
     bull_hint_xy: Optional[Tuple[float, float]] = None,
     prior_bull_xy: Optional[Tuple[float, float]] = None,
+    ellipse_hint_xy: Optional[List[Tuple[float, float]]] = None,
 ) -> Optional[BoardCalibration]:
     if frame is None or frame.size == 0:
         return None
@@ -4259,13 +4311,26 @@ def calibrate_board(
     green = cv2.morphologyEx(green, cv2.MORPH_OPEN, kernel)
     green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, kernel)
 
+    hint_pts_up: List[Tuple[float, float]] = []
+    for p in ellipse_hint_xy or []:
+        if p is None or len(p) < 2:
+            continue
+        hint_pts_up.append((float(p[0]) * upscale, float(p[1]) * upscale))
+    hint_ell = _ellipse_from_hint_points(hint_pts_up, min_dim) if len(hint_pts_up) >= 3 else None
+
     # 1) Najveća R/G elipsa ploce (gdje god u kadru) → 2) bull SAMO unutar nje.
-    board_guess = _find_largest_rg_board_ellipse(red, green, min_dim)
+    # Ručne točke vanjske elipse: maskiraj surround (npr. crvena spužva).
+    board_guess = hint_ell
+    if board_guess is None:
+        board_guess = _find_largest_rg_board_ellipse(red, green, min_dim)
     search_red, search_green = red, green
     if board_guess is not None:
-        mask = _board_ellipse_mask((h, w), board_guess, shrink=1.02)
+        mask = _board_ellipse_mask((h, w), board_guess, shrink=1.08)
         search_red = cv2.bitwise_and(red, mask)
         search_green = cv2.bitwise_and(green, mask)
+        if hint_ell is not None:
+            red = search_red
+            green = search_green
 
     def _search(
         sr: np.ndarray,
@@ -4447,11 +4512,13 @@ def calibrate_board(
         return None
 
     center, bull_r, bull_conf = bull_hit
-    ellipse, board_conf = _detect_double_ellipse(red, green, center, bull_r, min_dim)
+    ellipse, board_conf = _detect_double_ellipse(
+        red, green, center, bull_r, min_dim, extra_points=hint_pts_up or None
+    )
     if ellipse is None and board_guess is not None:
         # Ako classic double-fit padne, koristi najveću RG elipsu (bez outside-scale).
         ellipse = board_guess
-        board_conf = 0.45
+        board_conf = 0.55 if hint_ell is not None else 0.45
     # Hint: if double-fit still missing, try dark/RG ellipse near bull.
     if ellipse is None and hint_xy is not None:
         near_ell = _find_largest_board_ellipse_near_hint(
@@ -5208,6 +5275,7 @@ class BoardCalibrator:
         *,
         target_size: Optional[Tuple[int, int]] = None,
         bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
+        ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
         prefer_stable: bool = False,
     ) -> List[int]:
         """Detektira ploču po kameri. Vraća indekse bez *kompletne* kalibracije.
@@ -5235,6 +5303,21 @@ class BoardCalibrator:
             if hv is None or len(hv) < 2:
                 continue
             hints_norm[ik] = (float(hv[0]), float(hv[1]))
+        ell_norm: Dict[int, List[Tuple[float, float]]] = {}
+        for hk, hv in (ellipse_hints or {}).items():
+            try:
+                ik = int(hk)
+            except (TypeError, ValueError):
+                continue
+            pts: List[Tuple[float, float]] = []
+            if not isinstance(hv, (list, tuple)):
+                continue
+            for p in hv:
+                if p is None or len(p) < 2:
+                    continue
+                pts.append((float(p[0]), float(p[1])))
+            if pts:
+                ell_norm[ik] = pts[:4]
         # Kamere čiji *ovaj* detect nije dao kompletnu kalibraciju (nakon politike).
         failed_this_run: List[int] = []
         for cam_idx, frame in frames.items():
@@ -5247,6 +5330,7 @@ class BoardCalibrator:
                 continue
 
             hint = hints_norm.get(cam_i)
+            ell_hint = ell_norm.get(cam_i)
             prior: Optional[Tuple[float, float]] = None
             if hint is None and old is not None and old.is_valid():
                 prior = (float(old.center[0]), float(old.center[1]))
@@ -5267,12 +5351,18 @@ class BoardCalibrator:
                     f"({prior[0]:.1f},{prior[1]:.1f})",
                     flush=True,
                 )
+            if ell_hint:
+                print(
+                    f"[cal] detect_all cam{cam_i}: ellipse hints n={len(ell_hint)}",
+                    flush=True,
+                )
             new_cal = calibrate_board(
                 frame,
                 cam_idx=cam_i,
                 segment20_offset=offset,
                 bull_hint_xy=hint,
                 prior_bull_xy=prior,
+                ellipse_hint_xy=ell_hint,
             )
             if new_cal is None:
                 if hint is not None:
@@ -5409,6 +5499,7 @@ class BoardCalibrator:
         *,
         attempts: int = 2,
         bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
+        ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
     ) -> Tuple[List[int], Dict[int, Optional[np.ndarray]]]:
         """Stabilna auto-kalibracija pri startu igre (bez KLIKNI BULL).
 
@@ -5425,7 +5516,10 @@ class BoardCalibrator:
             except TypeError:
                 last_frames = grab_frames()
             incomplete = self.detect_all(
-                last_frames, bull_hints=hints, prefer_stable=True
+                last_frames,
+                bull_hints=hints,
+                ellipse_hints=ellipse_hints,
+                prefer_stable=True,
             )
             if not incomplete:
                 break
@@ -5524,8 +5618,6 @@ class BoardCalibrator:
     def render_frames(self, frames: Dict[int, Optional[np.ndarray]]) -> Dict[int, Optional[np.ndarray]]:
         if self.show_topdown:
             return self.render_topdown_frames(frames)
-        if not self.show_overlay:
-            return frames
         out: Dict[int, Optional[np.ndarray]] = {}
         for cam_idx, frame in frames.items():
             if frame is None:
