@@ -4744,18 +4744,23 @@ def project_topdown_overlay_onto_frame(
     cal: BoardCalibration,
     *,
     out_size: int = DEBUG_WARP_SIZE,
+    maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
 ) -> np.ndarray:
     """Projiciraj Stage2 topdown overlay (fill+žice+prsteni) natrag na kameru."""
     if frame is None or frame.size == 0 or not cal.is_valid():
         return frame
     fh, fw = frame.shape[:2]
     size = int(out_size) if out_size > 0 else DEBUG_WARP_SIZE
-    maps = build_topdown_warp_maps(cal, out_size=size, frame_wh=(fw, fh))
     if maps is None:
-        return draw_board_overlay(frame, cal)
+        maps = build_topdown_warp_maps(cal, out_size=size, frame_wh=(fw, fh))
+    if maps is None:
+        out = frame.copy()
+        _paint_board_wire_overlay(out, cal)
+        return out
     map_x, map_y, _mask = maps
     cx_out, _view_r, board_r = _warp_radii(size)
-    rings = scoring_ring_radii(size, cal=cal)
+    # Isti idealni prsteni kao na topdown overlayu (Stage2 sjeda na board_r).
+    rings = standard_ring_radii(board_r)
     color = _WARP_OVERLAY_BGR
     out = frame.copy()
     before = out.copy()
@@ -5187,14 +5192,13 @@ class BoardCalibrator:
         for k in dead:
             self._warp_maps.pop(k, None)
 
-    def warp_topdown(
+    def _cached_warp_maps(
         self,
         cam_idx: int,
         frame: np.ndarray,
         *,
         out_size: int = DEBUG_WARP_SIZE,
-    ) -> Optional[np.ndarray]:
-        """Brzi topdown: spojene remap mape (1 remap/frame), cache po kameri."""
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         cal = self._cals.get(cam_idx)
         if cal is None or not cal.is_valid() or cal.double_ellipse is None or frame is None:
             return None
@@ -5207,6 +5211,19 @@ class BoardCalibrator:
             if maps is None:
                 return None
             self._warp_maps[key] = maps
+        return maps
+
+    def warp_topdown(
+        self,
+        cam_idx: int,
+        frame: np.ndarray,
+        *,
+        out_size: int = DEBUG_WARP_SIZE,
+    ) -> Optional[np.ndarray]:
+        """Brzi topdown: spojene remap mape (1 remap/frame), cache po kameri."""
+        maps = self._cached_warp_maps(cam_idx, frame, out_size=out_size)
+        if maps is None:
+            return None
         return apply_topdown_warp_maps(frame, maps)
 
     def map_topdown_click_to_camera(
@@ -5658,7 +5675,13 @@ class BoardCalibrator:
             if cal is None or not cal.is_valid():
                 out[cam_idx] = frame
                 continue
-            out[cam_idx] = draw_board_overlay(frame, cal)
+            maps = self._cached_warp_maps(int(cam_idx), frame)
+            if maps is not None:
+                out[cam_idx] = project_topdown_overlay_onto_frame(
+                    frame, cal, maps=maps
+                )
+            else:
+                out[cam_idx] = draw_board_overlay(frame, cal)
         return out
 
     def render_topdown_frames(
