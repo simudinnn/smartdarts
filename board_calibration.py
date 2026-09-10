@@ -2938,25 +2938,41 @@ def enrich_calibration_with_warp_rings(
     cal: BoardCalibration,
     *,
     out_size: int = DEBUG_WARP_SIZE,
+    seed_warp1_d: Optional[Ellipse] = None,
+    seed_warp1_t: Optional[Ellipse] = None,
+    seed_center: Optional[Tuple[float, float]] = None,
 ) -> BoardCalibration:
     """Stage1 (double→board_r) → Stage2 egg→circle (+ multi-ring) + residual.
 
     Overlay ostaje savršeni krugovi; Stage2 iterativno dovodi fizički D/T na njih.
+    Uvijek radi residual (i kad je Stage1 već blizu) da KALIBRIRAJ može dotjerati prstene.
     """
     if frame is None or not cal.has_board_ellipse():
+        if cal.has_ring_align_warp():
+            return cal
         return ensure_ring_align_warp(cal, out_size=out_size)
     size = int(out_size) if out_size > 0 else DEBUG_WARP_SIZE
     warped1 = warp_topdown_stage1(frame, cal, out_size=size)
     if warped1 is None:
+        if seed_warp1_d is not None or cal.has_ring_align_warp():
+            return cal
         return ensure_ring_align_warp(cal, out_size=out_size)
 
     d1 = detect_double_outer_ellipse_on_warp(warped1)
     if d1 is None:
+        d1 = seed_warp1_d
+    if d1 is None:
+        if cal.has_ring_align_warp():
+            return cal
         return ensure_ring_align_warp(cal, out_size=out_size)
     src = _stage2_source_center(warped1, d1)
+    if seed_center is not None:
+        src = (float(seed_center[0]), float(seed_center[1]))
     cx_out, _, board_r = _warp_radii(size)
     d_semi = max(_mean_ellipse_semi(d1), 1.0)
     t1 = detect_triple_outer_ellipse_on_warp(warped1, d1)
+    if t1 is None:
+        t1 = seed_warp1_t
     target_t = board_r * RING_TRIPLE_OUTER_FRAC
     bull1 = detect_bull_center_on_warp(warped1)
     bull_off1 = (
@@ -2967,7 +2983,12 @@ def enrich_calibration_with_warp_rings(
         and abs(_mean_ellipse_semi(t1) - target_t) / board_r > STAGE2_RADIUS_MAX_DEV
     ) or (bull_off1 >= 0.6)
 
-    warp1_d, warp1_t = d1, t1
+    # Ponovni KALIBRIRAJ: nastavi residual od prethodnog Stage2 umjesto da resetira.
+    if seed_warp1_d is not None:
+        warp1_d, warp1_t = seed_warp1_d, (seed_warp1_t if seed_warp1_t is not None else t1)
+        print("[calib] Stage2 continue from previous warp1", flush=True)
+    else:
+        warp1_d, warp1_t = d1, t1
     # Stage1 omjeri pojasa (inner/outer) — 4-ring Stage2 dovodi ih na nominalne krugove.
     s1_bands = _measure_rg_ring_band_radii(warped1, board_r=_mean_ellipse_semi(d1))
     di_ratio = float(RING_DOUBLE_INNER_FRAC)
@@ -3030,7 +3051,7 @@ def enrich_calibration_with_warp_rings(
             d_err_mean = float(np.mean(finite) - board_r)
             d_err_p90 = float(np.percentile(np.abs(finite - board_r), 90))
             score += d_err_p90 + abs(d_err_mean)
-            if abs(d_err_mean) >= 0.25:
+            if abs(d_err_mean) >= 0.12:
                 corr = float(np.clip(float(np.mean(finite)) / board_r, 0.92, 1.08))
                 warp1_d = _scale_ellipse(warp1_d, corr)
                 if warp1_t is not None:
@@ -3040,7 +3061,7 @@ def enrich_calibration_with_warp_rings(
                     f"[calib] Stage2 D-radius corr={corr:.4f} (mean={d_err_mean:+.2f}px)",
                     flush=True,
                 )
-            elif d_err_p90 >= 0.55:
+            elif d_err_p90 >= 0.28:
                 refined = _refine_stage2_ellipse_from_residual(
                     warp1_d, src, r_d, board_r, float(size)
                 )
@@ -3066,7 +3087,7 @@ def enrich_calibration_with_warp_rings(
                 t_err_mean = float(np.mean(finite_t) - target_t)
                 t_err_p90 = float(np.percentile(np.abs(finite_t - target_t), 90))
                 score += t_err_p90 + abs(t_err_mean)
-                if abs(t_err_mean) >= 0.22:
+                if abs(t_err_mean) >= 0.12:
                     corr_t = float(
                         np.clip(float(np.mean(finite_t)) / max(target_t, 1.0), 0.90, 1.12)
                     )
@@ -3076,7 +3097,7 @@ def enrich_calibration_with_warp_rings(
                         f"[calib] Stage2 T-radius corr={corr_t:.4f} (mean={t_err_mean:+.2f}px)",
                         flush=True,
                     )
-                elif t_err_p90 >= 0.55:
+                elif t_err_p90 >= 0.28:
                     refined_t = _refine_stage2_ellipse_from_residual(
                         warp1_t, src, r_t, target_t, float(size)
                     )
@@ -3091,11 +3112,11 @@ def enrich_calibration_with_warp_rings(
 
         if score < best_score - 0.02:
             best_score = score
-        elif did and score >= best_score - 0.02 and _iter >= 1:
-            # Nema napretka — prestani da ne oscilira.
+        elif did and score >= best_score - 0.02 and _iter >= 2:
+            # Nema napretka — prestani da ne oscilira (min 3 prolaza).
             break
 
-        if not did:
+        if not did and _iter >= 2:
             break
 
     final_img = apply_ring_align_warp(
@@ -4260,29 +4281,6 @@ def _recover_calibration_geometry(old: BoardCalibration, new: BoardCalibration) 
         )
     if not patched.has_wires() and old.has_wires():
         patched = replace(patched, wire_angles_deg=old.wire_angles_deg)
-    if not patched.has_measured_rings() and old.has_measured_rings():
-        patched = replace(
-            patched,
-            measured_double_outer_frac=old.measured_double_outer_frac,
-            measured_double_inner_frac=old.measured_double_inner_frac,
-            measured_triple_outer_frac=old.measured_triple_outer_frac,
-            measured_triple_inner_frac=old.measured_triple_inner_frac,
-            warp_ring_size=old.warp_ring_size,
-            warp_double_outer=old.warp_double_outer,
-            warp_double_inner=old.warp_double_inner,
-            warp_triple_outer=old.warp_triple_outer,
-            warp_triple_inner=old.warp_triple_inner,
-            warp1_double_outer=old.warp1_double_outer,
-            warp1_triple_outer=old.warp1_triple_outer,
-            warp1_center=old.warp1_center,
-        )
-    elif not patched.has_ring_align_warp() and old.has_ring_align_warp():
-        patched = replace(
-            patched,
-            warp1_double_outer=old.warp1_double_outer,
-            warp1_triple_outer=old.warp1_triple_outer,
-            warp1_center=old.warp1_center,
-        )
     patched = replace(patched, segment20_offset=int(old.segment20_offset))
     refresh_segment20_fields(patched)
     return patched
@@ -4886,9 +4884,10 @@ def project_topdown_overlay_onto_frame(
     *,
     out_size: int = DEBUG_WARP_SIZE,
     maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
-    show_bull_rings: bool = False,
+    show_bull_rings: bool = True,
 ) -> np.ndarray:
     """Projiciraj Stage2 topdown overlay (fill+žice+prsteni) natrag na kameru."""
+    _ = show_bull_rings
     if frame is None or frame.size == 0 or not cal.is_valid():
         return frame
     fh, fw = frame.shape[:2]
@@ -4959,13 +4958,13 @@ def project_topdown_overlay_onto_frame(
         _punch_bull_disk(out, before, float(c_pt[0]), float(c_pt[1]), float(br))
 
     ring_keys = (
+        "bull_inner",
+        "bull_outer",
         "triple_inner",
         "triple_outer",
         "double_inner",
         "double_outer",
     )
-    if show_bull_rings:
-        ring_keys = ("bull_inner", "bull_outer") + ring_keys
     for key in ring_keys:
         ell = _fit_cam_ellipse_from_td_ring(
             map_x, map_y, cx_out, cx_out, float(rings[key]), fw=fw, fh=fh
@@ -5613,7 +5612,29 @@ class BoardCalibrator:
                     new_cal = _stabilize_calibration(
                         old, new_cal, CALIBRATION_BLEND_ALPHA
                     )
-                new_cal = enrich_calibration_with_warp_rings(frame, new_cal)
+                seed_d = None
+                seed_t = None
+                seed_c = None
+                if (
+                    (not prefer_stable)
+                    and old is not None
+                    and old.has_ring_align_warp()
+                    and old.warp1_double_outer is not None
+                    and bull_shift <= stable_shift
+                    and not _ellipse_jump_too_far(
+                        old, new_cal, float(min(frame.shape[0], frame.shape[1]))
+                    )
+                ):
+                    seed_d = old.warp1_double_outer
+                    seed_t = old.warp1_triple_outer
+                    seed_c = old.warp1_center
+                new_cal = enrich_calibration_with_warp_rings(
+                    frame,
+                    new_cal,
+                    seed_warp1_d=seed_d,
+                    seed_warp1_t=seed_t,
+                    seed_center=seed_c,
+                )
                 # Jamstvo: Stage2 podaci uvijek postoje i spremaju se.
                 if not new_cal.has_ring_align_warp():
                     new_cal = ensure_ring_align_warp(new_cal)
@@ -5844,7 +5865,7 @@ class BoardCalibrator:
         self,
         frames: Dict[int, Optional[np.ndarray]],
         *,
-        show_bull_rings: bool = False,
+        show_bull_rings: bool = True,
     ) -> Dict[int, Optional[np.ndarray]]:
         if self.show_topdown:
             return self.render_topdown_frames(frames)
@@ -5900,12 +5921,13 @@ class BoardCalibrator:
         return out
 
     def status_summary(self) -> str:
+        n_ok = sum(1 for cal in self._cals.values() if _is_calibration_complete(cal))
+        n_total = 3
         if self._last_detect_reasons:
             detail = self.format_incomplete_status()
-            return f"Kalibracija nepotpuna — {detail}" if detail else "Kalibracija nepotpuna"
-        n_ok = sum(1 for cal in self._cals.values() if _is_calibration_complete(cal))
-        if n_ok <= 0 and not self._cals:
-            return "Pritisni B za kalibraciju  |  strelice: pomak segmenta 20"
+            if detail:
+                return f"{n_ok}/{n_total} OK — {detail}"
+            return f"{n_ok}/{n_total} OK — nepotpuno"
         if n_ok > 0:
-            return f"Kompletno kalibrirano: {n_ok} kam."
-        return ""
+            return f"{n_ok}/{n_total} OK"
+        return "Nema kalibracije"

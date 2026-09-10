@@ -485,6 +485,45 @@ def _draw_button(
     cv2.putText(panel, label, (tx, ty), cv2.FONT_HERSHEY_DUPLEX, scale, (0, 0, 0), thickness)
 
 
+def _draw_status_chip(
+    img: np.ndarray,
+    text: str,
+    *,
+    x: int,
+    y: int,
+    scale: float,
+    color: Tuple[int, int, int] = (255, 220, 120),
+) -> None:
+    """Readable status in the corner: dark plate + text (never overdrawn)."""
+    text = str(text or "").strip()
+    if not text:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thick = 2
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+    pad_x, pad_y = 10, 6
+    x1 = max(0, int(x))
+    y2 = min(img.shape[0] - 1, int(y))
+    y1 = max(0, y2 - th - bl - pad_y * 2)
+    x2 = min(img.shape[1] - 1, x1 + tw + pad_x * 2)
+    roi = img[y1:y2, x1:x2]
+    if roi.size:
+        img[y1:y2, x1:x2] = (
+            roi.astype(np.float32) * 0.28 + np.array((12, 12, 16), np.float32) * 0.72
+        ).astype(np.uint8)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (70, 70, 80), 1)
+    cv2.putText(
+        img,
+        text,
+        (x1 + pad_x, y2 - pad_y - bl),
+        font,
+        scale,
+        color,
+        thick,
+        cv2.LINE_AA,
+    )
+
+
 def _draw_bull_hint_marker(img: np.ndarray, x: float, y: float) -> None:
     """Cross + circle at approximate bull click (frame coords)."""
     cx, cy = int(round(x)), int(round(y))
@@ -599,57 +638,31 @@ def build_calibration_view(
     title_y = margin + th
     cv2.putText(panel, title, ((width - tw) // 2, title_y), cv2.FONT_HERSHEY_DUPLEX, title_scale, (235, 235, 235), 2)
 
-    hint = f"2/ESC izlaz  |  B kalibriraj  |  O elipsa  |  T topdown  |  < > seg.20"
-    if (click_bull_mode or click_ellipse_mode) and click_bull_banner:
-        hint = click_bull_banner
-    hint_scale = max(0.36, min(0.48, width / 1500.0))
-    (hw, hh), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, hint_scale, 1)
-    if click_bull_mode:
-        hint_color = (0, 220, 255)
-    elif click_ellipse_mode:
-        hint_color = (40, 90, 255)
-    else:
-        hint_color = (130, 130, 130)
-    cv2.putText(
-        panel,
-        hint,
-        ((width - hw) // 2, title_y + int(th * 0.55) + hh + 4),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        hint_scale,
-        hint_color,
-        1,
-    )
+    # Qt kiosk already has its own click banner. OpenCV-only UI keeps the mode hint.
+    hint_extra = 0
+    if draw_action_buttons and (click_bull_mode or click_ellipse_mode) and click_bull_banner:
+        hint_scale = max(0.36, min(0.48, width / 1500.0))
+        (hw, hh), _ = cv2.getTextSize(click_bull_banner, cv2.FONT_HERSHEY_SIMPLEX, hint_scale, 1)
+        hint_color = (0, 220, 255) if click_bull_mode else (40, 90, 255)
+        cv2.putText(
+            panel,
+            click_bull_banner,
+            ((width - hw) // 2, title_y + int(th * 0.45) + hh + 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            hint_scale,
+            hint_color,
+            1,
+        )
+        hint_extra = hh + int(th * 0.45) + 6
 
     board_status = board_calibrator.status_summary() if board_calibrator is not None else ""
+    status_text = str(status or board_status or "").strip()
 
     btn_h = max(40, int(height * 0.065)) if draw_action_buttons else 0
     btn_gap = max(8, int(width * 0.01))
     btn_y2 = height - margin
     btn_y1 = btn_y2 - btn_h if draw_action_buttons else height - margin
-    footer_h = 44 if draw_action_buttons else 8
-
-    if board_status:
-        st_scale = max(0.48, min(0.62, width / 1200.0))
-        cv2.putText(
-            panel,
-            board_status,
-            (margin, max(title_y + th + 24, btn_y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            st_scale,
-            (255, 200, 80),
-            2,
-        )
-    if status:
-        st_scale = max(0.42, min(0.52, width / 1400.0))
-        cv2.putText(
-            panel,
-            status,
-            (margin, btn_y1 - footer_h + 6),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            st_scale,
-            (100, 220, 100),
-            1,
-        )
+    status_bar_h = 34
 
     btn_specs = [
         ("calibration_back", "NAZAD"),
@@ -679,8 +692,8 @@ def build_calibration_view(
             if buttons_out is not None:
                 buttons_out.append({"id": bid, "rect": (bx1, btn_y1, bx2, btn_y2)})
 
-    top = title_y + int(th * 1.6) + margin
-    bottom = btn_y1 - margin - footer_h
+    top = title_y + hint_extra + max(10, int(th * 0.35))
+    bottom = btn_y1 - status_bar_h
     avail_h = max(1, bottom - top)
     gap = max(8, int(width * 0.012))
     cell_w = max(1, (width - 2 * margin - gap * (len(CAMERA_INDICES) - 1)) // len(CAMERA_INDICES))
@@ -691,9 +704,7 @@ def build_calibration_view(
     # Overlay is always on (topdown is a separate warp view). Clicks unwarp when needed.
     display_frames = frames
     if board_calibrator is not None:
-        display_frames = board_calibrator.render_frames(
-            frames, show_bull_rings=bool(click_bull_mode)
-        )
+        display_frames = board_calibrator.render_frames(frames)
 
     for i, cam_idx in enumerate(CAMERA_INDICES):
         x1 = margin + i * (cell_w + gap)
@@ -818,5 +829,15 @@ def build_calibration_view(
             )
 
         panel[y1:y2, x1:x2] = tile
+
+    if status_text:
+        st_scale = max(0.50, min(0.64, width / 1100.0))
+        _draw_status_chip(
+            panel,
+            status_text,
+            x=margin,
+            y=btn_y1 - 4,
+            scale=st_scale,
+        )
 
     return panel
