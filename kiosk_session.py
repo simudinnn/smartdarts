@@ -32,6 +32,7 @@ from dart_detection import (
 
 import main_manual as mm
 from kiosk_settings import get_settings, load_settings, start_qr_image_path, update_settings
+from kiosk_stats import record_auto_hit, record_correction, record_game, record_manual_hit
 from league_qr import ensure_game_qr
 
 
@@ -104,6 +105,7 @@ class KioskSession:
             "ellipse_hints": {},
             "_cal_click_bull_mode": False,
             "_cal_click_ellipse_mode": False,
+            "_hit_sources": [None, None, None],
             "_ingame_cal_open": False,
             "_ingame_cal_phase": "",
             "_ingame_cal_status": "",
@@ -228,10 +230,40 @@ class KioskSession:
             self.open_hit_editor(slot)
             return
 
-    def set_turn_hit(self, slot: int, hit: mm.DetectedHit) -> None:
+    def _reset_hit_sources(self) -> None:
+        self.ctx["_hit_sources"] = [None, None, None]
+
+    def _note_hit_stat(self, slot: int, hit: mm.DetectedHit, source: str) -> None:
+        sources = list(self.ctx.get("_hit_sources") or [None, None, None])
+        while len(sources) < 3:
+            sources.append(None)
+        game = self.ctx.get("game") or {}
+        turn_hits = game.get("turn_hits", [None, None, None])
+        old = turn_hits[slot] if 0 <= slot < 3 else None
+        old_src = sources[slot] if 0 <= slot < 3 else None
+        old_tag = mm._hit_tag(old) if old is not None else None
+        new_tag = mm._hit_tag(hit)
+        if source == "auto":
+            record_auto_hit()
+            if 0 <= slot < 3:
+                sources[slot] = "auto"
+            self.ctx["_hit_sources"] = sources
+            return
+        if old_src == "auto" and old_tag and old_tag != new_tag:
+            record_correction(old_tag)
+        elif old_tag != new_tag:
+            record_manual_hit()
+        if 0 <= slot < 3:
+            sources[slot] = "manual"
+        self.ctx["_hit_sources"] = sources
+
+    def set_turn_hit(
+        self, slot: int, hit: mm.DetectedHit, *, source: str = "manual"
+    ) -> None:
         game = self.ctx.get("game") or {}
         turn_hits = game.get("turn_hits", [None, None, None])
         if 0 <= slot < 3:
+            self._note_hit_stat(slot, hit, source)
             turn_hits[slot] = hit
             game["turn_hits"] = turn_hits
             self.all_hits.append(hit)
@@ -382,7 +414,9 @@ class KioskSession:
         dart_det = self.ctx.get("dart_detector")
         if dart_det is not None:
             dart_det.reset_motion_state()
+        self._reset_hit_sources()
         self.ensure_manual_hit_editor()
+        record_game(str(self.state.get("selected_game_mode") or ""))
         print("[dart] igra pokrenuta", flush=True)
 
     def sync_board_refs_after_undo(self) -> None:
@@ -532,6 +566,7 @@ class KioskSession:
         if not g:
             return
         g["turn_hits"] = [None, None, None]
+        self._reset_hit_sources()
         self.ctx["_dart_status"] = ""
         self.ctx["_dart_wait_board_clear"] = False
         self.ctx["_dart_board_clear_frames"] = 0
@@ -625,6 +660,7 @@ class KioskSession:
             # Edited turn ended the game — drop interrupted next-player hits
             g["turn_hits"] = [None, None, None]
             g["undo_stack"] = []
+        self._reset_hit_sources()
         self.ctx["_dart_undo_target_player"] = None
         self.ctx["_dart_undo_pending_hits"] = None
         self.ctx["_dart_undo_pending_bull_steals"] = None
@@ -695,6 +731,7 @@ class KioskSession:
             self.state["current_player_idx"] = nxt_for_undo
             mm._advance_round_if_needed(g, cur, nxt_for_undo)
         g["turn_hits"] = [None, None, None]
+        self._reset_hit_sources()
         self.ctx["_dart_status"] = ""
         self.ctx["_dart_wait_board_clear"] = False
         self.ctx["_dart_board_clear_frames"] = 0
@@ -868,7 +905,7 @@ class KioskSession:
                 self.ctx["_dart_undo_pending_hits"] = pending
                 self.all_hits.append(hit)
             return
-        self.set_turn_hit(slot, hit)
+        self.set_turn_hit(slot, hit, source="auto")
 
     def try_auto_detect_dart(self, *, force_log: bool = False, undo_mode: bool = False) -> bool:
         """Sinhrono (hotkey D) — vision nit koristi _auto_detect_vision + queue."""
@@ -1434,6 +1471,11 @@ class KioskSession:
             turn_hits = g.get("turn_hits", [None, None, None])
             if 0 <= int(editing_slot) < 3:
                 turn_hits[int(editing_slot)] = None
+                sources = list(self.ctx.get("_hit_sources") or [None, None, None])
+                while len(sources) < 3:
+                    sources.append(None)
+                sources[int(editing_slot)] = None
+                self.ctx["_hit_sources"] = sources
             else:
                 mm._clear_one_slot(turn_hits)
             g["turn_hits"] = turn_hits
@@ -1469,7 +1511,7 @@ class KioskSession:
             n = int(kid.split(":", 1)[1])
             hit = mm._make_number_hit(n, int(self.ctx.get("input_multiplier", 1)))
         if hit is not None and 0 <= int(editing_slot) < 3:
-            self.set_turn_hit(int(editing_slot), hit)
+            self.set_turn_hit(int(editing_slot), hit, source="manual")
             if int(self.ctx.get("input_multiplier", 1)) in (2, 3):
                 self.ctx["input_multiplier"] = 1
             if self.is_manual_mode():

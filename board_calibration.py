@@ -490,6 +490,17 @@ def scoring_ring_ellipses(
     }
 
 
+def _segment_slot_from_theta(theta_deg: float, segment20_offset: int = 0) -> int:
+    """Kut na topdown warpu (0°=gore, clockwise) → indeks BOARD_SEGMENT_NUMBERS.
+
+    Granice su žice (±9° od centra segmenta). `round(theta/18)` je krivo:
+    Python 3 round(19.5)=20 pa žica 20/5 (351°) uvijek padne u 20.
+    """
+    step = float(SEGMENT_STEP_DEG)
+    slot = int(math.floor((float(theta_deg) % 360.0 + 0.5 * step) / step)) % SEGMENT_COUNT
+    return (slot - int(segment20_offset)) % SEGMENT_COUNT
+
+
 def topdown_point_to_score(
     px: float,
     py: float,
@@ -522,8 +533,7 @@ def topdown_point_to_score(
         bull_outer = mean_d * RING_BULL_OUTER_FRAC
         # Segment kut od centra warpa (seg.20 gore).
         theta = math.degrees(math.atan2(dx, -dy)) % 360.0
-        seg_slot = int(round(theta / SEGMENT_STEP_DEG)) % SEGMENT_COUNT
-        number = BOARD_SEGMENT_NUMBERS[(seg_slot - int(segment20_offset)) % SEGMENT_COUNT]
+        number = BOARD_SEGMENT_NUMBERS[_segment_slot_from_theta(theta, segment20_offset)]
 
         if r <= bull_inner:
             return 50, "inner_bull", 50
@@ -554,8 +564,7 @@ def topdown_point_to_score(
         return 25, "outer_bull", 25
 
     theta = math.degrees(math.atan2(dx, -dy)) % 360.0
-    seg_slot = int(round(theta / SEGMENT_STEP_DEG)) % SEGMENT_COUNT
-    number = BOARD_SEGMENT_NUMBERS[(seg_slot - int(segment20_offset)) % SEGMENT_COUNT]
+    number = BOARD_SEGMENT_NUMBERS[_segment_slot_from_theta(theta, segment20_offset)]
 
     if use_rings["triple_inner"] <= r <= use_rings["triple_outer"]:
         return number, "triple", number * 3

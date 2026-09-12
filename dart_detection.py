@@ -36,7 +36,7 @@ MOTION_LOG_MIN_PIXELS = 6
 # Idle LED/USB flicker is often ~8–20 px; a real dart is far above this.
 MOTION_ARM_PIXELS = 28
 MOTION_CLEAR_PIXELS = 12
-SETTLE_FRAME_DELAY = 4
+SETTLE_FRAME_DELAY = 2
 # FitLine (2-stage): soft grayscale motion gated by dilated morph ROI →
 # fixed FITLINE_SIZE → mild Gaussian blur → radial flight downweight →
 # intensity-weighted PCA (stage1) → multicam tip fuse → stage2 FitLine on
@@ -132,7 +132,7 @@ EMPTY_BOARD_DIFF_APPLY_MIN_PX = 400
 EMPTY_BOARD_RAW_HAND_PIXELS = 2800
 # Nakon hita: prikazi odmah, pa 0.5s da se ne upisu dva hita odjednom.
 # (Ne rearm koji ceka px<12 — to se zaglavi na sumu.)
-POST_HIT_COOLDOWN_SEC = 0.50
+POST_HIT_COOLDOWN_SEC = 0.28
 # Leftover shaft after a real hit is radial; 1-cam fuse projects to bull.
 BULL_MIN_CAMS = 2
 BULL_MOTION_MAX_BULL_OUTER = 2.2
@@ -3261,10 +3261,12 @@ class DartMotionDetector:
                 and max_px >= MOTION_ARM_PIXELS
             ):
                 self._motion_state = "armed"
-                self._armed_frames = 1
+                self._armed_frames = 0
                 self._hand_stable_streak = 0
-            self._cache_settle_frame(board_calibrator, frames, keep_bgr=False)
-            return probe, None, "idle"
+                state = "armed"
+            else:
+                self._cache_settle_frame(board_calibrator, frames, keep_bgr=False)
+                return probe, None, "idle"
 
         # armed — settle + stabilnost (ignoriraj ruku)
         if max_px < MOTION_ARM_PIXELS:

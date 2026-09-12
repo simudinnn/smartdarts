@@ -300,6 +300,12 @@ from kiosk_settings import (
     get_settings,
     update_settings,
 )
+from kiosk_stats import (
+    game_label,
+    load_stats,
+    top_corrected,
+    top_games,
+)
 import main_manual as mm
 
 
@@ -3689,6 +3695,7 @@ class MainWindow(QMainWindow):
 
         self._build_pin_overlay(root)
         self._build_quit_overlay(root)
+        self._build_stats_overlay(root)
         self._build_idle_overlay(root)
         self._build_killer_bull_overlay(root)
         self._build_ingame_cal_overlay(root)
@@ -3895,6 +3902,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "quit_overlay") and self.quit_overlay.isVisible():
             self.quit_overlay.setGeometry(0, 0, root.width(), root.height())
             self.quit_overlay.raise_()
+        if hasattr(self, "stats_overlay") and self.stats_overlay.isVisible():
+            self.stats_overlay.setGeometry(0, 0, root.width(), root.height())
+            self.stats_overlay.raise_()
         if hasattr(self, "name_overlay") and self.name_overlay.isVisible():
             self.name_overlay.setGeometry(0, 0, root.width(), root.height())
             self.name_overlay.raise_()
@@ -3912,6 +3922,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "idle_overlay") and self.idle_overlay.isVisible():
             self.idle_overlay.setGeometry(0, 0, root.width(), root.height())
             self.idle_overlay.raise_()
+        if hasattr(self, "stats_overlay") and self.stats_overlay.isVisible():
+            self.stats_overlay.raise_()
 
     def _update_settings_fab_visibility(self) -> None:
         if not hasattr(self, "settings_fab"):
@@ -3952,6 +3964,14 @@ class MainWindow(QMainWindow):
         if action == "settings_change_password":
             self._show_pin("set_new")
             return
+        if action == "settings_report":
+            self._show_stats_report()
+            return
+        if action == "settings_report_close":
+            self._hide_stats_report()
+            return
+        if action in ("settings_back", "settings_calibration"):
+            self._hide_stats_report()
         if action == "settings_quit":
             self._show_quit_confirm("exit")
             return
@@ -4164,6 +4184,84 @@ class MainWindow(QMainWindow):
         row.addWidget(self.quit_no_btn, 1)
         cl.addLayout(row)
         ol.addWidget(card, 0, Qt.AlignCenter)
+
+    def _build_stats_overlay(self, root: QWidget) -> None:
+        self.stats_overlay = QWidget(root)
+        self.stats_overlay.setObjectName("StatsOverlay")
+        self.stats_overlay.hide()
+        self.stats_overlay.setStyleSheet(
+            "QWidget#StatsOverlay { background-color: rgba(0,0,0,190); }"
+        )
+        ol = QVBoxLayout(self.stats_overlay)
+        ol.setContentsMargins(40, 32, 40, 32)
+        ol.setAlignment(Qt.AlignCenter)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(920)
+        card.setMaximumWidth(1100)
+        cl = QVBoxLayout(card)
+        cl.setSpacing(18)
+        cl.setContentsMargins(36, 28, 36, 28)
+
+        self.stats_title = QLabel("")
+        self.stats_title.setObjectName("SettingsTitle")
+        self.stats_title.setAlignment(Qt.AlignCenter)
+        self.stats_title.setWordWrap(True)
+        cl.addWidget(self.stats_title)
+
+        self.stats_body = QLabel("")
+        self.stats_body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.stats_body.setWordWrap(True)
+        self.stats_body.setStyleSheet(
+            "font-size: 32px; font-weight: 600; color: #f2f2f2; line-height: 1.35;"
+        )
+        cl.addWidget(self.stats_body)
+
+        self.stats_close_btn = _btn("ZATVORI", "settings_report_close", role="Primary", tall=True)
+        self.stats_close_btn.setFocusPolicy(Qt.NoFocus)
+        cl.addWidget(self.stats_close_btn)
+        ol.addWidget(card, 0, Qt.AlignCenter)
+
+    def _hide_stats_report(self) -> None:
+        if hasattr(self, "stats_overlay"):
+            self.stats_overlay.hide()
+
+    def _show_stats_report(self) -> None:
+        if not hasattr(self, "stats_overlay"):
+            return
+        t = get_settings().t
+        data = load_stats()
+        auto_n = int(data.get("auto_hits", 0) or 0)
+        man_n = int(data.get("manual_hits", 0) or 0)
+        corr_n = int(data.get("corrected_hits", 0) or 0)
+        games = top_games(6)
+        nums = top_corrected(5)
+        none = t("report_none")
+        if nums:
+            num_txt = ",  ".join(f"{tag} ({n})" for tag, n in nums)
+        else:
+            num_txt = none
+        if games:
+            game_txt = ",  ".join(f"{game_label(mode)} ({n})" for mode, n in games)
+            top_game = f"{game_label(games[0][0])} ({games[0][1]})"
+        else:
+            game_txt = none
+            top_game = none
+        lines = [
+            f"{t('report_auto')}:  {auto_n}",
+            f"{t('report_manual')}:  {man_n}",
+            f"{t('report_corrected')}:  {corr_n}",
+            f"{t('report_top_numbers')}:  {num_txt}",
+            f"{t('report_top_games')}:  {top_game}",
+            f"{t('report_games')}:  {game_txt}",
+        ]
+        self.stats_title.setText(t("report_title"))
+        self.stats_body.setText("\n".join(lines))
+        self.stats_close_btn.setText(t("report_close"))
+        self.stats_overlay.show()
+        self.stats_overlay.raise_()
+        self._place_chrome(wallpaper=False)
 
     def _build_idle_overlay(self, root: QWidget) -> None:
         self.idle_overlay = QWidget(root)
@@ -6177,8 +6275,10 @@ class MainWindow(QMainWindow):
         foot = QHBoxLayout()
         foot.setSpacing(16)
         self.settings_back_btn = _btn("NATRAG", "settings_back", role="Footer", tall=True)
+        self.settings_report_btn = _btn("IZVJEŠTAJ", "settings_report", role="Footer", tall=True)
         self.settings_cal_btn = _btn("KALIBRACIJA", "settings_calibration", role="Accent", tall=True)
         foot.addWidget(self.settings_back_btn, 1)
+        foot.addWidget(self.settings_report_btn, 1)
         foot.addWidget(self.settings_cal_btn, 1)
         lay.addLayout(foot)
         return w
@@ -6235,6 +6335,8 @@ class MainWindow(QMainWindow):
                 self.settings_league_qr_lbl.setText(t("league_qr"))
             self.settings_cal_btn.setText(t("calibration"))
             self.settings_back_btn.setText(t("back"))
+            if hasattr(self, "settings_report_btn"):
+                self.settings_report_btn.setText(t("report"))
             if hasattr(self, "settings_auto_cal_lbl"):
                 self.settings_auto_cal_lbl.setText(t("auto_calibrate"))
             if hasattr(self, "settings_pw_lbl"):
