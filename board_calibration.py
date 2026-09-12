@@ -87,7 +87,24 @@ EDGE_REFINE_STEP_DEG = 0.5
 CANNY_LOW = 40
 CANNY_HIGH = 120
 CALIBRATION_FILENAME = "board_calibration.json"
-DEBUG_SAVE_CANNY_EDGES = True
+# Production default False: do not write Canny/masked/wires/topdown PNGs.
+# Manual enable: set True here, or SMARTDARTS_CAL_DEBUG=1 in the environment.
+DEBUG_SAVE_CANNY_EDGES = False
+if os.environ.get("SMARTDARTS_CAL_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+    DEBUG_SAVE_CANNY_EDGES = True
+CAL_SNAPSHOT_ENABLED = os.environ.get("SMARTDARTS_CAL_SNAPSHOT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _perf_ms(t0: float) -> float:
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def _perf_cal(msg: str) -> None:
+    print(f"[PERF][CAL] {msg}", flush=True)
 
 
 @dataclass
@@ -153,6 +170,184 @@ def _is_calibration_complete(cal: Optional[BoardCalibration]) -> bool:
         and cal.has_board_ellipse()
         and cal.has_wires()
     )
+
+
+def _debug_calibration_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_calibration")
+
+
+def _ellipse_to_golden(ell: Optional[Ellipse]) -> Optional[dict]:
+    if ell is None:
+        return None
+    (cx, cy), (w, h), ang = ell
+    return {
+        "center": [float(cx), float(cy)],
+        "axes": [float(w), float(h)],
+        "angle": float(ang),
+    }
+
+
+def calibration_golden_entry(cam_idx: int, cal: Optional[BoardCalibration]) -> dict:
+    """Reference geometry for one camera (future optimizer must match this)."""
+    if cal is None:
+        return {"cam_idx": int(cam_idx), "complete": False}
+    return {
+        "cam_idx": int(cam_idx),
+        "complete": bool(_is_calibration_complete(cal)),
+        "bull": [float(cal.center[0]), float(cal.center[1])],
+        "bull_radius": float(cal.bull_radius),
+        "confidence": float(cal.confidence),
+        "board_confidence": float(cal.board_confidence),
+        "double_ellipse": _ellipse_to_golden(cal.double_ellipse),
+        "wire_angles_deg": [float(a) for a in cal.wire_angles_deg],
+        "segment20_offset": int(cal.segment20_offset),
+        "segment20_wire_sector": int(cal.segment20_wire_sector),
+        "segment20_wire_end": int(cal.segment20_wire_end),
+        "align_rotation_deg": float(cal.align_rotation_deg),
+        "stage1_double": _ellipse_to_golden(cal.warp1_double_outer),
+        "stage1_triple": _ellipse_to_golden(cal.warp1_triple_outer),
+        "stage2_center": (
+            [float(cal.warp1_center[0]), float(cal.warp1_center[1])]
+            if cal.warp1_center is not None
+            else None
+        ),
+        "final_double_outer": _ellipse_to_golden(cal.warp_double_outer),
+        "final_double_inner": _ellipse_to_golden(cal.warp_double_inner),
+        "final_triple_outer": _ellipse_to_golden(cal.warp_triple_outer),
+        "final_triple_inner": _ellipse_to_golden(cal.warp_triple_inner),
+        "measured_double_outer_frac": float(cal.measured_double_outer_frac),
+        "measured_double_inner_frac": float(cal.measured_double_inner_frac),
+        "measured_triple_outer_frac": float(cal.measured_triple_outer_frac),
+        "measured_triple_inner_frac": float(cal.measured_triple_inner_frac),
+        "warp_ring_size": int(cal.warp_ring_size),
+        "stage2_double_inner_ratio": float(cal.stage2_double_inner_ratio),
+        "stage2_triple_inner_ratio": float(cal.stage2_triple_inner_ratio),
+    }
+
+
+def save_calibration_input_snapshot(
+    frames: Dict[int, Optional[np.ndarray]],
+    *,
+    bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
+    ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
+) -> None:
+    """DEBUG: save the exact BGR frames + hints used by this detect_all."""
+    if not CAL_SNAPSHOT_ENABLED:
+        return
+    d = _debug_calibration_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    meta_hints_b: dict = {}
+    meta_hints_e: dict = {}
+    for cam_idx, frame in frames.items():
+        cam_i = int(cam_idx)
+        if frame is None or frame.size == 0:
+            continue
+        path = os.path.join(d, f"input_cam{cam_i}.png")
+        try:
+            cv2.imwrite(path, frame)
+        except Exception:
+            continue
+    for hk, hv in (bull_hints or {}).items():
+        try:
+            meta_hints_b[str(int(hk))] = [float(hv[0]), float(hv[1])]
+        except (TypeError, ValueError, IndexError):
+            continue
+    for hk, hv in (ellipse_hints or {}).items():
+        try:
+            ik = int(hk)
+        except (TypeError, ValueError):
+            continue
+        pts = []
+        for p in hv or []:
+            if p is None or len(p) < 2:
+                continue
+            pts.append([float(p[0]), float(p[1])])
+        if pts:
+            meta_hints_e[str(ik)] = pts
+    meta = {
+        "bull_hints": meta_hints_b,
+        "ellipse_hints": meta_hints_e,
+        "cameras": [int(k) for k in frames.keys()],
+    }
+    try:
+        with open(os.path.join(d, "input_hints.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
+    except OSError:
+        return
+    print(f"[CAL_SNAPSHOT] saved inputs to {d}", flush=True)
+
+
+def save_golden_calibration_output(
+    cals: Dict[int, Optional[BoardCalibration]],
+    *,
+    cameras: Optional[List[int]] = None,
+) -> None:
+    """DEBUG: write golden geometry for cameras in this run."""
+    if not CAL_SNAPSHOT_ENABLED:
+        return
+    d = _debug_calibration_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    keys = list(cameras) if cameras is not None else list(cals.keys())
+    payload = {
+        "cameras": {
+            str(int(cam)): calibration_golden_entry(int(cam), cals.get(cam))
+            for cam in keys
+        }
+    }
+    path = os.path.join(d, "golden_output.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"[CAL_SNAPSHOT] saved golden {path}", flush=True)
+    except OSError:
+        return
+
+
+def _golden_num_close(a: object, b: object, atol: float) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if len(a) != len(b):
+            return False
+        return all(_golden_num_close(x, y, atol) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(_golden_num_close(a[k], b[k], atol) for k in a)
+    try:
+        return abs(float(a) - float(b)) <= atol
+    except (TypeError, ValueError):
+        return a == b
+
+
+def compare_golden_calibration(
+    actual: dict,
+    expected: dict,
+    *,
+    atol: float = 1e-3,
+) -> List[str]:
+    """Return mismatch paths. Empty list = pass. For future optimizer tests."""
+    mismatches: List[str] = []
+
+    def _walk(prefix: str, av: object, ev: object) -> None:
+        if isinstance(ev, dict) and isinstance(av, dict):
+            keys = sorted(set(ev.keys()) | set(av.keys()))
+            for k in keys:
+                _walk(f"{prefix}.{k}" if prefix else str(k), av.get(k), ev.get(k))
+            return
+        if not _golden_num_close(av, ev, atol):
+            mismatches.append(f"{prefix}: actual={av!r} expected={ev!r}")
+
+    _walk("", actual, expected)
+    return mismatches
 
 
 def _calibration_quality(cal: Optional[BoardCalibration]) -> float:
@@ -2950,23 +3145,31 @@ def enrich_calibration_with_warp_rings(
     seed_warp1_d: Optional[Ellipse] = None,
     seed_warp1_t: Optional[Ellipse] = None,
     seed_center: Optional[Tuple[float, float]] = None,
+    perf: Optional[Dict[str, float]] = None,
 ) -> BoardCalibration:
     """Stage1 (double→board_r) → Stage2 egg→circle (+ multi-ring) + residual.
 
     Overlay ostaje savršeni krugovi; Stage2 iterativno dovodi fizički D/T na njih.
     Uvijek radi residual (i kad je Stage1 već blizu) da KALIBRIRAJ može dotjerati prstene.
     """
+    def _perf_set(key: str, t0: float) -> None:
+        if perf is not None:
+            perf[key] = _perf_ms(t0)
+
     if frame is None or not cal.has_board_ellipse():
         if cal.has_ring_align_warp():
             return cal
         return ensure_ring_align_warp(cal, out_size=out_size)
     size = int(out_size) if out_size > 0 else DEBUG_WARP_SIZE
+    t_warp = time.perf_counter()
     warped1 = warp_topdown_stage1(frame, cal, out_size=size)
+    _perf_set("stage1_warp", t_warp)
     if warped1 is None:
         if seed_warp1_d is not None or cal.has_ring_align_warp():
             return cal
         return ensure_ring_align_warp(cal, out_size=out_size)
 
+    t_ring = time.perf_counter()
     d1 = detect_double_outer_ellipse_on_warp(warped1)
     if d1 is None:
         d1 = seed_warp1_d
@@ -3007,8 +3210,10 @@ def enrich_calibration_with_warp_rings(
         t_o = max(float(s1_bands["triple_outer"]), 1.0)
         di_ratio = float(np.clip(float(s1_bands["double_inner"]) / d_o, 0.88, 0.985))
         ti_ratio = float(np.clip(float(s1_bands["triple_inner"]) / t_o, 0.82, 0.985))
+    _perf_set("ring_measure", t_ring)
 
     # Uvijek odradi Stage2 (i kad je Stage1 "OK") da KALIBRIRAJ može dotjerati prstene.
+    t_s2 = time.perf_counter()
     mode = "multi" if t1 is not None else "double"
     print(
         f"[calib] Stage2 {mode}-align "
@@ -3171,6 +3376,7 @@ def enrich_calibration_with_warp_rings(
             flush=True,
         )
 
+    _perf_set("stage2", t_s2)
     return replace(
         cal,
         measured_double_outer_frac=d_out_f,
@@ -4426,6 +4632,15 @@ def calibrate_board(
     if frame is None or frame.size == 0:
         return None
 
+    cam_tag = f"cam{cam_idx}" if cam_idx is not None else "cam?"
+    t_mark = time.perf_counter()
+
+    def _lap(name: str) -> None:
+        nonlocal t_mark
+        now = time.perf_counter()
+        _perf_cal(f"{cam_tag} {name}={(now - t_mark) * 1000.0:.1f}ms")
+        t_mark = now
+
     h0, w0 = frame.shape[:2]
     min_dim0 = float(min(h0, w0))
     upscale = CALIBRATE_UPSCALE if min_dim0 < CALIBRATE_UPSCALE_IF_MIN_DIM_LT else 1
@@ -4436,6 +4651,7 @@ def calibrate_board(
             (w0 * upscale, h0 * upscale),
             interpolation=cv2.INTER_CUBIC,
         )
+    _lap("upscale")
 
     h, w = work.shape[:2]
     min_dim = float(min(h, w))
@@ -4446,12 +4662,14 @@ def calibrate_board(
     if prior_bull_xy is not None and hint_xy is None:
         prior_xy = (float(prior_bull_xy[0]) * upscale, float(prior_bull_xy[1]) * upscale)
     hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+    _lap("hsv")
     red, green, black, _white = _board_color_masks(hsv)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     red = cv2.morphologyEx(red, cv2.MORPH_OPEN, kernel)
     red = cv2.morphologyEx(red, cv2.MORPH_CLOSE, kernel)
     green = cv2.morphologyEx(green, cv2.MORPH_OPEN, kernel)
     green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, kernel)
+    _lap("masks")
 
     hint_pts_up: List[Tuple[float, float]] = []
     for p in ellipse_hint_xy or []:
@@ -4473,6 +4691,7 @@ def calibrate_board(
         if hint_ell is not None:
             red = search_red
             green = search_green
+    _lap("board")
 
     def _search(
         sr: np.ndarray,
@@ -4647,6 +4866,7 @@ def calibrate_board(
                         f"({prior_xy[0] / upscale:.1f},{prior_xy[1] / upscale:.1f})",
                         flush=True,
                     )
+    _lap("bull")
     if bull_hit is None:
         if hint_xy is not None:
             cam_tag = f"cam{cam_idx}" if cam_idx is not None else "cam?"
@@ -4677,9 +4897,11 @@ def calibrate_board(
         if near_ell is not None:
             ellipse = near_ell
             board_conf = 0.40
+    _lap("ellipse")
     wire_angles: Tuple[float, ...] = ()
     if ellipse is not None:
         wire_angles = _detect_segment_boundaries(work, red, green, center, bull_r, ellipse, cam_idx=cam_idx)
+    _lap("wires")
 
     seg_offset = int(segment20_offset) % SEGMENT_COUNT
     cal = BoardCalibration(
@@ -5473,6 +5695,7 @@ class BoardCalibrator:
         bull_hints: Optional[Dict[int, Tuple[float, float]]] = None,
         ellipse_hints: Optional[Dict[int, List[Tuple[float, float]]]] = None,
         prefer_stable: bool = False,
+        persist: bool = True,
     ) -> List[int]:
         """Detektira ploču po kameri. Vraća indekse bez *kompletne* kalibracije.
 
@@ -5487,7 +5710,16 @@ class BoardCalibrator:
         prefer_stable: True za auto-kalibraciju pri startu igre — soft prior iz
         prethodne kalibracije, blend, i ne briše dobar cal lošim/nepotpunim.
         False za ručni KALIBRIRAJ (force replace + incomplete overwrite).
+
+        persist: True (production) piše board_calibration.json. False samo
+        preskače disk — geometrija jedne kamere ostaje ista.
         """
+        t_all = time.perf_counter()
+        # Snapshot only on manual KALIBRIRAJ (prefer_stable=False), not auto-recal.
+        if persist and not prefer_stable:
+            save_calibration_input_snapshot(
+                frames, bull_hints=bull_hints, ellipse_hints=ellipse_hints
+            )
         hints = bull_hints or {}
         # Normalize keys (int / str / numpy) so cam0/cam2 hints are never missed.
         hints_norm: Dict[int, Tuple[float, float]] = {}
@@ -5520,9 +5752,11 @@ class BoardCalibrator:
             old = self._cals.get(cam_idx)
             offset = self._segment20_offset_for(cam_idx)
             cam_i = int(cam_idx)
+            t_cam = time.perf_counter()
 
             if frame is None:
                 failed_this_run.append(cam_i)
+                _perf_cal(f"cam{cam_i} total={_perf_ms(t_cam):.1f}ms")
                 continue
 
             hint = hints_norm.get(cam_i)
@@ -5581,8 +5815,10 @@ class BoardCalibrator:
                         flush=True,
                     )
                     self._remember_segment20(cam_idx, old)
+                    _perf_cal(f"cam{cam_i} total={_perf_ms(t_cam):.1f}ms")
                     continue
                 failed_this_run.append(cam_i)
+                _perf_cal(f"cam{cam_i} total={_perf_ms(t_cam):.1f}ms")
                 continue
 
             diag = _frame_diag(frame)
@@ -5637,12 +5873,23 @@ class BoardCalibrator:
                     seed_d = old.warp1_double_outer
                     seed_t = old.warp1_triple_outer
                     seed_c = old.warp1_center
+                enrich_perf: Dict[str, float] = {}
                 new_cal = enrich_calibration_with_warp_rings(
                     frame,
                     new_cal,
                     seed_warp1_d=seed_d,
                     seed_warp1_t=seed_t,
                     seed_center=seed_c,
+                    perf=enrich_perf,
+                )
+                _perf_cal(
+                    f"cam{cam_i} stage1_warp={float(enrich_perf.get('stage1_warp', 0.0)):.1f}ms"
+                )
+                _perf_cal(
+                    f"cam{cam_i} ring_measure={float(enrich_perf.get('ring_measure', 0.0)):.1f}ms"
+                )
+                _perf_cal(
+                    f"cam{cam_i} stage2={float(enrich_perf.get('stage2', 0.0)):.1f}ms"
                 )
                 # Jamstvo: Stage2 podaci uvijek postoje i spremaju se.
                 if not new_cal.has_ring_align_warp():
@@ -5689,6 +5936,7 @@ class BoardCalibrator:
                         flush=True,
                     )
                     self._remember_segment20(cam_idx, old)
+                    _perf_cal(f"cam{cam_i} total={_perf_ms(t_cam):.1f}ms")
                     continue
                 self._cals[cam_idx] = new_cal
                 self._remember_segment20(cam_idx, new_cal)
@@ -5711,6 +5959,7 @@ class BoardCalibrator:
                     self.invalidate_warp_cache(cam_idx)
                 elif old is not None:
                     self._remember_segment20(cam_idx, old)
+            _perf_cal(f"cam{cam_i} total={_perf_ms(t_cam):.1f}ms")
 
         incomplete = sorted(
             set(failed_this_run)
@@ -5727,7 +5976,15 @@ class BoardCalibrator:
             )
             for cam_idx in incomplete
         }
-        self.save()
+        t_save = time.perf_counter()
+        if persist:
+            self.save()
+        _perf_cal(f"json_save={_perf_ms(t_save):.1f}ms")
+        if persist and not prefer_stable:
+            save_golden_calibration_output(
+                self._cals, cameras=[int(k) for k in frames.keys()]
+            )
+        _perf_cal(f"detect_all total={_perf_ms(t_all):.1f}ms")
         return incomplete
 
     def recalibrate_for_play(
@@ -5746,21 +6003,28 @@ class BoardCalibrator:
         hints = bull_hints or None
         last_frames: Dict[int, Optional[np.ndarray]] = {}
         incomplete: List[int] = []
-        for attempt in range(max(1, int(attempts))):
+        t_full = time.perf_counter()
+        n_attempts = max(1, int(attempts))
+        for attempt in range(n_attempts):
             flush = 2 if attempt == 0 else 1
+            t_grab = time.perf_counter()
             try:
                 last_frames = grab_frames(flush=flush)
             except TypeError:
                 last_frames = grab_frames()
+            _perf_cal(
+                f"attempt{attempt} grab_frames={_perf_ms(t_grab):.1f}ms flush={flush}"
+            )
             incomplete = self.detect_all(
                 last_frames,
                 bull_hints=hints,
                 ellipse_hints=ellipse_hints,
                 prefer_stable=True,
             )
+            _perf_cal(f"attempt{attempt} incomplete={incomplete}")
             if not incomplete:
                 break
-            if attempt + 1 >= attempts:
+            if attempt + 1 >= n_attempts:
                 break
             # Nema signala = kamere još nisu bile spremne — duže pričekaj.
             no_sig = self.incomplete_no_signal(incomplete)
@@ -5768,6 +6032,10 @@ class BoardCalibrator:
                 time.sleep(0.35)
             else:
                 time.sleep(0.08)
+        _perf_cal(
+            f"full recalibrate_for_play including frame grabs/retries="
+            f"{_perf_ms(t_full):.1f}ms"
+        )
         return incomplete, last_frames
 
     def format_incomplete_status(self, incomplete: Optional[List[int]] = None) -> str:

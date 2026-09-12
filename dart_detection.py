@@ -28,10 +28,10 @@ from board_calibration import (
 )
 
 
-MOTION_DIFF_THRESH = 14
-MOTION_MIN_PIXELS = 12
+MOTION_DIFF_THRESH = 10
+MOTION_MIN_PIXELS = 16
 MOTION_MAX_PIXELS = 12000
-MOTION_BLUR_KSIZE = 2
+MOTION_BLUR_KSIZE = 3
 MOTION_LOG_MIN_PIXELS = 6
 # Idle LED/USB flicker is often ~8–20 px; a real dart is far above this.
 MOTION_ARM_PIXELS = 28
@@ -46,7 +46,7 @@ SETTLE_FRAME_DELAY = 2
 FITLINE_SIZE = 300
 FITLINE_DS_SIZE = FITLINE_SIZE
 FITLINE_BLUR_KSIZE = 5
-FITLINE_BLUR_SIGMA = 1.0
+FITLINE_BLUR_SIGMA = 2.0
 # Ignore near-black for numerical stability (weights stay continuous above this).
 FITLINE_WEIGHT_EPS = 2.0
 FITLINE_MIN_PX = 8
@@ -83,6 +83,28 @@ FITLINE_STAGE2_TIP_RADIUS_FRAC = 0.50
 # Stage-2 soft falloff: weight *= (1 - dist/r)^power so tip-local shaft
 # constrains direction more than residual flight at the ROI rim.
 FITLINE_STAGE2_DIST_WEIGHT_POWER = 1.25
+# After Stage2 PCA: equal-weight longitudinal-bin median centerline (not blob mass).
+CENTERLINE_N_BINS = 14
+CENTERLINE_MIN_BINS = 5
+CENTERLINE_MIN_BIN_PX = 3
+CENTERLINE_MIN_LENGTH_PX = 10.0
+CENTERLINE_RES_WORSE_FRAC = 1.35
+CENTERLINE_RES_WORSE_PX = 0.35
+# FitLine quality (always) + conservative recovery (suspicious hits only).
+# Quality describes geometric line shape, not blob size / motion energy.
+FITQ_CORRIDOR_PX = 3.0
+FITQ_RESIDUAL_REF_PX = 4.0
+FITQ_THICK_REF_PX = 5.5
+FITQ_LENGTH_REF_FRAC = 0.40
+FITQ_WEAK_PIXEL_REF = 400.0
+FITQ_ANGLE_PEN_DEG = 28.0
+# Normal 3-cam hits usually have pair_spread of a few px; keep this high so
+# ordinary darts never enter recovery.
+FITQ_PAIR_SPREAD_MIN_PX = 18.0
+FITQ_PAIR_SPREAD_FRAC = 0.12
+FITQ_WIDER_ROI_SCALE = 1.40
+FITQ_IRLS_SIGMA_PX = 1.8
+FITQ_MIN_SPREAD_IMPROVE = 0.85
 # Legacy midline helpers (unused by default path; kept for experiments).
 FITLINE_SLICE_STEP = 1.0
 FITLINE_MIDLINE_MIN_SLICES = 4
@@ -138,7 +160,7 @@ BULL_MIN_CAMS = 2
 BULL_MOTION_MAX_BULL_OUTER = 2.2
 SAVE_MOTION_DEBUG = False
 # Hit debug: fused_motion_raw + fitline_smooth_intersect only (see save_hit_fusion_debug).
-SAVE_HIT_FUSION_DEBUG = False
+SAVE_HIT_FUSION_DEBUG = True
 MOTION_REFS_DIRNAME = "dart_motion_refs"
 # BGR boje po kameri za hit fusion debug overlay (jarke radi vidljivosti).
 _HIT_DEBUG_CAM_COLORS = {
@@ -226,6 +248,28 @@ class DartDetectResult:
     # Per-cam tip: projekcija fused tipa na liniju (2+ cam) / board-center (1 cam).
     # line_* are in FITLINE_SIZE coordinates (same space as fit_ds_gray).
     radius_tip: Tuple[float, float] = (0.0, 0.0)
+    # Stage-1 line snapshot (before Stage2 ROI overwrite).
+    stage1_vx: float = 0.0
+    stage1_vy: float = 0.0
+    stage1_x0: float = 0.0
+    stage1_y0: float = 0.0
+    # Geometric FitLine quality (not blob-size confidence).
+    fitq_pixels: int = 0
+    fitq_support: float = 0.0
+    fitq_residual: float = 0.0
+    fitq_linearity: float = 0.0
+    fitq_length: float = 0.0
+    fitq_thickness: float = 0.0
+    fitq_s1s2_angle: float = 0.0
+    fitq_s1s2_tip: float = 0.0
+    fitq_quality: float = 0.0
+    # Stage2 centerline-bin points in FitLine/ds space (debug overlay).
+    centerline_pts_ds: List[Tuple[float, float]] = field(default_factory=list)
+    # (vx,vy,x0,y0) in the same ds space as line_* / yellow points.
+    centerline_old_ds: Optional[Tuple[float, float, float, float]] = None
+    centerline_cand_ds: Optional[Tuple[float, float, float, float]] = None
+    centerline_accepted: bool = False
+    centerline_reject_reason: str = ""
 
 
 @dataclass
@@ -242,6 +286,9 @@ class FusedDartResult:
     # Stage-2 ROI (stage1 fused tip + radius) in original warp space — debug only.
     stage2_roi_tip_xy: Optional[Tuple[float, float]] = None
     stage2_roi_radius: float = 0.0
+    fitq_pair_spread: float = 0.0
+    fitq_suspicious: bool = False
+    fitq_recovery_cam: int = -1
 
 
 def summarize_motion_log(results: List[DartDetectResult]) -> str:
@@ -723,6 +770,213 @@ def _refit_fitline_near_tip(
     return float(vx), float(vy), float(x0), float(y0)
 
 
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted median; equal-weight median when weights are degenerate."""
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    w = np.clip(np.asarray(weights, dtype=np.float64).reshape(-1), 0.0, None)
+    n = int(v.size)
+    if n <= 0:
+        return 0.0
+    if n == 1:
+        return float(v[0])
+    order = np.argsort(v, kind="mergesort")
+    v = v[order]
+    w = w[order]
+    wsum = float(w.sum())
+    if wsum <= 1e-12:
+        return float(v[n // 2])
+    cdf = np.cumsum(w)
+    return float(v[int(np.searchsorted(cdf, 0.5 * wsum, side="left"))])
+
+
+def _equal_weight_rms_perp(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    vx: float,
+    vy: float,
+    x0: float,
+    y0: float,
+) -> float:
+    """RMS perpendicular distance, equal weight per point (not blob mass)."""
+    n = int(xs.size)
+    if n <= 0:
+        return 0.0
+    nn = float(np.hypot(vx, vy)) or 1.0
+    ux, uy = float(vx) / nn, float(vy) / nn
+    dx = xs.astype(np.float64) - float(x0)
+    dy = ys.astype(np.float64) - float(y0)
+    perp = dx * (-uy) + dy * ux
+    return float(np.sqrt(np.mean(perp * perp)))
+
+
+def _log_center_refit(
+    *,
+    cam_idx: int,
+    bins: int,
+    old_angle: float,
+    candidate_angle: float,
+    old_res: float,
+    candidate_res: float,
+    accepted: bool,
+    reject_reason: str,
+    scale_x: float,
+    scale_y: float,
+) -> None:
+    print(
+        "[CENTER_REFIT]\n"
+        f"cam={int(cam_idx)}\n"
+        f"bins={int(bins)}\n"
+        f"old_angle={old_angle:.1f}\n"
+        f"candidate_angle={candidate_angle:.1f}\n"
+        f"old_res={old_res:.3f}\n"
+        f"candidate_res={candidate_res:.3f}\n"
+        f"accepted={bool(accepted)}\n"
+        f"reject_reason={reject_reason}\n"
+        f"coordinate_space=fit_ds FITLINE_SIZE={int(FITLINE_SIZE)}\n"
+        f"scale_x={float(scale_x):.6f}\n"
+        f"scale_y={float(scale_y):.6f}",
+        flush=True,
+    )
+
+
+def _centerline_refit_stage2(
+    ds_soft: np.ndarray,
+    tip_xy_ds: Tuple[float, float],
+    radius_ds: float,
+    line: Tuple[float, float, float, float],
+    board_center_ds: Tuple[float, float],
+    *,
+    cam_idx: int = -1,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> Tuple[
+    Tuple[float, float, float, float],
+    List[Tuple[float, float]],
+    bool,
+    str,
+    Optional[Tuple[float, float, float, float]],
+]:
+    """Robust midline after Stage2 PCA: one median point per longitudinal bin.
+
+    Fit is equal-weight PCA through the SAME xy points that are drawn yellow.
+    Guard compares RMS perp of that same point set to old vs candidate.
+    Returns (chosen_line, bin_xy, accepted, reject_reason, candidate_line).
+    """
+    vx0, vy0, x00, y00 = (float(line[0]), float(line[1]), float(line[2]), float(line[3]))
+    orig = (vx0, vy0, x00, y00)
+    old_ang = _fitline_angle_deg(vx0, vy0)
+
+    def _fail(reason: str, pts: List[Tuple[float, float]], bins: int) -> tuple:
+        _log_center_refit(
+            cam_idx=cam_idx,
+            bins=bins,
+            old_angle=old_ang,
+            candidate_angle=old_ang,
+            old_res=-1.0,
+            candidate_res=-1.0,
+            accepted=False,
+            reject_reason=reason,
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
+        return orig, pts, False, reason, None
+
+    xs, ys, inten, prox_w = _soft_roi_xyw(ds_soft, tip_xy_ds, radius_ds)
+    n = int(xs.size)
+    if n < FITLINE_MIN_PX:
+        return _fail("low_pixels", [], 0)
+    w = np.clip(prox_w.astype(np.float64), 0.0, None)
+    if float(w.sum()) <= 1e-12:
+        w = np.clip(inten.astype(np.float64), 0.0, None)
+    nn = float(np.hypot(vx0, vy0)) or 1.0
+    ux, uy = vx0 / nn, vy0 / nn
+    nx, ny = -uy, ux
+    dx = xs - x00
+    dy = ys - y00
+    u = dx * ux + dy * uy
+    v = dx * nx + dy * ny
+    u_lo = float(np.min(u))
+    u_hi = float(np.max(u))
+    span = u_hi - u_lo
+    if span < float(CENTERLINE_MIN_LENGTH_PX):
+        return _fail("short_span", [], 0)
+
+    n_bins = int(CENTERLINE_N_BINS)
+    edges = np.linspace(u_lo, u_hi, n_bins + 1)
+    edges[-1] = u_hi + 1e-9
+    bin_id = np.digitize(u, edges[1:-1], right=False)
+    bin_id = np.clip(bin_id, 0, n_bins - 1)
+
+    bin_x: List[float] = []
+    bin_y: List[float] = []
+    bin_u: List[float] = []
+    min_px = int(CENTERLINE_MIN_BIN_PX)
+    for b in range(n_bins):
+        m = bin_id == b
+        n_b = int(np.count_nonzero(m))
+        if n_b < min_px:
+            continue
+        wb = w[m]
+        if float(wb.sum()) <= 1e-12:
+            continue
+        u_m = float(_weighted_median(u[m], wb))
+        v_m = float(_weighted_median(v[m], wb))
+        bin_u.append(u_m)
+        bin_x.append(float(x00 + u_m * ux + v_m * nx))
+        bin_y.append(float(y00 + u_m * uy + v_m * ny))
+
+    pts: List[Tuple[float, float]] = list(zip(bin_x, bin_y))
+    n_valid = len(bin_x)
+    if n_valid < int(CENTERLINE_MIN_BINS):
+        return _fail("few_bins", pts, n_valid)
+    length = float(max(bin_u) - min(bin_u))
+    if length < float(CENTERLINE_MIN_LENGTH_PX):
+        return _fail("short_length", pts, n_valid)
+
+    px = np.asarray(bin_x, dtype=np.float64)
+    py = np.asarray(bin_y, dtype=np.float64)
+    # Equal weight per yellow point — same set used for the candidate fit.
+    eq = np.ones(n_valid, dtype=np.float64)
+    vx, vy, x0, y0 = _fit_from_points(px, py, eq)
+    vx, vy = _orient_fitline_tipward(vx, vy, x0, y0, board_center_ds)
+    cand = (float(vx), float(vy), float(x0), float(y0))
+    cand_ang = _fitline_angle_deg(vx, vy)
+
+    old_res = _equal_weight_rms_perp(px, py, vx0, vy0, x00, y00)
+    cand_res = _equal_weight_rms_perp(px, py, vx, vy, x0, y0)
+    worse = cand_res > (
+        old_res * float(CENTERLINE_RES_WORSE_FRAC) + float(CENTERLINE_RES_WORSE_PX)
+    )
+    if worse:
+        _log_center_refit(
+            cam_idx=cam_idx,
+            bins=n_valid,
+            old_angle=old_ang,
+            candidate_angle=cand_ang,
+            old_res=old_res,
+            candidate_res=cand_res,
+            accepted=False,
+            reject_reason="residual_worse",
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
+        return orig, pts, False, "residual_worse", cand
+
+    _log_center_refit(
+        cam_idx=cam_idx,
+        bins=n_valid,
+        old_angle=old_ang,
+        candidate_angle=cand_ang,
+        old_res=old_res,
+        candidate_res=cand_res,
+        accepted=True,
+        reject_reason="ok",
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
+    return cand, pts, True, "ok", cand
+
+
 def _gate_soft_motion_for_fit(soft: np.ndarray, morph_mask: np.ndarray) -> np.ndarray:
     """Keep soft intensities, but only inside a dilated morph motion ROI.
 
@@ -955,6 +1209,21 @@ def _save_fitline_smooth_debug(
             base = composite[mask].astype(np.float32)
             composite[mask] = (base * (1.0 - a) + color * a).astype(np.uint8)
 
+    # Old Stage2 (thin gray), candidate centerline (thin magenta), then final.
+    for r in draw:
+        sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
+        sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
+        if r.centerline_old_ds is not None:
+            ovx, ovy, ox0, oy0 = r.centerline_old_ds
+            _draw_fitline_ds_on_original(
+                composite, ox0, oy0, ovx, ovy, sx, sy, (180, 180, 180), thickness=1
+            )
+        if r.centerline_cand_ds is not None:
+            cvx, cvy, cx0, cy0 = r.centerline_cand_ds
+            _draw_fitline_ds_on_original(
+                composite, cx0, cy0, cvx, cvy, sx, sy, (255, 0, 255), thickness=1
+            )
+
     # Rejected (flee) lines first, dim; consensus-used lines on top, full color.
     for r in draw:
         sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
@@ -974,6 +1243,17 @@ def _save_fitline_smooth_debug(
             color,
             thickness=1 if not used_cam else 2,
         )
+        if _hit_motion_debug_enabled():
+            for px_ds, py_ds in r.centerline_pts_ds:
+                ox, oy = _map_ds_xy_to_original(float(px_ds), float(py_ds), sx, sy)
+                cv2.circle(
+                    composite,
+                    (int(round(ox)), int(round(oy))),
+                    2,
+                    (0, 255, 255),
+                    -1,
+                    cv2.LINE_AA,
+                )
 
     # Stage2 ROI circle (matches re-FitLine radius).
     roi_pt = (int(round(roi_cx)), int(round(roi_cy)))
@@ -989,18 +1269,39 @@ def _save_fitline_smooth_debug(
     tip_pt = (int(round(fused.tip_xy[0])), int(round(fused.tip_xy[1])))
     cv2.circle(composite, tip_pt, 5, (0, 180, 180), 1, cv2.LINE_AA)
     cv2.circle(composite, tip_pt, 3, (0, 255, 255), -1, cv2.LINE_AA)
-    n_rej = sum(1 for r in draw if int(r.cam_idx) not in used_ids)
-    rej_note = f" dim={n_rej}rej" if n_rej else ""
+    rec_note = ""
+    if int(fused.fitq_recovery_cam) >= 0:
+        rec_note = f" RECOVERY cam{int(fused.fitq_recovery_cam)}"
     cv2.putText(
         composite,
-        f"FitLine consensus + stage2 r={roi_r:.0f} (cyan=in red=out){rej_note}",
+        f"spread={fused.fitq_pair_spread:.1f}{rec_note}",
         (4, 16),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.40,
+        0.42,
         (0, 255, 255),
         1,
         cv2.LINE_AA,
     )
+    for r in draw:
+        sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
+        sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
+        ox, oy = _map_ds_xy_to_original(r.line_x0, r.line_y0, sx, sy)
+        vx = float(r.line_vx) * sx
+        vy = float(r.line_vy) * sy
+        nn = float(np.hypot(vx, vy)) or 1.0
+        qx = int(round(ox + 26.0 * vx / nn))
+        qy = int(round(oy + 26.0 * vy / nn))
+        color = _hit_debug_cam_color(r.cam_idx)
+        cv2.putText(
+            composite,
+            f"q={r.fitq_quality:.2f}",
+            (qx, qy),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
     cpath = os.path.join(motion_dir, f"{stem}_fitline_smooth_intersect.png")
     cv2.imwrite(cpath, composite)
     saved.append(cpath)
@@ -1461,6 +1762,504 @@ def _line_pixel_support(
         if s > 1e-9:
             return float(w[in_c].sum() / s)
     return float(np.count_nonzero(in_c) / max(n, 1))
+
+
+def _dir_angle_delta_deg(vx0: float, vy0: float, vx1: float, vy1: float) -> float:
+    """Smallest angle between two directions, 0..90 deg (unsigned axis)."""
+    n0 = float(np.hypot(vx0, vy0)) or 1.0
+    n1 = float(np.hypot(vx1, vy1)) or 1.0
+    c = abs((vx0 / n0) * (vx1 / n1) + (vy0 / n0) * (vy1 / n1))
+    c = float(np.clip(c, 0.0, 1.0))
+    return float(np.degrees(np.arccos(c)))
+
+
+def _soft_roi_xyw(
+    ds_soft: np.ndarray,
+    tip_xy_ds: Tuple[float, float],
+    radius_ds: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """xs, ys, intensity, tip-proximity weights inside Stage2 circle."""
+    empty = (
+        np.zeros((0,), dtype=np.float64),
+        np.zeros((0,), dtype=np.float64),
+        np.zeros((0,), dtype=np.float64),
+        np.zeros((0,), dtype=np.float64),
+    )
+    if ds_soft is None or ds_soft.size == 0:
+        return empty
+    soft = ds_soft.astype(np.float32, copy=False)
+    ys, xs = np.where(soft > float(FITLINE_WEIGHT_EPS))
+    if int(xs.size) < 1:
+        return empty
+    tx, ty = float(tip_xy_ds[0]), float(tip_xy_ds[1])
+    r = max(float(radius_ds), 1.0)
+    dist = np.hypot(xs.astype(np.float64) - tx, ys.astype(np.float64) - ty)
+    keep = dist <= r
+    if int(np.count_nonzero(keep)) < 1:
+        return empty
+    xs_f = xs[keep].astype(np.float64)
+    ys_f = ys[keep].astype(np.float64)
+    dist_k = dist[keep]
+    inten = soft[ys[keep], xs[keep]].astype(np.float64)
+    prox = np.clip(1.0 - dist_k / r, 0.05, 1.0) ** float(FITLINE_STAGE2_DIST_WEIGHT_POWER)
+    return xs_f, ys_f, inten, inten * prox
+
+
+def _perp_and_par(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    vx: float,
+    vy: float,
+    x0: float,
+    y0: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    nn = float(np.hypot(vx, vy)) or 1.0
+    ux, uy = float(vx) / nn, float(vy) / nn
+    dx = xs.astype(np.float64) - float(x0)
+    dy = ys.astype(np.float64) - float(y0)
+    par = dx * ux + dy * uy
+    perp = np.abs(dx * (-uy) + dy * ux)
+    return perp, par
+
+
+def _compute_fitline_quality(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    weights: np.ndarray,
+    vx: float,
+    vy: float,
+    x0: float,
+    y0: float,
+    *,
+    board_r: float,
+    s1s2_angle: float = 0.0,
+    s1s2_tip: float = 0.0,
+) -> Dict[str, float]:
+    """Geometric line quality. Pixel count is only a weak extra term."""
+    n = int(xs.size)
+    z = {
+        "pixels": float(n),
+        "support": 0.0,
+        "residual": 0.0,
+        "linearity": 0.0,
+        "length": 0.0,
+        "thickness": 0.0,
+        "s1s2_angle": float(s1s2_angle),
+        "s1s2_tip": float(s1s2_tip),
+        "quality": 0.0,
+    }
+    if n < 2:
+        return z
+    w = np.clip(weights.astype(np.float64), 0.0, None) if weights is not None else np.ones(n, dtype=np.float64)
+    if int(w.size) != n:
+        w = np.ones(n, dtype=np.float64)
+    wsum = float(w.sum())
+    if wsum <= 1e-9:
+        w = np.ones(n, dtype=np.float64)
+        wsum = float(n)
+    wn = w / wsum
+    perp, par = _perp_and_par(xs, ys, vx, vy, x0, y0)
+    corridor = float(FITQ_CORRIDOR_PX)
+    in_c = perp <= corridor
+    support = float(w[in_c].sum() / wsum)
+    residual = float(np.sqrt(np.sum(wn * perp * perp)))
+    thickness = float(np.sum(wn * perp))
+    if np.any(in_c):
+        length = float(np.max(par[in_c]) - np.min(par[in_c]))
+    else:
+        length = float(np.max(par) - np.min(par)) if n else 0.0
+    mx = float(np.sum(wn * xs))
+    my = float(np.sum(wn * ys))
+    dx = xs.astype(np.float64) - mx
+    dy = ys.astype(np.float64) - my
+    cxx = float(np.sum(wn * dx * dx))
+    cxy = float(np.sum(wn * dx * dy))
+    cyy = float(np.sum(wn * dy * dy))
+    tr = cxx + cyy
+    det = cxx * cyy - cxy * cxy
+    disc = max(tr * tr - 4.0 * det, 0.0)
+    l1 = 0.5 * (tr + np.sqrt(disc))
+    l2 = 0.5 * (tr - np.sqrt(disc))
+    linearity = float((l1 - l2) / (l1 + l2 + 1e-9))
+    br = max(float(board_r), 1.0)
+    length_n = float(np.clip(length / max(FITQ_LENGTH_REF_FRAC * br, 1.0), 0.0, 1.0))
+    res_n = float(np.clip(residual / FITQ_RESIDUAL_REF_PX, 0.0, 1.0))
+    th_n = float(np.clip(thickness / FITQ_THICK_REF_PX, 0.0, 1.0))
+    ang_n = float(np.clip(float(s1s2_angle) / FITQ_ANGLE_PEN_DEG, 0.0, 1.0))
+    pix_n = float(
+        np.clip(np.log1p(float(n)) / np.log1p(FITQ_WEAK_PIXEL_REF), 0.0, 1.0)
+    )
+    # Shape first: a 15px thin shaft outranks an 800px round flight blob.
+    quality = (
+        0.32 * linearity
+        + 0.24 * support
+        + 0.20 * length_n
+        + 0.04 * pix_n
+        - 0.22 * res_n
+        - 0.18 * th_n
+        - 0.12 * ang_n
+    )
+    z.update(
+        {
+            "support": support,
+            "residual": residual,
+            "linearity": float(np.clip(linearity, 0.0, 1.0)),
+            "length": length,
+            "thickness": thickness,
+            "quality": float(np.clip(quality, 0.0, 1.0)),
+        }
+    )
+    return z
+
+
+def _apply_fitq_to_result(r: DartDetectResult, q: Dict[str, float]) -> None:
+    r.fitq_pixels = int(q.get("pixels", 0.0))
+    r.fitq_support = float(q.get("support", 0.0))
+    r.fitq_residual = float(q.get("residual", 0.0))
+    r.fitq_linearity = float(q.get("linearity", 0.0))
+    r.fitq_length = float(q.get("length", 0.0))
+    r.fitq_thickness = float(q.get("thickness", 0.0))
+    r.fitq_s1s2_angle = float(q.get("s1s2_angle", 0.0))
+    r.fitq_s1s2_tip = float(q.get("s1s2_tip", 0.0))
+    r.fitq_quality = float(q.get("quality", 0.0))
+
+
+def _cam_stage2_roi_ds(
+    r: DartDetectResult,
+    tip_orig: Tuple[float, float],
+    radius_orig: float,
+    scale_x: float,
+    scale_y: float,
+) -> Tuple[Tuple[float, float], float]:
+    sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else scale_x
+    sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else scale_y
+    tip_cam = _map_original_xy_to_ds(tip_orig[0], tip_orig[1], sx, sy)
+    r_cam = float(radius_orig) / max(0.5 * (sx + sy), 1e-9)
+    return tip_cam, r_cam
+
+
+def _measure_cam_fitq(
+    r: DartDetectResult,
+    *,
+    tip_orig: Tuple[float, float],
+    radius_orig: float,
+    scale_x: float,
+    scale_y: float,
+    board_r_ds: float,
+    stage1_tip_ds: Optional[Tuple[float, float]] = None,
+    roi_scale: float = 1.0,
+) -> Dict[str, float]:
+    tip_cam, r_cam = _cam_stage2_roi_ds(
+        r, tip_orig, float(radius_orig) * float(roi_scale), scale_x, scale_y
+    )
+    xs, ys, inten, _prox = _soft_roi_xyw(r.fit_ds_gray, tip_cam, r_cam)
+    ang = 0.0
+    tip_d = 0.0
+    if abs(r.stage1_vx) + abs(r.stage1_vy) > 1e-9:
+        ang = _dir_angle_delta_deg(r.stage1_vx, r.stage1_vy, r.line_vx, r.line_vy)
+        if stage1_tip_ds is not None:
+            tip_d = _point_to_line_distance(
+                r.line_x0,
+                r.line_y0,
+                r.line_vx,
+                r.line_vy,
+                float(stage1_tip_ds[0]),
+                float(stage1_tip_ds[1]),
+            )
+    w = inten if int(inten.size) else np.ones((0,), dtype=np.float64)
+    return _compute_fitline_quality(
+        xs,
+        ys,
+        w,
+        r.line_vx,
+        r.line_vy,
+        r.line_x0,
+        r.line_y0,
+        board_r=board_r_ds,
+        s1s2_angle=ang,
+        s1s2_tip=tip_d,
+    )
+
+
+def _pairwise_intersections(
+    line_cams: List[DartDetectResult],
+    board_center_ds: Tuple[float, float],
+) -> List[Tuple[int, int, Tuple[float, float]]]:
+    out: List[Tuple[int, int, Tuple[float, float]]] = []
+    n = len(line_cams)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = line_cams[i], line_cams[j]
+            na = float(np.hypot(a.line_vx, a.line_vy)) or 1.0
+            nb = float(np.hypot(b.line_vx, b.line_vy)) or 1.0
+            cross = abs(
+                a.line_vx / na * b.line_vy / nb - a.line_vy / na * b.line_vx / nb
+            )
+            if cross < 0.08:
+                continue
+            tip, _res = intersect_lines_least_squares(
+                [
+                    (a.line_x0, a.line_y0, a.line_vx, a.line_vy),
+                    (b.line_x0, b.line_y0, b.line_vx, b.line_vy),
+                ],
+                board_center=board_center_ds,
+            )
+            if tip is None:
+                continue
+            out.append((i, j, (float(tip[0]), float(tip[1]))))
+    return out
+
+
+def _pair_spread_px(
+    line_cams: List[DartDetectResult],
+    board_center_ds: Tuple[float, float],
+) -> float:
+    """RMS distance of pairwise intersections from their centroid (ds px)."""
+    pairs = _pairwise_intersections(line_cams, board_center_ds)
+    if len(pairs) < 2:
+        return 0.0
+    pts = np.array([p[2] for p in pairs], dtype=np.float64)
+    c = pts.mean(axis=0)
+    d = np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1])
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def _identify_suspect_cam(
+    line_cams: List[DartDetectResult],
+    board_center_ds: Tuple[float, float],
+) -> int:
+    """Index into line_cams. Geometry + quality, never min(pixel count)."""
+    n = len(line_cams)
+    if n < 3:
+        if n <= 0:
+            return -1
+        return int(np.argmin([r.fitq_quality for r in line_cams]))
+    pairs = _pairwise_intersections(line_cams, board_center_ds)
+    by_pair = {(i, j): xy for i, j, xy in pairs}
+    geom = np.zeros(n, dtype=np.float64)
+    for k in range(n):
+        others = [i for i in range(n) if i != k]
+        if len(others) != 2:
+            continue
+        a, b = others[0], others[1]
+        key = (a, b) if a < b else (b, a)
+        trusted = by_pair.get(key)
+        if trusted is None:
+            continue
+        dists: List[float] = []
+        for j in others:
+            key2 = (k, j) if k < j else (j, k)
+            pt = by_pair.get(key2)
+            if pt is None:
+                continue
+            dists.append(float(np.hypot(pt[0] - trusted[0], pt[1] - trusted[1])))
+        if dists:
+            geom[k] = float(np.mean(dists))
+    gmax = float(np.max(geom)) + 1e-6
+    scores = []
+    for k, r in enumerate(line_cams):
+        scores.append(
+            0.55 * float(geom[k] / gmax)
+            + 0.35 * (1.0 - float(r.fitq_quality))
+            + 0.10 * float(np.clip(r.fitq_s1s2_angle / 40.0, 0.0, 1.0))
+        )
+    return int(np.argmax(np.asarray(scores, dtype=np.float64)))
+
+
+def _orient_line_tipward(
+    vx: float,
+    vy: float,
+    x0: float,
+    y0: float,
+    board_center_ds: Tuple[float, float],
+) -> Tuple[float, float, float, float]:
+    vx, vy = _orient_fitline_tipward(vx, vy, x0, y0, board_center_ds)
+    return float(vx), float(vy), float(x0), float(y0)
+
+
+def _shaft_focused_candidates(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    inten: np.ndarray,
+    prox_w: np.ndarray,
+    tip_xy: Tuple[float, float],
+    board_center_ds: Tuple[float, float],
+) -> List[Tuple[float, float, float, float]]:
+    """Recovery-only line candidates. No connected-component size ranking."""
+    n = int(xs.size)
+    if n < FITLINE_MIN_PX:
+        return []
+    tx, ty = float(tip_xy[0]), float(tip_xy[1])
+    cands: List[Tuple[float, float, float, float]] = []
+    sqrt_w = np.sqrt(np.clip(inten, 0.0, None)) * np.clip(prox_w, 1e-6, None)
+
+    def _add(vx: float, vy: float, x0: float, y0: float) -> None:
+        span = float(
+            np.hypot(float(np.max(xs) - np.min(xs)), float(np.max(ys) - np.min(ys)))
+        )
+        if span < 2.0:
+            return
+        cands.append(_orient_line_tipward(vx, vy, x0, y0, board_center_ds))
+
+    # Equal-weight PCA: spatial extent, not brightness (shaft can beat fat flight).
+    vx, vy, x0, y0 = _fit_from_points(xs, ys, None)
+    _add(vx, vy, x0, y0)
+    vx, vy, x0, y0 = _fit_from_points(xs, ys, sqrt_w)
+    _add(vx, vy, x0, y0)
+    vx, vy = _direction_through_point(xs, ys, tx, ty, sqrt_w)
+    perp, _par = _perp_and_par(xs, ys, vx, vy, tx, ty)
+    sigma = float(FITQ_IRLS_SIGMA_PX)
+    irls_w = sqrt_w * np.exp(-0.5 * (perp / max(sigma, 0.4)) ** 2)
+    vx2, vy2, x02, y02 = _fit_from_points(xs, ys, irls_w)
+    _add(vx2, vy2, x02, y02)
+    return cands
+
+
+def _score_recovery_candidate(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    inten: np.ndarray,
+    line: Tuple[float, float, float, float],
+    *,
+    board_r_ds: float,
+    other_cams: List[DartDetectResult],
+    self_r: DartDetectResult,
+    board_center_ds: Tuple[float, float],
+) -> Tuple[float, float, Dict[str, float]]:
+    vx, vy, x0, y0 = line
+    q = _compute_fitline_quality(
+        xs, ys, inten, vx, vy, x0, y0, board_r=board_r_ds
+    )
+    saved = (self_r.line_vx, self_r.line_vy, self_r.line_x0, self_r.line_y0)
+    self_r.line_vx, self_r.line_vy, self_r.line_x0, self_r.line_y0 = vx, vy, x0, y0
+    trial = [self_r] + list(other_cams)
+    spread = _pair_spread_px(trial, board_center_ds)
+    self_r.line_vx, self_r.line_vy, self_r.line_x0, self_r.line_y0 = saved
+    score = float(q["quality"]) + 0.30 * float(
+        np.clip(1.0 - spread / max(FITQ_PAIR_SPREAD_MIN_PX, 1.0), 0.0, 1.0)
+    )
+    return score, spread, q
+
+
+def _recover_suspicious_cam(
+    line_cams: List[DartDetectResult],
+    suspect_i: int,
+    *,
+    tip_orig: Tuple[float, float],
+    radius_orig: float,
+    scale_x: float,
+    scale_y: float,
+    board_center_orig: Tuple[float, float],
+    board_center_ds: Tuple[float, float],
+    board_r_ds: float,
+    stage1_tip_ds: Tuple[float, float],
+) -> bool:
+    """Refit only the suspect cam. Keep original unless spread+quality improve."""
+    if suspect_i < 0 or suspect_i >= len(line_cams):
+        return False
+    r = line_cams[suspect_i]
+    others = [c for i, c in enumerate(line_cams) if i != suspect_i]
+    if r.fit_ds_gray is None or len(others) < 1:
+        return False
+    sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else scale_x
+    sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else scale_y
+    bc_cam = _map_original_xy_to_ds(
+        board_center_orig[0], board_center_orig[1], sx, sy
+    )
+    old_spread = _pair_spread_px(line_cams, board_center_ds)
+    old_q = float(r.fitq_quality)
+    old_line = (float(r.line_vx), float(r.line_vy), float(r.line_x0), float(r.line_y0))
+    best_line: Optional[Tuple[float, float, float, float]] = None
+    best_score = -1e9
+    best_spread = old_spread
+    best_q: Optional[Dict[str, float]] = None
+    best_roi_scale = 1.0
+
+    for roi_scale in (1.0, float(FITQ_WIDER_ROI_SCALE)):
+        tip_cam, r_cam = _cam_stage2_roi_ds(
+            r, tip_orig, float(radius_orig) * roi_scale, scale_x, scale_y
+        )
+        xs, ys, inten, prox_w = _soft_roi_xyw(r.fit_ds_gray, tip_cam, r_cam)
+        if int(xs.size) < FITLINE_MIN_PX:
+            continue
+        cands = _shaft_focused_candidates(xs, ys, inten, prox_w, tip_cam, bc_cam)
+        cands.append((r.line_vx, r.line_vy, r.line_x0, r.line_y0))
+        for line in cands:
+            score, spread, q = _score_recovery_candidate(
+                xs,
+                ys,
+                inten,
+                line,
+                board_r_ds=board_r_ds,
+                other_cams=others,
+                self_r=r,
+                board_center_ds=board_center_ds,
+            )
+            if roi_scale > 1.0 + 1e-6:
+                if (
+                    float(q["linearity"]) + 0.05 < r.fitq_linearity
+                    and float(q["residual"]) > r.fitq_residual
+                    and float(q["length"]) < r.fitq_length
+                ):
+                    continue
+            if score > best_score + 1e-9:
+                best_score = score
+                best_line = line
+                best_spread = spread
+                best_q = q
+                best_roi_scale = roi_scale
+
+    if best_line is None or best_q is None:
+        return False
+    improved_spread = best_spread <= old_spread * float(FITQ_MIN_SPREAD_IMPROVE)
+    similar_spread_better_q = (
+        best_spread <= old_spread * 1.02 and float(best_q["quality"]) >= old_q + 0.08
+    )
+    if not improved_spread and not similar_spread_better_q:
+        return False
+    if float(best_q["quality"]) < old_q - 0.12:
+        return False
+    vx, vy, x0, y0 = best_line
+    ang_chg = _dir_angle_delta_deg(old_line[0], old_line[1], vx, vy)
+    orig_chg = float(np.hypot(x0 - old_line[2], y0 - old_line[3]))
+    if ang_chg < 2.0 and orig_chg < 2.5:
+        return False
+    r.line_vx, r.line_vy, r.line_x0, r.line_y0 = float(vx), float(vy), float(x0), float(y0)
+    r.line_angle_deg = _fitline_angle_deg(vx, vy)
+    q_final = _measure_cam_fitq(
+        r,
+        tip_orig=tip_orig,
+        radius_orig=radius_orig,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        board_r_ds=board_r_ds,
+        stage1_tip_ds=stage1_tip_ds,
+        roi_scale=best_roi_scale,
+    )
+    _apply_fitq_to_result(r, q_final)
+    print(
+        f"[FITQ] recovery cam{r.cam_idx} roi_scale={best_roi_scale:.2f} "
+        f"spread {old_spread:.1f}->{best_spread:.1f} "
+        f"q {old_q:.2f}->{r.fitq_quality:.2f}",
+        flush=True,
+    )
+    return True
+
+
+def _log_fitq_block(r: DartDetectResult) -> None:
+    print(
+        f"[FITQ] cam{int(r.cam_idx)}\n"
+        f"pixels={int(r.fitq_pixels)}\n"
+        f"support={r.fitq_support:.3f}\n"
+        f"residual={r.fitq_residual:.2f}\n"
+        f"linearity={r.fitq_linearity:.3f}\n"
+        f"length={r.fitq_length:.1f}\n"
+        f"thickness={r.fitq_thickness:.2f}\n"
+        f"s1s2_angle={r.fitq_s1s2_angle:.1f}\n"
+        f"s1s2_tip={r.fitq_s1s2_tip:.1f}\n"
+        f"quality={r.fitq_quality:.3f}",
+        flush=True,
+    )
 
 
 def _fuse_tip_from_best_pair(
@@ -2192,6 +2991,7 @@ def fuse_multicam_lines(
     per_cam: List[DartDetectResult],
     *,
     board_calibrator: Optional[BoardCalibrator] = None,
+    perf: Optional[Dict[str, float]] = None,
 ) -> FusedDartResult:
     """Spoji fitline s vise kamera u jedan tip (sjeciste pravaca).
 
@@ -2203,6 +3003,10 @@ def fuse_multicam_lines(
     distances to all lines; keep the agreeing pair and drop a fleeing outlier.
     Tip = sjecište u FITLINE_SIZE, zatim map u original top-down scoring coords.
     """
+    def _lap(name: str, t0: float) -> None:
+        if perf is not None:
+            perf[name] = (time.perf_counter() - t0) * 1000.0
+
     ring_cals: List[Optional[BoardCalibration]] = []
     if board_calibrator is not None:
         for r in per_cam:
@@ -2263,9 +3067,21 @@ def fuse_multicam_lines(
     # --- Stage 1 tip fuse from preliminary per-cam FitLines ---
     # Keep all cams for stage2 refit; consensus may drop a fleeer only for tip.
     all_line_cams = list(line_cams)
+    t_fuse1 = time.perf_counter()
     tip_ds, residual, line_cams = _estimate_fused_tip_ds(all_line_cams, board_center_ds)
+    fuse1_ms = (time.perf_counter() - t_fuse1) * 1000.0
+    if perf is not None:
+        perf["fuse1"] = fuse1_ms
+        perf["stage1"] = fuse1_ms
     if tip_ds is None:
         return FusedDartResult(found=False, per_cam=per_cam, reject_reason="no_intersect")
+
+    stage1_tip_ds = (float(tip_ds[0]), float(tip_ds[1]))
+    for r in all_line_cams:
+        r.stage1_vx = float(r.line_vx)
+        r.stage1_vy = float(r.line_vy)
+        r.stage1_x0 = float(r.line_x0)
+        r.stage1_y0 = float(r.line_y0)
 
     # --- Stage 2: re-FitLine on soft pixels inside tip ROI, then fuse again ---
     # Refit every cam near the consensus tip — a bad stage1 direction may recover.
@@ -2275,6 +3091,7 @@ def fuse_multicam_lines(
     # Persist ROI in original warp space for hit debug overlays.
     stage2_roi_tip_xy = _map_ds_xy_to_original(tip_ds[0], tip_ds[1], scale_x, scale_y)
     stage2_roi_radius = float(FITLINE_STAGE2_TIP_RADIUS_FRAC) * float(board_r)
+    t_s2 = time.perf_counter()
     _stage2_refit_lines_near_tip(
         all_line_cams,
         tip_ds,
@@ -2283,9 +3100,87 @@ def fuse_multicam_lines(
         scale_x=scale_x,
         scale_y=scale_y,
     )
+    _lap("stage2", t_s2)
+
+    fitq_pair_spread = 0.0
+    fitq_suspicious = False
+    fitq_recovery_cam = -1
+    t_fitq = time.perf_counter()
+    for r in all_line_cams:
+        q = _measure_cam_fitq(
+            r,
+            tip_orig=stage2_roi_tip_xy,
+            radius_orig=stage2_roi_radius,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            board_r_ds=board_r_ds,
+            stage1_tip_ds=stage1_tip_ds,
+        )
+        _apply_fitq_to_result(r, q)
+        _log_fitq_block(r)
+    if len(all_line_cams) >= 3:
+        fitq_pair_spread = _pair_spread_px(all_line_cams, board_center_ds)
+        spread_thresh = max(
+            float(FITQ_PAIR_SPREAD_MIN_PX),
+            float(FITQ_PAIR_SPREAD_FRAC) * float(board_r_ds),
+        )
+        fitq_suspicious = fitq_pair_spread > spread_thresh
+    print(
+        f"[FITQ] pair_spread={fitq_pair_spread:.1f} px "
+        f"suspicious={int(fitq_suspicious)}",
+        flush=True,
+    )
+    rec_ms = 0.0
+    if fitq_suspicious and len(all_line_cams) >= 3:
+        t_rec = time.perf_counter()
+        suspect_i = _identify_suspect_cam(all_line_cams, board_center_ds)
+        if suspect_i >= 0:
+            fitq_recovery_cam = int(all_line_cams[suspect_i].cam_idx)
+            did = _recover_suspicious_cam(
+                all_line_cams,
+                suspect_i,
+                tip_orig=stage2_roi_tip_xy,
+                radius_orig=stage2_roi_radius,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                board_center_orig=board_center,
+                board_center_ds=board_center_ds,
+                board_r_ds=board_r_ds,
+                stage1_tip_ds=stage1_tip_ds,
+            )
+            if did:
+                fitq_pair_spread = _pair_spread_px(all_line_cams, board_center_ds)
+                for r in all_line_cams:
+                    _log_fitq_block(r)
+                print(
+                    f"[FITQ] pair_spread={fitq_pair_spread:.1f} px after recovery",
+                    flush=True,
+                )
+            else:
+                fitq_recovery_cam = -1
+                print(
+                    f"[FITQ] recovery cam{all_line_cams[suspect_i].cam_idx} rejected",
+                    flush=True,
+                )
+        rec_ms = (time.perf_counter() - t_rec) * 1000.0
+    fitq_ms = (time.perf_counter() - t_fitq) * 1000.0
+    print(
+        f"[FITQ] overhead={fitq_ms:.1f}ms recovery={rec_ms:.1f}ms",
+        flush=True,
+    )
+
+    t_fuse2 = time.perf_counter()
     tip_ds, residual, line_cams = _estimate_fused_tip_ds(all_line_cams, board_center_ds)
+    _lap("fuse2", t_fuse2)
     if tip_ds is None:
-        return FusedDartResult(found=False, per_cam=per_cam, reject_reason="no_intersect")
+        return FusedDartResult(
+            found=False,
+            per_cam=per_cam,
+            reject_reason="no_intersect",
+            fitq_pair_spread=fitq_pair_spread,
+            fitq_suspicious=fitq_suspicious,
+            fitq_recovery_cam=fitq_recovery_cam,
+        )
 
     tip = _map_ds_xy_to_original(tip_ds[0], tip_ds[1], scale_x, scale_y)
     tx_ds, ty_ds = float(tip_ds[0]), float(tip_ds[1])
@@ -2324,11 +3219,16 @@ def fuse_multicam_lines(
             reject_reason="off_board",
             stage2_roi_tip_xy=stage2_roi_tip_xy,
             stage2_roi_radius=stage2_roi_radius,
+            fitq_pair_spread=fitq_pair_spread,
+            fitq_suspicious=fitq_suspicious,
+            fitq_recovery_cam=fitq_recovery_cam,
         )
 
+    t_score = time.perf_counter()
     number, zone, score = score_topdown_point(
         tx, ty, out_size=FITLINE_SIZE, cals=ring_cals
     )
+    _lap("score", t_score)
     if score <= 0:
         return FusedDartResult(
             found=True,
@@ -2342,6 +3242,9 @@ def fuse_multicam_lines(
             reject_reason="miss",
             stage2_roi_tip_xy=stage2_roi_tip_xy,
             stage2_roi_radius=stage2_roi_radius,
+            fitq_pair_spread=fitq_pair_spread,
+            fitq_suspicious=fitq_suspicious,
+            fitq_recovery_cam=fitq_recovery_cam,
         )
 
     if zone in ("inner_bull", "outer_bull"):
@@ -2357,6 +3260,9 @@ def fuse_multicam_lines(
                 cam_indices=[r.cam_idx for r in line_cams],
                 stage2_roi_tip_xy=stage2_roi_tip_xy,
                 stage2_roi_radius=stage2_roi_radius,
+                fitq_pair_spread=fitq_pair_spread,
+                fitq_suspicious=fitq_suspicious,
+                fitq_recovery_cam=fitq_recovery_cam,
             )
 
     mean_conf = float(np.mean([r.confidence for r in line_cams]))
@@ -2376,6 +3282,9 @@ def fuse_multicam_lines(
         per_cam=per_cam,
         stage2_roi_tip_xy=stage2_roi_tip_xy,
         stage2_roi_radius=stage2_roi_radius,
+        fitq_pair_spread=fitq_pair_spread,
+        fitq_suspicious=fitq_suspicious,
+        fitq_recovery_cam=fitq_recovery_cam,
     )
 
 
@@ -2444,7 +3353,27 @@ def _stage2_refit_lines_near_tip(
         refined = _refit_fitline_near_tip(ds, tip_cam, r_cam, bc_cam)
         if refined is None:
             continue
-        vx, vy, x0, y0 = refined
+        r.centerline_old_ds = (
+            float(refined[0]),
+            float(refined[1]),
+            float(refined[2]),
+            float(refined[3]),
+        )
+        chosen, bin_pts, accepted, reason, cand = _centerline_refit_stage2(
+            ds,
+            tip_cam,
+            r_cam,
+            refined,
+            bc_cam,
+            cam_idx=int(r.cam_idx),
+            scale_x=sx,
+            scale_y=sy,
+        )
+        r.centerline_pts_ds = list(bin_pts)
+        r.centerline_cand_ds = cand
+        r.centerline_accepted = bool(accepted)
+        r.centerline_reject_reason = str(reason)
+        vx, vy, x0, y0 = chosen
         r.line_vx = float(vx)
         r.line_vy = float(vy)
         r.line_x0 = float(x0)
@@ -2475,6 +3404,7 @@ class DartMotionDetector:
         self._post_hit_until: float = 0.0
         self._post_hit_need_clear: bool = False
         self._pending_ui_commit: bool = False
+        self._arm_t0: float = 0.0
         self._last_empty_td_px: int = 0
         self._last_empty_raw_px: int = 0
         self._last_empty_td_diff: float = 0.0
@@ -2524,6 +3454,7 @@ class DartMotionDetector:
         self._post_hit_until = 0.0
         self._post_hit_need_clear = False
         self._pending_ui_commit = False
+        self._arm_t0 = 0.0
 
     def defer_board_snapshot(self) -> None:
         """Odgodi motion ref do mirne ploce (npr. nakon MISS izvan ploce)."""
@@ -3229,6 +4160,7 @@ class DartMotionDetector:
                     if max_px >= MOTION_ARM_PIXELS:
                         self._motion_state = "armed"
                         self._armed_frames = 1
+                        self._arm_t0 = time.perf_counter()
                         self._hand_stable_streak = 0
                         self._clear_frames = 0
                         self._hand_cooldown_frames = 0
@@ -3262,6 +4194,7 @@ class DartMotionDetector:
             ):
                 self._motion_state = "armed"
                 self._armed_frames = 0
+                self._arm_t0 = time.perf_counter()
                 self._hand_stable_streak = 0
                 state = "armed"
             else:
@@ -3308,11 +4241,24 @@ class DartMotionDetector:
 
         # Detekcija na zadnjem stabilnom kadru (settle cache), ne na svjezem USB bufferu.
         fire_frames = self._fire_frames if len(self._fire_frames) >= 2 else frames
+        t_proc = time.perf_counter()
+        wait_since_arm_ms = 0.0
+        if self._arm_t0 > 0.0:
+            wait_since_arm_ms = (t_proc - self._arm_t0) * 1000.0
         # Soft-threshold FitLine po kameri (downscaled) → tip = sjecište u ds, map natrag.
+        t_detect = time.perf_counter()
         per_cam = self.detect_all(board_calibrator, fire_frames, save_debug=False)
-        fused = fuse_multicam_lines(per_cam, board_calibrator=board_calibrator)
+        detect_ms = (time.perf_counter() - t_detect) * 1000.0
+        fuse_perf: Dict[str, float] = {}
+        fused = fuse_multicam_lines(
+            per_cam, board_calibrator=board_calibrator, perf=fuse_perf
+        )
         fused.per_cam = per_cam
         fused = _apply_ml_tip_cached(fused, per_cam, board_calibrator)
+        total_processing_ms = (time.perf_counter() - t_proc) * 1000.0
+        total_arm_to_result_ms = (
+            (time.perf_counter() - self._arm_t0) * 1000.0 if self._arm_t0 > 0.0 else total_processing_ms
+        )
         # Debug / raw-shaft shadow nakon UI-ja — ne smiju blokirati prikaz hita.
         if save_debug and fused.found and _hit_motion_debug_enabled():
             save_hit_fusion_debug(
@@ -3326,6 +4272,19 @@ class DartMotionDetector:
         self._armed_frames = 0
         self._clear_frames = 0
         if fused.found:
+            print(
+                "[PERF][HIT]\n"
+                f"wait_since_arm={wait_since_arm_ms:.1f}ms\n"
+                f"detect_all={detect_ms:.1f}ms\n"
+                f"stage1={float(fuse_perf.get('stage1', 0.0)):.1f}ms\n"
+                f"fuse1={float(fuse_perf.get('fuse1', 0.0)):.1f}ms\n"
+                f"stage2={float(fuse_perf.get('stage2', 0.0)):.1f}ms\n"
+                f"fuse2={float(fuse_perf.get('fuse2', 0.0)):.1f}ms\n"
+                f"score={float(fuse_perf.get('score', 0.0)):.1f}ms\n"
+                f"total_processing={total_processing_ms:.1f}ms\n"
+                f"total_arm_to_result={total_arm_to_result_ms:.1f}ms",
+                flush=True,
+            )
             tag = "fired_miss" if fused.zone_name == "miss" or fused.score <= 0 else "fired"
             return probe, fused, tag
         if fused.reject_reason:

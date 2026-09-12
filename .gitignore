@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Calibration / motion debug dumps (recreated at runtime)
+debug_edges/
+debug_calibration/
+dart_motion_refs/

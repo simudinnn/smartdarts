@@ -12,4 +12,4 @@ BROKER_PORT = 8883
 USERNAME = "pustinja_cluster"
 PASSWORD = "9fHYv8mNjgzJ8@e"
 
-TOPIC = "pikado/pikado3/cmd"
+TOPIC = "pikado/pikado1/cmd"

@@ -330,9 +330,16 @@ class KioskSession:
         cam_mgr = self.ctx.get("camera_mgr")
         board_cal = self.ctx.get("board_calibrator")
         frames = self.ctx.get("_last_cal_frames") or {}
+        t_full = time.perf_counter()
         if cam_mgr is not None and cam_mgr.active:
+            t_grab0 = time.perf_counter()
             frames = cam_mgr.grab_frames(flush=2)
             self.ctx["_last_cal_frames"] = frames
+            print(
+                f"[PERF][CAL] precheck grab_frames="
+                f"{(time.perf_counter() - t_grab0) * 1000.0:.1f}ms flush=2",
+                flush=True,
+            )
         if board_cal is None or not frames:
             print("[dart] DETEKTIRAJ: nema kadrova", flush=True)
             self.ctx["_dart_status"] = "DET FAIL"
@@ -341,19 +348,40 @@ class KioskSession:
         # Max 3 pokušaja na 320x240 — softverski upscale je u calibrate_board.
         hints = dict(self.ctx.get("bull_hints") or {})
         ell_hints = dict(self.ctx.get("ellipse_hints") or {})
-        for _attempt in range(3):
+        for attempt in range(3):
+            t_grab = time.perf_counter()
             if cam_mgr is not None and cam_mgr.active:
                 frames = cam_mgr.grab_frames(flush=2)
                 self.ctx["_last_cal_frames"] = frames
+            print(
+                f"[PERF][CAL] attempt{attempt} grab_frames="
+                f"{(time.perf_counter() - t_grab) * 1000.0:.1f}ms flush=2",
+                flush=True,
+            )
             incomplete = board_cal.detect_all(
                 frames,
                 bull_hints=hints or None,
                 ellipse_hints=ell_hints or None,
             )
+            print(
+                f"[PERF][CAL] attempt{attempt} incomplete={incomplete}",
+                flush=True,
+            )
             if not incomplete:
                 break
             time.sleep(0.08)
+        t_ref = time.perf_counter()
         n_ref = self.capture_dart_reference()
+        print(
+            f"[PERF][CAL] capture_dart_reference="
+            f"{(time.perf_counter() - t_ref) * 1000.0:.1f}ms",
+            flush=True,
+        )
+        print(
+            f"[PERF][CAL] full calibration including frame grabs/retries/ref="
+            f"{(time.perf_counter() - t_full) * 1000.0:.1f}ms",
+            flush=True,
+        )
         all_ok = not incomplete and n_ref > 0
         if incomplete:
             detail = board_cal.format_incomplete_status(incomplete)
