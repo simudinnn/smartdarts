@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -10,27 +11,45 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+import distance_yfit as _dyfit
+
 from board_calibration import (
+    BOARD_SEGMENT_NUMBERS,
     BOARD_SISAL_EDGE_FRAC,
+    RING_BULL_INNER_FRAC,
+    RING_BULL_OUTER_FRAC,
+    SEGMENT_COUNT,
     BoardCalibration,
     BoardCalibrator,
     warp_topdown_from_calibration,
     topdown_point_to_score,
     scoring_ring_radii,
     scoring_ring_ellipses,
+    calibrated_topdown_wire_thetas,
+    canonical_topdown_wire_thetas,
     normalized_ellipse_radius,
+    _ang_abs_delta_deg,
+    _angle_sin_cos,
     _board_ellipse_mask,
     _debug_dir_path,
     _ensure_debug_dir_exists,
+    _mean_ellipse_semi,
+    _ray_to_ellipse_edge_f,
     _scale_ellipse,
     _scale_ellipse_axes,
+    _segment_slot_from_theta,
+    _segment_slot_from_wires,
     _warp_radii,
 )
 
 
-MOTION_DIFF_THRESH = 10
-MOTION_MIN_PIXELS = 16
+MOTION_DIFF_THRESH = 25
+MOTION_MIN_PIXELS = 20
 MOTION_MAX_PIXELS = 12000
+# Scattered LED/empty-ref specks can sum past MOTION_MIN_PIXELS. Reject
+# only a *field* of tiny CCs — a thin dart shaft may be 12–40 px after morph.
+MOTION_MIN_BLOB_AREA = 12
+MOTION_SPECKLE_MIN_CCS = 8
 MOTION_BLUR_KSIZE = 3
 MOTION_LOG_MIN_PIXELS = 6
 # Idle LED/USB flicker is often ~8–20 px; a real dart is far above this.
@@ -52,6 +71,92 @@ FITLINE_WEIGHT_EPS = 2.0
 FITLINE_MIN_PX = 8
 # Dilate morph gate so soft FitLine keeps a margin around the motion streak.
 FITLINE_GATE_DILATE = 5
+# Experimental joint Y detector (no FitLine seed). "fitline" keeps production path.
+# "hybrid" = FitLine seed + local Y-refine.
+DART_DETECTOR_MODE = os.environ.get("SMARTDARTS_DETECTOR", "hybrid").strip().lower()
+if DART_DETECTOR_MODE not in ("fitline", "yfit", "hybrid"):
+    DART_DETECTOR_MODE = "hybrid"
+# Experimental warpPolar distance-Y (distance_yfit_warppolar_final_v2).
+# Default off: hybrid FitLine/Y-refine stays production.
+# SMARTDARTS_TIP_ESTIMATOR=distance_yfit  (alias: SMARTDARTS_TIP_MODE)
+_raw_tip = (
+    os.environ.get("SMARTDARTS_TIP_ESTIMATOR")
+    or os.environ.get("SMARTDARTS_TIP_MODE")
+    or "off"
+).strip().lower()
+if _raw_tip in ("", "none", "hybrid", "fitline", "yfit", "off"):
+    DART_TIP_ESTIMATOR = "off"
+elif _raw_tip in ("distance_yfit", "distance_yfit_standalone"):
+    DART_TIP_ESTIMATOR = "distance_yfit"
+else:
+    DART_TIP_ESTIMATOR = "off"
+DART_TIP_MODE = DART_TIP_ESTIMATOR
+DYFIT_2CAM_CONF_SCALE = 0.72
+# Y-FIT knobs (board px @ FITLINE_SIZE). Easy to retune.
+YFIT_COARSE_XY_STEP = 4.0
+YFIT_FINE_XY_STEP = 1.0
+YFIT_COARSE_ANGLE_DEG = 6.0
+YFIT_FINE_ANGLE_DEG = 1.0
+YFIT_SEARCH_MARGIN_PX = 15.0  # P search bbox = fused motion + this margin
+YFIT_RAY_LENGTH_FRAC = 0.50  # of board_r; matches Stage2 ROI radius
+YFIT_CORRIDOR_PX = 3.0  # Gaussian sigma for distance-weighted support
+YFIT_DIST_CUTOFF_SIGMA = 3.0  # ignore |v| > this * sigma (not a binary corridor)
+YFIT_BALANCE_PENALTY = 0.15  # mild left/right mass imbalance penalty
+YFIT_BIN_TAU = 0.80  # per-bin mass saturation (coverage, not raw intensity)
+YFIT_FINE_XY_RADIUS = 4.0  # around best coarse P (covers 4px coarse cell)
+YFIT_FINE_ANGLE_SPAN_DEG = 6.0  # around best coarse theta (covers 6° coarse cell)
+YFIT_U_BINS = 12
+YFIT_MIN_TOTAL = 0.35
+YFIT_P_CHUNK = 8192
+# 1° ray/corridor templates, keyed by (ray_len, corridor, n_bins, cutoff).
+_YFIT_RAY_BANK: Dict[Tuple, dict] = {}
+# Local Y-refine around FitLine seed (hybrid). Search windows in FITLINE_SIZE px / deg.
+# Adaptive P/angle from pair_spread (tight hits stay small/fast).
+YREFINE_SPREAD_TIGHT = 3.0
+YREFINE_SPREAD_WIDE = 8.0
+YREFINE_P_RADIUS_TIGHT = 5.0
+YREFINE_P_RADIUS_MID = 9.0
+YREFINE_P_RADIUS_WIDE = 18.0
+YREFINE_P_RADIUS_EXPAND_CAP = 20.0
+YREFINE_MAX_DP_TIGHT = 6.0
+YREFINE_MAX_DP_MID = 12.0
+YREFINE_MAX_DP_WIDE = 20.0
+YREFINE_ANG_TIGHT = 5.0
+YREFINE_ANG_MID_GOOD = 7.0
+YREFINE_ANG_MID_BAD = 10.0
+YREFINE_ANG_WIDE_GOOD = 8.0
+YREFINE_ANG_WIDE_BAD = 15.0
+YREFINE_COARSE_XY_STEP = 2.0
+YREFINE_FINE_XY_STEP = 1.0
+YREFINE_FINE_XY_RADIUS = 2.0
+YREFINE_COARSE_ANG_STEP = 2.0
+YREFINE_FINE_ANG_STEP = 1.0
+YREFINE_FINE_ANG_SPAN = 2.0
+YREFINE_LOW_Q = 0.34
+YREFINE_S1S2_JUMP_DEG = 12.0
+YREFINE_MIN_CAM_NORMAL = 0.28
+YREFINE_MIN_CAM_SUSP = 0.18
+YREFINE_SCORE_EPS_NORMAL = 0.005
+YREFINE_SCORE_EPS_SUSP = 0.002
+YREFINE_ABSURD_ANG_DEG = 22.0
+# Per-cam ray: keep Gaussian corridor; weight tightness (center) over coverage.
+YREFINE_COV_W = 0.40
+YREFINE_TIGHT_W = 0.60
+YREFINE_OBJECTIVE = "consensus"  # 0.5*mean + 0.5*min; see _yrefine_objectives
+YREFINE_ALIVE_SUPPORT = 0.08  # ignore dead cams in min/geom/consensus
+# Hybrid: Y-refine only when a FitLine misses the fused tip (poor concurrence).
+YREFINE_FLEE_PX = 2.0
+# Motion pixels Y-refine may use: bright dart core + small halo.
+# Dim specks must be zeroed *before* CC or they 8-connect onto the dart
+# and ray coverage walks the tip along board wires.
+YREFINE_NOISE_PCTL = 90.0
+YREFINE_NOISE_CORE_FRAC = 0.32
+YREFINE_NOISE_CORE_MIN_AREA = 6
+YREFINE_NOISE_DILATE_PX = 2
+# Bright satellite beside the dart (not along the shaft) rotates the Y ray.
+YREFINE_SATELLITE_PERP_PX = 4.5
+YREFINE_SATELLITE_AREA_FRAC = 0.22
+YREFINE_SATELLITE_ELONG_RATIO = 1.6
 
 
 def _warp_frame(
@@ -83,13 +188,25 @@ FITLINE_STAGE2_TIP_RADIUS_FRAC = 0.50
 # Stage-2 soft falloff: weight *= (1 - dist/r)^power so tip-local shaft
 # constrains direction more than residual flight at the ROI rim.
 FITLINE_STAGE2_DIST_WEIGHT_POWER = 1.25
-# After Stage2 PCA: equal-weight longitudinal-bin median centerline (not blob mass).
+# Centerline bin-refit is debug-only and must not change the production line.
+DEBUG_CENTERLINE_REFIT = False
 CENTERLINE_N_BINS = 14
 CENTERLINE_MIN_BINS = 5
 CENTERLINE_MIN_BIN_PX = 3
 CENTERLINE_MIN_LENGTH_PX = 10.0
 CENTERLINE_RES_WORSE_FRAC = 1.35
 CENTERLINE_RES_WORSE_PX = 0.35
+# Stage2 shaft component selection (CC). Not ranked by area.
+SHAFT_CC_MIN_AREA = 8
+SHAFT_MIN_ELONG = 0.28
+SHAFT_MIN_LENGTH_PX = 8.0
+SHAFT_MAX_THICK_PX = 12.0
+SHAFT_TIP_DIST_FRAC = 0.62
+SHAFT_MIN_SCORE = 0.22
+SHAFT_MERGE_ANGLE_DEG = 18.0
+SHAFT_MERGE_COLLINEAR_PX = 4.5
+SHAFT_MERGE_GAP_PX = 16.0
+SHAFT_MERGE_TIP_PERP_PX = 10.0
 # FitLine quality (always) + conservative recovery (suspicious hits only).
 # Quality describes geometric line shape, not blob size / motion energy.
 FITQ_CORRIDOR_PX = 3.0
@@ -155,11 +272,17 @@ EMPTY_BOARD_RAW_HAND_PIXELS = 2800
 # Nakon hita: prikazi odmah, pa 0.5s da se ne upisu dva hita odjednom.
 # (Ne rearm koji ceka px<12 — to se zaglavi na sumu.)
 POST_HIT_COOLDOWN_SEC = 0.28
-# Leftover shaft after a real hit is radial; 1-cam fuse projects to bull.
+# Leftover shaft after a real hit is radial; 1-cam fuse used to project to bull.
 BULL_MIN_CAMS = 2
+# A 2D tip needs two lines with a real crossing. One FitLine through the
+# board center turns a miss-flight into a fake on-board hit; two nearly
+# parallel lines slide the intersection along the dart (S4 vs S13).
+FUSE_MIN_CAMS = 2
+FUSE_MIN_CROSS_2CAM = 0.18  # |sin θ| ≈ 10.4°
+FITLINE_PAIR_CROSS_MIN = 0.08  # 3-cam pairwise skip (unchanged)
 BULL_MOTION_MAX_BULL_OUTER = 2.2
 SAVE_MOTION_DEBUG = False
-# Hit debug: fused_motion_raw + fitline_smooth_intersect only (see save_hit_fusion_debug).
+# Hit debug: fused_motion_raw (blobs) + scoring-canvas FitLine / Y-refine overlays.
 SAVE_HIT_FUSION_DEBUG = True
 MOTION_REFS_DIRNAME = "dart_motion_refs"
 # BGR boje po kameri za hit fusion debug overlay (jarke radi vidljivosti).
@@ -245,7 +368,7 @@ class DartDetectResult:
     # Map FitLine/ds coords → original warp: original = ds * scale.
     fit_scale_x: float = 1.0
     fit_scale_y: float = 1.0
-    # Per-cam tip: projekcija fused tipa na liniju (2+ cam) / board-center (1 cam).
+    # Per-cam tip: projekcija fused tipa na liniju (2+ cam).
     # line_* are in FITLINE_SIZE coordinates (same space as fit_ds_gray).
     radius_tip: Tuple[float, float] = (0.0, 0.0)
     # Stage-1 line snapshot (before Stage2 ROI overwrite).
@@ -263,13 +386,18 @@ class DartDetectResult:
     fitq_s1s2_angle: float = 0.0
     fitq_s1s2_tip: float = 0.0
     fitq_quality: float = 0.0
-    # Stage2 centerline-bin points in FitLine/ds space (debug overlay).
+    # Stage2 centerline-bin points (DEBUG_CENTERLINE_REFIT only; not used for line).
     centerline_pts_ds: List[Tuple[float, float]] = field(default_factory=list)
-    # (vx,vy,x0,y0) in the same ds space as line_* / yellow points.
     centerline_old_ds: Optional[Tuple[float, float, float, float]] = None
     centerline_cand_ds: Optional[Tuple[float, float, float, float]] = None
     centerline_accepted: bool = False
     centerline_reject_reason: str = ""
+    # Stage2 shaft CC debug (ds coords).
+    shaft_sel_xs: Optional[np.ndarray] = None
+    shaft_sel_ys: Optional[np.ndarray] = None
+    shaft_rej_xs: Optional[np.ndarray] = None
+    shaft_rej_ys: Optional[np.ndarray] = None
+    yfit_support: float = 0.0
 
 
 @dataclass
@@ -289,6 +417,18 @@ class FusedDartResult:
     fitq_pair_spread: float = 0.0
     fitq_suspicious: bool = False
     fitq_recovery_cam: int = -1
+    yfit_total: float = 0.0
+    yfit_ms: float = 0.0
+    yrefine_p0: Tuple[float, float] = (0.0, 0.0)
+    yrefine_p: Tuple[float, float] = (0.0, 0.0)
+    yrefine_accepted: bool = False
+    yrefine_mode: str = ""
+    yrefine_seed_dir: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+    yrefine_dir: Dict[int, Tuple[float, float]] = field(default_factory=dict)
+    yrefine_scores: Dict[int, float] = field(default_factory=dict)
+    yrefine_search_radius: float = 0.0
+    yrefine_on_edge: bool = False
+    yrefine_expanded: bool = False
 
 
 def summarize_motion_log(results: List[DartDetectResult]) -> str:
@@ -770,6 +910,271 @@ def _refit_fitline_near_tip(
     return float(vx), float(vy), float(x0), float(y0)
 
 
+def _pca_geom_xy(
+    xs: np.ndarray, ys: np.ndarray
+) -> Tuple[float, float, float, float, float, float, float, float]:
+    """Equal-weight PCA geometry: vx,vy,cx,cy,elong,length,thickness,n."""
+    xs_f = xs.astype(np.float64)
+    ys_f = ys.astype(np.float64)
+    n = int(xs_f.size)
+    if n < 2:
+        cx = float(xs_f[0]) if n else 0.0
+        cy = float(ys_f[0]) if n else 0.0
+        return 1.0, 0.0, cx, cy, 0.0, 0.0, 0.0, float(n)
+    cx = float(xs_f.mean())
+    cy = float(ys_f.mean())
+    dx = xs_f - cx
+    dy = ys_f - cy
+    cov = np.array(
+        [
+            [float((dx * dx).mean()), float((dx * dy).mean())],
+            [float((dx * dy).mean()), float((dy * dy).mean())],
+        ],
+        dtype=np.float64,
+    )
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    l2, l1 = float(eigvals[0]), float(eigvals[1])
+    vx = float(eigvecs[0, -1])
+    vy = float(eigvecs[1, -1])
+    nn = float(np.hypot(vx, vy)) or 1.0
+    vx, vy = vx / nn, vy / nn
+    elong = float((l1 - l2) / (l1 + l2 + 1e-9))
+    par = dx * vx + dy * vy
+    perp = dx * (-vy) + dy * vx
+    length = float(np.max(par) - np.min(par)) if n else 0.0
+    thickness = float(2.0 * np.mean(np.abs(perp))) if n else 0.0
+    return vx, vy, cx, cy, elong, length, thickness, float(n)
+
+
+def _shaft_component_score(
+    *,
+    dmin: float,
+    radius: float,
+    elong: float,
+    length: float,
+    thickness: float,
+) -> float:
+    """Prefer near-tip, long, thin structure. Area/pixel count is not the rank."""
+    r = max(float(radius), 1.0)
+    tip_prox = float(np.clip(1.0 - float(dmin) / r, 0.0, 1.0))
+    length_n = float(np.clip(float(length) / max(0.35 * r, 8.0), 0.0, 1.0))
+    thick_n = float(np.clip(float(thickness) / float(SHAFT_MAX_THICK_PX), 0.0, 1.0))
+    elong_n = float(np.clip(float(elong), 0.0, 1.0))
+    return 0.40 * tip_prox + 0.30 * elong_n + 0.25 * length_n - 0.25 * thick_n
+
+
+def _comps_mergeable(
+    a: dict,
+    b: dict,
+    tip_xy: Tuple[float, float],
+) -> bool:
+    ang = _dir_angle_delta_deg(a["vx"], a["vy"], b["vx"], b["vy"])
+    if ang > float(SHAFT_MERGE_ANGLE_DEG):
+        return False
+    d_cent = _point_to_line_distance(
+        a["cx"], a["cy"], a["vx"], a["vy"], b["cx"], b["cy"]
+    )
+    if d_cent > float(SHAFT_MERGE_COLLINEAR_PX):
+        return False
+    ua = (a["xs"] - a["cx"]) * a["vx"] + (a["ys"] - a["cy"]) * a["vy"]
+    ub = (b["xs"] - a["cx"]) * a["vx"] + (b["ys"] - a["cy"]) * a["vy"]
+    a0, a1 = float(np.min(ua)), float(np.max(ua))
+    b0, b1 = float(np.min(ub)), float(np.max(ub))
+    if a1 < b0:
+        gap = b0 - a1
+    elif b1 < a0:
+        gap = a0 - b1
+    else:
+        gap = 0.0
+    if gap > float(SHAFT_MERGE_GAP_PX):
+        return False
+    tip_d = _point_to_line_distance(
+        a["cx"], a["cy"], a["vx"], a["vy"], float(tip_xy[0]), float(tip_xy[1])
+    )
+    tip_db = _point_to_line_distance(
+        b["cx"], b["cy"], b["vx"], b["vy"], float(tip_xy[0]), float(tip_xy[1])
+    )
+    if tip_d > float(SHAFT_MERGE_TIP_PERP_PX) and tip_db > float(SHAFT_MERGE_TIP_PERP_PX):
+        return False
+    return True
+
+
+def _select_shaft_components_stage2(
+    ds_soft: np.ndarray,
+    tip_xy_ds: Tuple[float, float],
+    radius_ds: float,
+    board_center_ds: Tuple[float, float],
+    *,
+    cam_idx: int = -1,
+) -> Tuple[
+    Optional[Tuple[float, float, float, float]],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
+    """Pick elongated near-tip CC in Stage2 ROI; fallback None → original Stage2."""
+    empty = (None, None, None, None, None)
+    if ds_soft is None or ds_soft.size == 0:
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps=0 selected=[] pixels=0 "
+            f"elong=- length=- rejected_reason=no_soft",
+            flush=True,
+        )
+        return empty
+    soft = ds_soft.astype(np.float32, copy=False)
+    h, w = soft.shape[:2]
+    tx, ty = float(tip_xy_ds[0]), float(tip_xy_ds[1])
+    r = max(float(radius_ds), 1.0)
+    ys, xs = np.where(soft > float(FITLINE_WEIGHT_EPS))
+    if int(xs.size) < FITLINE_MIN_PX:
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps=0 selected=[] pixels=0 "
+            f"elong=- length=- rejected_reason=no_pixels",
+            flush=True,
+        )
+        return empty
+    dist = np.hypot(xs.astype(np.float64) - tx, ys.astype(np.float64) - ty)
+    in_roi = dist <= r
+    if int(np.count_nonzero(in_roi)) < FITLINE_MIN_PX:
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps=0 selected=[] pixels=0 "
+            f"elong=- length=- rejected_reason=roi_empty",
+            flush=True,
+        )
+        return empty
+
+    binary = np.zeros((h, w), dtype=np.uint8)
+    binary[ys[in_roi], xs[in_roi]] = 255
+    n_lab, labels, stats, _cents = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    comps: List[dict] = []
+    rej_xs: List[np.ndarray] = []
+    rej_ys: List[np.ndarray] = []
+    for lab in range(1, int(n_lab)):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < int(SHAFT_CC_MIN_AREA):
+            continue
+        ys_c, xs_c = np.where(labels == lab)
+        xs_f = xs_c.astype(np.float64)
+        ys_f = ys_c.astype(np.float64)
+        vx, vy, cx, cy, elong, length, thick, _n = _pca_geom_xy(xs_f, ys_f)
+        dmin = float(
+            np.min(np.hypot(xs_f - tx, ys_f - ty))
+        )
+        rec = {
+            "lab": int(lab),
+            "area": area,
+            "xs": xs_f,
+            "ys": ys_f,
+            "vx": vx,
+            "vy": vy,
+            "cx": cx,
+            "cy": cy,
+            "elong": elong,
+            "length": length,
+            "thick": thick,
+            "dmin": dmin,
+        }
+        shaft_like = (
+            elong >= float(SHAFT_MIN_ELONG)
+            and length >= float(SHAFT_MIN_LENGTH_PX)
+            and thick <= float(SHAFT_MAX_THICK_PX)
+            and dmin <= float(SHAFT_TIP_DIST_FRAC) * r
+        )
+        rec["score"] = _shaft_component_score(
+            dmin=dmin, radius=r, elong=elong, length=length, thickness=thick
+        )
+        rec["shaft_like"] = bool(shaft_like)
+        if shaft_like:
+            comps.append(rec)
+        else:
+            rej_xs.append(xs_f)
+            rej_ys.append(ys_f)
+
+    n_cc = max(int(n_lab) - 1, 0)
+    if not comps:
+        rx = np.concatenate(rej_xs) if rej_xs else None
+        ry = np.concatenate(rej_ys) if rej_ys else None
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps={n_cc} selected=[] pixels=0 "
+            f"elong=- length=- rejected_reason=no_shaft_component",
+            flush=True,
+        )
+        return None, None, None, rx, ry
+
+    comps.sort(key=lambda c: float(c["score"]), reverse=True)
+    best = comps[0]
+    if float(best["score"]) < float(SHAFT_MIN_SCORE):
+        rx = np.concatenate([c["xs"] for c in comps] + rej_xs)
+        ry = np.concatenate([c["ys"] for c in comps] + rej_ys)
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps={n_cc} selected=[] pixels=0 "
+            f"elong={best['elong']:.2f} length={best['length']:.1f} "
+            f"rejected_reason=low_score",
+            flush=True,
+        )
+        return None, None, None, rx, ry
+
+    selected = [best]
+    selected_labs = {int(best["lab"])}
+    for other in comps[1:]:
+        if any(_comps_mergeable(s, other, (tx, ty)) for s in selected):
+            selected.append(other)
+            selected_labs.add(int(other["lab"]))
+        else:
+            rej_xs.append(other["xs"])
+            rej_ys.append(other["ys"])
+
+    sel_xs = np.concatenate([c["xs"] for c in selected])
+    sel_ys = np.concatenate([c["ys"] for c in selected])
+    if int(sel_xs.size) < FITLINE_MIN_PX:
+        rx = np.concatenate(rej_xs + [sel_xs])
+        ry = np.concatenate(rej_ys + [sel_ys])
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps={n_cc} selected=[] pixels=0 "
+            f"elong=- length=- rejected_reason=few_pixels",
+            flush=True,
+        )
+        return None, None, None, rx, ry
+
+    inten = soft[sel_ys.astype(np.int32), sel_xs.astype(np.int32)].astype(np.float64)
+    dist_s = np.hypot(sel_xs - tx, sel_ys - ty)
+    prox = np.clip(1.0 - dist_s / r, 0.05, 1.0) ** float(FITLINE_STAGE2_DIST_WEIGHT_POWER)
+    vx, vy, x0, y0 = _fit_from_points(sel_xs, sel_ys, inten * prox)
+    vx, vy = _orient_fitline_tipward(vx, vy, x0, y0, board_center_ds)
+    span = float(
+        np.hypot(float(sel_xs.max()) - float(sel_xs.min()), float(sel_ys.max()) - float(sel_ys.min()))
+    )
+    if span < 2.0:
+        rx = np.concatenate(rej_xs + [sel_xs])
+        ry = np.concatenate(rej_ys + [sel_ys])
+        print(
+            f"[SHAFT_SELECT] cam{int(cam_idx)} comps={n_cc} selected=[] pixels={int(sel_xs.size)} "
+            f"elong=- length=- rejected_reason=short_span",
+            flush=True,
+        )
+        return None, None, None, rx, ry
+
+    elong_s = float(np.mean([c["elong"] for c in selected]))
+    length_s = float(sum(c["length"] for c in selected))
+    labs = ",".join(str(int(c["lab"])) for c in selected)
+    print(
+        f"[SHAFT_SELECT] cam{int(cam_idx)} comps={n_cc} selected=[{labs}] "
+        f"pixels={int(sel_xs.size)} elong={elong_s:.2f} length={length_s:.1f} "
+        f"rejected_reason=-",
+        flush=True,
+    )
+    rx = np.concatenate(rej_xs) if rej_xs else None
+    ry = np.concatenate(rej_ys) if rej_ys else None
+    return (
+        (float(vx), float(vy), float(x0), float(y0)),
+        sel_xs,
+        sel_ys,
+        rx,
+        ry,
+    )
+
+
 def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     """Weighted median; equal-weight median when weights are degenerate."""
     v = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -1016,6 +1421,48 @@ def _motion_binary(motion_gray: np.ndarray) -> np.ndarray:
     return (motion_gray > 0).astype(np.uint8) * 255
 
 
+def _largest_motion_cc_area(mask: np.ndarray) -> int:
+    """Area of the largest connected component (0 if none)."""
+    largest, _n_cc = _motion_cc_stats(mask)
+    return largest
+
+
+def _motion_cc_stats(mask: np.ndarray) -> Tuple[int, int]:
+    """(largest CC area, number of CCs)."""
+    if mask is None or mask.size == 0:
+        return 0, 0
+    binary = (mask > 0).astype(np.uint8)
+    n_lab, _labels, stats, _cents = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if int(n_lab) <= 1:
+        return 0, 0
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    return int(np.max(areas)), int(areas.size)
+
+
+def _motion_is_speckle(mask: np.ndarray) -> bool:
+    """True when motion is many tiny dots, not a dart (even a thin one)."""
+    largest, n_cc = _motion_cc_stats(mask)
+    if largest >= int(MOTION_MIN_BLOB_AREA):
+        return False
+    return n_cc >= int(MOTION_SPECKLE_MIN_CCS)
+
+
+def _keep_large_motion_ccs(gray: np.ndarray, *, min_area: int) -> np.ndarray:
+    """Zero CCs smaller than min_area (speckle). Gray/mask same HxW."""
+    if gray is None or gray.size == 0:
+        return gray
+    binary = (gray > 0).astype(np.uint8)
+    n_lab, labels, stats, _cents = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    keep = np.zeros(gray.shape[:2], dtype=np.uint8)
+    min_a = max(1, int(min_area))
+    for lab in range(1, int(n_lab)):
+        if int(stats[lab, cv2.CC_STAT_AREA]) >= min_a:
+            keep[labels == lab] = 255
+    if gray.ndim == 2:
+        return np.where(keep > 0, gray, 0).astype(gray.dtype, copy=False)
+    return gray
+
+
 def _save_motion_debug(
     cam_idx: int,
     mask: np.ndarray,
@@ -1046,24 +1493,62 @@ def _hit_debug_cam_color(cam_idx: int) -> Tuple[int, int, int]:
     return _HIT_DEBUG_CAM_COLORS.get(int(cam_idx), (200, 200, 200))
 
 
-def _overlay_grayscale_blob(
-    canvas_bgr: np.ndarray,
-    motion_gray: np.ndarray,
-    color_bgr: Tuple[int, int, int],
-) -> None:
-    """Uboi blob jarko — fit pikselima punom bojom radi vidljivosti."""
-    if motion_gray.shape[:2] != canvas_bgr.shape[:2]:
-        motion_gray = cv2.resize(
-            motion_gray,
-            (canvas_bgr.shape[1], canvas_bgr.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
+def _motion_blob_gray_u8(
+    r: DartDetectResult, out_size: int
+) -> Optional[np.ndarray]:
+    """Gated dart motion only — never ungated absdiff speckle."""
+    blob = r.fit_gray
+    if blob is None or int(np.count_nonzero(blob)) <= 0:
+        blob = r.motion_gray
+    if blob is None or int(np.count_nonzero(blob)) <= 0:
+        return None
+    if blob.ndim == 3:
+        blob = cv2.cvtColor(blob, cv2.COLOR_BGR2GRAY)
+    if blob.shape[0] != out_size or blob.shape[1] != out_size:
+        blob = cv2.resize(blob, (out_size, out_size), interpolation=cv2.INTER_AREA)
+    blob = _keep_large_motion_ccs(blob, min_area=int(MOTION_MIN_BLOB_AREA))
+    if int(np.count_nonzero(blob)) <= 0:
+        return None
+    return blob.astype(np.uint8, copy=False)
+
+
+def _compose_cam_colored_motion(
+    cams: List[DartDetectResult],
+    out_size: int,
+) -> np.ndarray:
+    """One black frame: each camera's motion blob in that camera's debug color."""
+    acc = np.zeros((out_size, out_size, 3), dtype=np.float32)
+    seen: set[int] = set()
+    ordered = sorted(cams, key=lambda r: int(r.cam_idx))
+    for r in ordered:
+        cam = int(r.cam_idx)
+        if cam in seen:
+            continue
+        gray = _motion_blob_gray_u8(r, out_size)
+        if gray is None or int(np.count_nonzero(gray)) <= 0:
+            continue
+        seen.add(cam)
+        stretched = _contrast_stretch_gray(gray)
+        w = stretched.astype(np.float32) / 255.0
+        col = np.array(_hit_debug_cam_color(cam), dtype=np.float32)
+        acc += w[:, :, None] * col
+    canvas = np.clip(acc, 0, 255).astype(np.uint8)
+    y = 10
+    for cam in sorted(seen):
+        col = _hit_debug_cam_color(cam)
+        cv2.rectangle(canvas, (8, y), (20, y + 12), col, -1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"cam{cam}",
+            (26, y + 11),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.40,
+            col,
+            1,
+            cv2.LINE_AA,
         )
-    m = motion_gray > 0
-    if not np.any(m):
-        return
-    color = np.array(color_bgr, dtype=np.uint8)
-    # Puna boja na fit pikselima (bez prigušenja).
-    canvas_bgr[m] = color
+        y += 16
+    return canvas
 
 
 def _draw_fitline_on(
@@ -1156,6 +1641,321 @@ def _draw_fitline_ds_on_original(
     _draw_fitline_on(img, x0, y0, vx, vy, color, thickness=thickness)
 
 
+_SCORE_CANVAS_BG = (22, 22, 22)
+_WIRE_NEAR_DEG = 3.0
+
+
+def _score_cals_for_debug(
+    board_calibrator: Optional[BoardCalibrator],
+) -> Optional[List[Optional[BoardCalibration]]]:
+    if board_calibrator is None:
+        return None
+    return [board_calibrator.get(i) for i in (0, 2, 4)]
+
+
+def _fitline_original_xyv(r: DartDetectResult) -> Tuple[float, float, float, float]:
+    """FitLine (x0,y0,vx,vy) in original FITLINE_SIZE warp pixels (unit direction)."""
+    sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
+    sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
+    x0, y0 = _map_ds_xy_to_original(float(r.line_x0), float(r.line_y0), sx, sy)
+    vx = float(r.line_vx) * sx
+    vy = float(r.line_vy) * sy
+    n = float(np.hypot(vx, vy))
+    if n < 1e-9:
+        return x0, y0, 0.0, 0.0
+    return x0, y0, vx / n, vy / n
+
+
+def _dir_original_unit(vx: float, vy: float, r: Optional[DartDetectResult] = None) -> Tuple[float, float]:
+    sx = float(r.fit_scale_x) if r is not None and float(r.fit_scale_x) > 1e-9 else 1.0
+    sy = float(r.fit_scale_y) if r is not None and float(r.fit_scale_y) > 1e-9 else 1.0
+    ox, oy = float(vx) * sx, float(vy) * sy
+    n = float(np.hypot(ox, oy))
+    if n < 1e-9:
+        return 0.0, 0.0
+    return ox / n, oy / n
+
+
+def _hit_score_label(
+    px: float,
+    py: float,
+    *,
+    out_size: int,
+    cals: Optional[List[Optional[BoardCalibration]]],
+) -> str:
+    n, z, _s = score_topdown_point(
+        float(px), float(py), out_size=out_size, cals=cals, log_geom=False
+    )
+    return _zone_short_label(z, int(n))
+
+
+def _theta_from_center(px: float, py: float, center: Tuple[float, float]) -> float:
+    return math.degrees(math.atan2(float(px) - center[0], -(float(py) - center[1]))) % 360.0
+
+
+def _nearest_scoring_wire(
+    px: float,
+    py: float,
+    center: Tuple[float, float],
+    wires: Tuple[float, ...],
+) -> Tuple[int, float]:
+    theta = _theta_from_center(px, py, center)
+    best_i = 0
+    best_d = 999.0
+    for i, ang in enumerate(wires):
+        d = float(_ang_abs_delta_deg(theta, float(ang)))
+        if d < best_d:
+            best_i = i
+            best_d = d
+    return best_i, best_d
+
+
+def _wire_pair_label(wire_idx: int) -> str:
+    prev_n = BOARD_SEGMENT_NUMBERS[(int(wire_idx) - 1) % SEGMENT_COUNT]
+    next_n = BOARD_SEGMENT_NUMBERS[int(wire_idx) % SEGMENT_COUNT]
+    return f"{prev_n}/{next_n}"
+
+
+def _debug_draw_ellipse(
+    img: np.ndarray,
+    ell: Tuple,
+    color: Tuple[int, int, int],
+    thickness: int,
+) -> None:
+    (ecx, ecy), (ew, eh), ang = ell
+    ax = max(1, int(round(float(ew) * 0.5)))
+    ay = max(1, int(round(float(eh) * 0.5)))
+    cv2.ellipse(
+        img,
+        (int(round(float(ecx))), int(round(float(ecy)))),
+        (ax, ay),
+        float(ang),
+        0,
+        360,
+        color,
+        int(thickness),
+        cv2.LINE_AA,
+    )
+
+
+def _wire_end_xy(
+    cx: float,
+    cy: float,
+    ang: float,
+    r_out: float,
+    double_ell: Optional[Tuple],
+) -> Tuple[int, int]:
+    if double_ell is not None:
+        pt = _ray_to_ellipse_edge_f((cx, cy), float(ang), double_ell)
+        if pt is not None:
+            return int(round(pt[0])), int(round(pt[1]))
+    st, ct = _angle_sin_cos(float(ang))
+    return int(round(cx + r_out * st)), int(round(cy + r_out * ct))
+
+
+def make_scoring_board_canvas(
+    *,
+    out_size: int = FITLINE_SIZE,
+    cal: Optional[BoardCalibration] = None,
+    cals: Optional[List[Optional[BoardCalibration]]] = None,
+    near_points: Optional[List[Tuple[float, float]]] = None,
+    wire_near_deg: float = _WIRE_NEAR_DEG,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Clean 300x300 board-coordinate canvas using score_topdown_point geometry.
+
+    No camera photograph. Rings/wires/center match scoring, including ellipses
+    when score_topdown_point uses them.
+    """
+    size = int(out_size) if out_size > 0 else FITLINE_SIZE
+    img = np.full((size, size, 3), _SCORE_CANVAS_BG, dtype=np.uint8)
+    center, board_r = _board_center_and_r(size)
+    rings = scoring_ring_radii(size, cal=cal, cals=cals)
+    ellipses = scoring_ring_ellipses(size, cal=cal, cals=cals)
+    wires = _score_wire_thetas(size, cal=cal, cals=cals)
+    cx, cy = float(center[0]), float(center[1])
+    icx, icy = int(round(cx)), int(round(cy))
+    r_out = float(rings.get("double_outer", board_r))
+    if ellipses is not None:
+        mean_d = float(_mean_ellipse_semi(ellipses["double_outer"]))
+        r_bull_in = mean_d * float(RING_BULL_INNER_FRAC)
+        r_bull_out = mean_d * float(RING_BULL_OUTER_FRAC)
+    else:
+        r_bull_in = float(rings["bull_inner"])
+        r_bull_out = float(rings["bull_outer"])
+
+    col_d = (0, 165, 255)
+    col_t = (0, 220, 120)
+    col_b = (70, 70, 255)
+    col_wire = (190, 190, 190)
+    col_hi = (0, 255, 255)
+    col_num = (170, 170, 170)
+    col_cen = (255, 0, 255)
+
+    if ellipses is not None:
+        _debug_draw_ellipse(img, ellipses["double_outer"], col_d, 1)
+        _debug_draw_ellipse(img, ellipses["double_inner"], col_d, 1)
+        _debug_draw_ellipse(img, ellipses["triple_outer"], col_t, 1)
+        _debug_draw_ellipse(img, ellipses["triple_inner"], col_t, 1)
+        d_ell = ellipses["double_outer"]
+    else:
+        for key, col in (
+            ("double_outer", col_d),
+            ("double_inner", col_d),
+            ("triple_outer", col_t),
+            ("triple_inner", col_t),
+        ):
+            rr = max(1, int(round(float(rings[key]))))
+            cv2.circle(img, (icx, icy), rr, col, 1, cv2.LINE_AA)
+        d_ell = None
+
+    cv2.circle(img, (icx, icy), max(1, int(round(r_bull_out))), col_b, 1, cv2.LINE_AA)
+    cv2.circle(img, (icx, icy), max(1, int(round(r_bull_in))), col_b, 1, cv2.LINE_AA)
+
+    near_idx: Dict[int, float] = {}
+    for pt in near_points or []:
+        wi, dist = _nearest_scoring_wire(float(pt[0]), float(pt[1]), center, wires)
+        if dist <= float(wire_near_deg):
+            prev = near_idx.get(wi)
+            if prev is None or dist < prev:
+                near_idx[wi] = dist
+
+    for i, ang in enumerate(wires):
+        x1, y1 = _wire_end_xy(cx, cy, float(ang), r_out, d_ell)
+        hi = i in near_idx
+        cv2.line(
+            img,
+            (icx, icy),
+            (x1, y1),
+            col_hi if hi else col_wire,
+            2 if hi else 1,
+            cv2.LINE_AA,
+        )
+
+    r_num = 0.5 * (float(rings["triple_outer"]) + float(rings["double_inner"]))
+    for k in range(min(len(wires), SEGMENT_COUNT)):
+        a0 = float(wires[k])
+        a1 = float(wires[(k + 1) % len(wires)])
+        span = (a1 - a0) % 360.0
+        mid = (a0 + 0.5 * span) % 360.0
+        st, ct = _angle_sin_cos(mid)
+        tx = int(round(cx + r_num * st))
+        ty = int(round(cy + r_num * ct))
+        lab = str(int(BOARD_SEGMENT_NUMBERS[k % SEGMENT_COUNT]))
+        cv2.putText(
+            img,
+            lab,
+            (tx - 6, ty + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            col_num,
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.drawMarker(img, (icx, icy), col_cen, cv2.MARKER_CROSS, 12, 1, cv2.LINE_AA)
+    cv2.circle(img, (icx, icy), 3, col_cen, 1, cv2.LINE_AA)
+
+    meta: Dict[str, object] = {
+        "center": center,
+        "wires": wires,
+        "rings": rings,
+        "near_wires": near_idx,
+    }
+    return img, meta
+
+
+def _draw_marked_point(
+    img: np.ndarray,
+    xy: Tuple[float, float],
+    color: Tuple[int, int, int],
+    *,
+    radius: int = 3,
+    cross: int = 7,
+) -> None:
+    pt = (int(round(xy[0])), int(round(xy[1])))
+    cv2.drawMarker(img, pt, color, cv2.MARKER_CROSS, cross, 1, cv2.LINE_AA)
+    cv2.circle(img, pt, max(1, int(radius)), color, -1, cv2.LINE_AA)
+    cv2.circle(img, pt, max(2, int(radius) + 1), (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _draw_hud_lines(
+    img: np.ndarray,
+    lines: List[str],
+    *,
+    color: Tuple[int, int, int] = (240, 240, 240),
+    x: int = 4,
+    y0: int = 14,
+    step: int = 14,
+    scale: float = 0.40,
+) -> None:
+    if not lines:
+        return
+    widths = [
+        cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] for line in lines
+    ]
+    box_w = int(max(widths)) + 10
+    box_h = int(step * len(lines)) + 8
+    x0, y_top = 2, 2
+    cv2.rectangle(img, (x0, y_top), (x0 + box_w, y_top + box_h), (8, 8, 8), -1)
+    cv2.rectangle(img, (x0, y_top), (x0 + box_w, y_top + box_h), (60, 60, 60), 1)
+    for i, line in enumerate(lines):
+        cv2.putText(
+            img,
+            line,
+            (x, y0 + i * step),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _label_xy(
+    img: np.ndarray,
+    xy: Tuple[float, float],
+    text: str,
+    color: Tuple[int, int, int],
+    *,
+    dx: int = 8,
+    dy: int = -8,
+) -> None:
+    cv2.putText(
+        img,
+        text,
+        (int(round(xy[0])) + int(dx), int(round(xy[1])) + int(dy)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _pairwise_intersections_original(
+    line_cams: List[DartDetectResult],
+    board_center: Tuple[float, float],
+) -> List[Tuple[int, int, Tuple[float, float]]]:
+    out: List[Tuple[int, int, Tuple[float, float]]] = []
+    n = len(line_cams)
+    orig = [_fitline_original_xyv(r) for r in line_cams]
+    for i in range(n):
+        for j in range(i + 1, n):
+            ax0, ay0, avx, avy = orig[i]
+            bx0, by0, bvx, bvy = orig[j]
+            cross = _line_direction_cross(avx, avy, bvx, bvy)
+            if cross < float(FITLINE_PAIR_CROSS_MIN):
+                continue
+            tip, _res = intersect_lines_least_squares(
+                [(ax0, ay0, avx, avy), (bx0, by0, bvx, bvy)],
+                board_center=board_center,
+            )
+            if tip is None:
+                continue
+            out.append((i, j, (float(tip[0]), float(tip[1]))))
+    return out
+
+
 def _save_fitline_smooth_debug(
     stem: str,
     fused: FusedDartResult,
@@ -1165,145 +1965,84 @@ def _save_fitline_smooth_debug(
     base_gray: np.ndarray,
     soft_acc: Optional[np.ndarray],
     draw_cams: Optional[List[DartDetectResult]] = None,
+    board_calibrator: Optional[BoardCalibrator] = None,
 ) -> List[str]:
-    """Board underlay + soft blobs tinted by stage2 ROI + cam lines + tip.
+    """Scoring-coordinate canvas + FitLine rays + pair intersections + FIT P.
 
     ``line_cams`` = consensus-used cams (full color). ``draw_cams`` may include
-    rejected fleeers drawn dim so bad FitLines are visible but not dominant.
+    rejected fleeers drawn dim. Photo / motion underlay is not used.
     """
     used = list(line_cams)
     draw = list(draw_cams) if draw_cams is not None else list(line_cams)
     if not _hit_motion_debug_enabled() or not draw:
         return []
+    _ = base_gray
+    _ = soft_acc
     saved: List[str] = []
     used_ids = {int(r.cam_idx) for r in used}
-
-    h, w = int(base_gray.shape[0]), int(base_gray.shape[1])
-    under = cv2.cvtColor(
-        (base_gray.astype(np.float32) * 0.40).astype(np.uint8), cv2.COLOR_GRAY2BGR
+    out_size = FITLINE_SIZE
+    cals = _score_cals_for_debug(board_calibrator)
+    fit_xy = (float(fused.tip_xy[0]), float(fused.tip_xy[1]))
+    canvas, meta = make_scoring_board_canvas(
+        out_size=out_size,
+        cals=cals,
+        near_points=[fit_xy],
     )
-    composite = under.copy()
+    center = meta["center"]  # type: ignore[assignment]
+    assert isinstance(center, tuple)
 
-    # Stage2 ROI center/radius used for re-FitLine (stage1 tip in warp space).
-    if fused.stage2_roi_tip_xy is not None:
-        roi_cx, roi_cy = float(fused.stage2_roi_tip_xy[0]), float(fused.stage2_roi_tip_xy[1])
-        roi_r = float(fused.stage2_roi_radius)
-    else:
-        roi_cx, roi_cy = float(fused.tip_xy[0]), float(fused.tip_xy[1])
-        _, board_r = _board_center_and_r(max(h, w))
-        roi_r = float(FITLINE_STAGE2_TIP_RADIUS_FRAC) * float(board_r)
-
-    if soft_acc is not None and soft_acc.shape[0] == h and soft_acc.shape[1] == w:
-        stretched = _contrast_stretch_gray(soft_acc).astype(np.float32) / 255.0
-        motion_m = soft_acc > float(FITLINE_WEIGHT_EPS)
-        yy, xx = np.ogrid[:h, :w]
-        inside = (xx - roi_cx) ** 2 + (yy - roi_cy) ** 2 <= (roi_r * roi_r)
-        # Inside ROI (used by stage2 FitLine): cyan; excluded outside: red.
-        in_color = np.array((0, 255, 220), dtype=np.float32)  # BGR cyan
-        out_color = np.array((40, 40, 255), dtype=np.float32)  # BGR red
-        for mask, color in ((motion_m & inside, in_color), (motion_m & ~inside, out_color)):
-            if not np.any(mask):
-                continue
-            a = stretched[mask][:, None]
-            a = np.clip(a * 0.85 + 0.15, 0.0, 1.0)
-            base = composite[mask].astype(np.float32)
-            composite[mask] = (base * (1.0 - a) + color * a).astype(np.uint8)
-
-    # Old Stage2 (thin gray), candidate centerline (thin magenta), then final.
     for r in draw:
-        sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
-        sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
-        if r.centerline_old_ds is not None:
-            ovx, ovy, ox0, oy0 = r.centerline_old_ds
-            _draw_fitline_ds_on_original(
-                composite, ox0, oy0, ovx, ovy, sx, sy, (180, 180, 180), thickness=1
-            )
-        if r.centerline_cand_ds is not None:
-            cvx, cvy, cx0, cy0 = r.centerline_cand_ds
-            _draw_fitline_ds_on_original(
-                composite, cx0, cy0, cvx, cvy, sx, sy, (255, 0, 255), thickness=1
-            )
-
-    # Rejected (flee) lines first, dim; consensus-used lines on top, full color.
-    for r in draw:
-        sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
-        sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
+        x0, y0, vx, vy = _fitline_original_xyv(r)
         color = _hit_debug_cam_color(r.cam_idx)
         used_cam = int(r.cam_idx) in used_ids
         if not used_cam:
             color = tuple(int(round(c * 0.35)) for c in color)
-        _draw_fitline_ds_on_original(
-            composite,
-            r.line_x0,
-            r.line_y0,
-            r.line_vx,
-            r.line_vy,
-            sx,
-            sy,
-            color,
-            thickness=1 if not used_cam else 2,
+        _draw_fitline_on(
+            canvas, x0, y0, vx, vy, color, thickness=1 if not used_cam else 2
         )
-        if _hit_motion_debug_enabled():
-            for px_ds, py_ds in r.centerline_pts_ds:
-                ox, oy = _map_ds_xy_to_original(float(px_ds), float(py_ds), sx, sy)
-                cv2.circle(
-                    composite,
-                    (int(round(ox)), int(round(oy))),
-                    2,
-                    (0, 255, 255),
-                    -1,
-                    cv2.LINE_AA,
-                )
 
-    # Stage2 ROI circle (matches re-FitLine radius).
-    roi_pt = (int(round(roi_cx)), int(round(roi_cy)))
-    cv2.circle(
-        composite,
-        roi_pt,
-        max(1, int(round(roi_r))),
-        (0, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    for _i, _j, (px, py) in _pairwise_intersections_original(used, center):
+        cv2.circle(
+            canvas,
+            (int(round(px)), int(round(py))),
+            3,
+            (255, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
-    tip_pt = (int(round(fused.tip_xy[0])), int(round(fused.tip_xy[1])))
-    cv2.circle(composite, tip_pt, 5, (0, 180, 180), 1, cv2.LINE_AA)
-    cv2.circle(composite, tip_pt, 3, (0, 255, 255), -1, cv2.LINE_AA)
+    _draw_marked_point(canvas, fit_xy, (0, 255, 255), radius=3, cross=9)
+    _label_xy(canvas, fit_xy, "FIT", (0, 255, 255), dx=8, dy=-10)
+    fit_lab = _hit_score_label(fit_xy[0], fit_xy[1], out_size=out_size, cals=cals)
     rec_note = ""
     if int(fused.fitq_recovery_cam) >= 0:
-        rec_note = f" RECOVERY cam{int(fused.fitq_recovery_cam)}"
-    cv2.putText(
-        composite,
+        rec_note = f" recovery=cam{int(fused.fitq_recovery_cam)}"
+    hud = [
+        f"FIT ({fit_xy[0]:.1f},{fit_xy[1]:.1f}) {fit_lab}",
         f"spread={fused.fitq_pair_spread:.1f}{rec_note}",
-        (4, 16),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
-        (0, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    ]
+    near_wires: Dict[int, float] = meta["near_wires"]  # type: ignore[assignment]
+    if near_wires:
+        wi, dist = min(near_wires.items(), key=lambda kv: kv[1])
+        hud.append(f"wire {_wire_pair_label(wi)}  {dist:.2f}deg")
     for r in draw:
-        sx = float(r.fit_scale_x) if float(r.fit_scale_x) > 1e-9 else 1.0
-        sy = float(r.fit_scale_y) if float(r.fit_scale_y) > 1e-9 else 1.0
-        ox, oy = _map_ds_xy_to_original(r.line_x0, r.line_y0, sx, sy)
-        vx = float(r.line_vx) * sx
-        vy = float(r.line_vy) * sy
-        nn = float(np.hypot(vx, vy)) or 1.0
-        qx = int(round(ox + 26.0 * vx / nn))
-        qy = int(round(oy + 26.0 * vy / nn))
+        x0, y0, vx, vy = _fitline_original_xyv(r)
+        qx = int(round(x0 + 28.0 * vx))
+        qy = int(round(y0 + 28.0 * vy))
         color = _hit_debug_cam_color(r.cam_idx)
         cv2.putText(
-            composite,
-            f"q={r.fitq_quality:.2f}",
+            canvas,
+            f"cam{int(r.cam_idx)} q={r.fitq_quality:.2f}",
             (qx, qy),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
+            0.36,
             color,
             1,
             cv2.LINE_AA,
         )
+    _draw_hud_lines(canvas, hud)
     cpath = os.path.join(motion_dir, f"{stem}_fitline_smooth_intersect.png")
-    cv2.imwrite(cpath, composite)
+    cv2.imwrite(cpath, canvas)
     saved.append(cpath)
     return saved
 
@@ -1338,13 +2077,11 @@ def save_hit_fusion_debug(
     warp_refs: Optional[Dict[int, np.ndarray]] = None,
     out_size: int = FITLINE_SIZE,
 ) -> Optional[str]:
-    """Save only two hit debug images during normal detection:
+    """Save hit debug images during normal detection:
 
-    - ``{stem}_fused_motion_raw.png`` — fused soft-motion blobs on black (no lines)
-    - ``motion/{stem}_fitline_smooth_intersect.png`` — board underlay + stage2 in/out
-      blobs + cam intersection lines + tip + stage2 radius circle
-
-    Per-cam fitline_smooth / motion_raw / motion_mask / raw cam frames are not saved.
+    - ``{stem}_fused_motion_raw.png`` — fused motion blobs on black, color per camera
+    - ``motion/{stem}_fitline_smooth_intersect.png`` — scoring-coordinate canvas
+      (no board photo) + FitLine rays + pair intersections + FIT P
     """
     if not _hit_motion_debug_enabled() or not fused.found:
         return None
@@ -1403,26 +2140,25 @@ def save_hit_fusion_debug(
 
     # Fused soft motion blobs only — no FitLine strokes / tip overlays.
     soft_acc: Optional[np.ndarray] = None
-    for r in draw_cams:
-        blob = r.fit_gray
-        if blob is None:
-            blob = r.motion_raw
-        if blob is None:
+    blob_cams: List[DartDetectResult] = []
+    seen_blob: set[int] = set()
+    for r in list(draw_cams) + list(fused.per_cam):
+        cam = int(r.cam_idx)
+        if cam in seen_blob:
             continue
-        if blob.ndim == 3:
-            blob = cv2.cvtColor(blob, cv2.COLOR_BGR2GRAY)
-        if blob.shape[0] != out_size or blob.shape[1] != out_size:
-            blob = cv2.resize(blob, (out_size, out_size), interpolation=cv2.INTER_AREA)
+        gray = _motion_blob_gray_u8(r, out_size)
+        if gray is None or int(np.count_nonzero(gray)) <= 0:
+            continue
+        seen_blob.add(cam)
+        blob_cams.append(r)
         if soft_acc is None:
-            soft_acc = blob.astype(np.uint8, copy=True)
+            soft_acc = gray.astype(np.uint8, copy=True)
         else:
-            np.maximum(soft_acc, blob, out=soft_acc)
+            np.maximum(soft_acc, gray, out=soft_acc)
 
-    # Blobs-only image: soft motion on black (no board underlay, no lines).
-    if soft_acc is not None and int(np.count_nonzero(soft_acc)) > 0:
-        canvas = _soft_motion_bgr_vis(soft_acc)
-        motion_m = soft_acc > float(FITLINE_WEIGHT_EPS)
-        canvas = np.where(motion_m[:, :, None], canvas, 0)
+    # One frame, blobs colored by camera (cam0 red / cam2 green / cam4 cyan).
+    if blob_cams:
+        canvas = _compose_cam_colored_motion(blob_cams, out_size)
     else:
         canvas = np.zeros((out_size, out_size, 3), dtype=np.uint8)
 
@@ -1443,7 +2179,7 @@ def save_hit_fusion_debug(
         cv2.imwrite(fused_path, canvas)
         print(f"[dart] hit debug: {fused_path}", flush=True)
 
-    # 2) Board underlay + stage2 in/out tint + intersection lines + tip.
+    # 2) Scoring-coordinate canvas + FitLine rays + intersections + FIT P.
     intersect_paths: List[str] = []
     for p in _save_fitline_smooth_debug(
         stem,
@@ -1453,6 +2189,7 @@ def save_hit_fusion_debug(
         base_gray=base_gray,
         soft_acc=soft_acc,
         draw_cams=draw_cams,
+        board_calibrator=board_calibrator,
     ):
         print(f"[dart] hit fitline smooth debug: {p}", flush=True)
         intersect_paths.append(p)
@@ -1981,6 +2718,28 @@ def _measure_cam_fitq(
     )
 
 
+def _line_direction_cross(
+    vx0: float, vy0: float, vx1: float, vy1: float
+) -> float:
+    """|sin θ| between two direction vectors."""
+    na = float(np.hypot(vx0, vy0)) or 1.0
+    nb = float(np.hypot(vx1, vy1)) or 1.0
+    return abs((vx0 / na) * (vy1 / nb) - (vy0 / na) * (vx1 / nb))
+
+
+def _max_line_cross(line_cams: List[DartDetectResult]) -> float:
+    best = 0.0
+    n = len(line_cams)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = line_cams[i], line_cams[j]
+            best = max(
+                best,
+                _line_direction_cross(a.line_vx, a.line_vy, b.line_vx, b.line_vy),
+            )
+    return best
+
+
 def _pairwise_intersections(
     line_cams: List[DartDetectResult],
     board_center_ds: Tuple[float, float],
@@ -1990,12 +2749,8 @@ def _pairwise_intersections(
     for i in range(n):
         for j in range(i + 1, n):
             a, b = line_cams[i], line_cams[j]
-            na = float(np.hypot(a.line_vx, a.line_vy)) or 1.0
-            nb = float(np.hypot(b.line_vx, b.line_vy)) or 1.0
-            cross = abs(
-                a.line_vx / na * b.line_vy / nb - a.line_vy / na * b.line_vx / nb
-            )
-            if cross < 0.08:
+            cross = _line_direction_cross(a.line_vx, a.line_vy, b.line_vx, b.line_vy)
+            if cross < float(FITLINE_PAIR_CROSS_MIN):
                 continue
             tip, _res = intersect_lines_least_squares(
                 [
@@ -2277,11 +3032,18 @@ def _fuse_tip_from_best_pair(
     """
     n = len(line_cams)
     if n < 2:
-        if n == 1:
-            return line_cams[0].tip_xy, 0.0, list(line_cams)
-        return None, 0.0, []
+        return None, 0.0, list(line_cams)
 
     if n == 2:
+        a, b = line_cams[0], line_cams[1]
+        cross = _line_direction_cross(a.line_vx, a.line_vy, b.line_vx, b.line_vy)
+        if cross < float(FUSE_MIN_CROSS_2CAM):
+            print(
+                f"[fuse] parallel_2cam cross={cross:.3f} "
+                f"min={float(FUSE_MIN_CROSS_2CAM):.3f}",
+                flush=True,
+            )
+            return None, 0.0, list(line_cams)
         lines = [
             (r.line_x0, r.line_y0, r.line_vx, r.line_vy) for r in line_cams
         ]
@@ -2303,13 +3065,9 @@ def _fuse_tip_from_best_pair(
     for i in range(n):
         for j in range(i + 1, n):
             a, b = line_cams[i], line_cams[j]
-            na = float(np.hypot(a.line_vx, a.line_vy)) or 1.0
-            nb = float(np.hypot(b.line_vx, b.line_vy)) or 1.0
-            cross = abs(
-                a.line_vx / na * b.line_vy / nb - a.line_vy / na * b.line_vx / nb
-            )
+            cross = _line_direction_cross(a.line_vx, a.line_vy, b.line_vx, b.line_vy)
             # Reject near-parallel pairs (unstable intersection).
-            if cross < 0.08:
+            if cross < float(FITLINE_PAIR_CROSS_MIN):
                 continue
             lines = [
                 (a.line_x0, a.line_y0, a.line_vx, a.line_vy),
@@ -2344,9 +3102,7 @@ def _fuse_tip_from_best_pair(
                 best_dists = dists
 
     if best_tip is None or best_dists is None:
-        lines = [(r.line_x0, r.line_y0, r.line_vx, r.line_vy) for r in line_cams]
-        tip, res = intersect_lines_least_squares(lines, board_center=board_center)
-        return tip, float(res), list(line_cams)
+        return None, 0.0, list(line_cams)
 
     pair_i, pair_j = best_pair_idx
     kept: List[DartDetectResult] = []
@@ -2591,10 +3347,7 @@ def intersect_lines_least_squares(
     if not lines:
         return None, 0.0
     if len(lines) == 1:
-        x0, y0, vx, vy = lines[0]
-        cx, cy = board_center
-        pt = _point_on_line_closest_to(x0, y0, vx, vy, cx, cy)
-        return pt, 0.0
+        return None, 0.0
 
     A: List[List[float]] = []
     b: List[float] = []
@@ -2607,7 +3360,7 @@ def intersect_lines_least_squares(
         A.append([nx, ny])
         b.append(nx * x0 + ny * y0)
     if len(A) < 2:
-        return intersect_lines_least_squares([lines[0]], board_center=board_center)
+        return None, 0.0
     A_arr = np.array(A, dtype=np.float64)
     b_arr = np.array(b, dtype=np.float64)
     pt, residuals, _, _ = np.linalg.lstsq(A_arr, b_arr, rcond=None)
@@ -2622,12 +3375,16 @@ def score_topdown_point(
     out_size: int = FITLINE_SIZE,
     cal: Optional[BoardCalibration] = None,
     cals: Optional[List[Optional[BoardCalibration]]] = None,
+    log_geom: bool = True,
 ) -> Tuple[int, str, int]:
     """Score u aligned top-down prostoru (seg.20 gore, offset=0)."""
     center, board_r = _board_center_and_r(out_size)
     ring_ellipses = scoring_ring_ellipses(out_size, cal=cal, cals=cals)
     rings = scoring_ring_radii(out_size, cal=cal, cals=cals)
-    return topdown_point_to_score(
+    wires = calibrated_topdown_wire_thetas(out_size, cal=cal, cals=cals)
+    if log_geom:
+        _log_score_geom_sanity(out_size, center, wires)
+    number, zone, score = topdown_point_to_score(
         px,
         py,
         center,
@@ -2635,7 +3392,1825 @@ def score_topdown_point(
         segment20_offset=0,
         rings=rings,
         ring_ellipses=ring_ellipses,
+        wire_thetas_deg=wires,
+        log_geom=log_geom,
+        center_source="warp_canvas_center:_board_center_and_r",
     )
+    if log_geom:
+        _log_score_debug(
+            px, py, center, wires, number=number, zone=zone, score=score
+        )
+    return number, zone, score
+
+
+def _score_wire_thetas(
+    out_size: int,
+    *,
+    cal: Optional[BoardCalibration] = None,
+    cals: Optional[List[Optional[BoardCalibration]]] = None,
+) -> Tuple[float, ...]:
+    """Exactly the wire set score_topdown_point uses (calibrated, else nominal 18°)."""
+    wires = calibrated_topdown_wire_thetas(out_size, cal=cal, cals=cals)
+    if wires is not None and len(wires) >= SEGMENT_COUNT - 2:
+        return tuple(float(w) % 360.0 for w in wires[:SEGMENT_COUNT])
+    return canonical_topdown_wire_thetas()
+
+
+def _zone_multiplier(zone: str, score: int) -> int:
+    if zone == "triple":
+        return 3
+    if zone == "double":
+        return 2
+    if zone in ("inner_bull", "outer_bull"):
+        return int(score)
+    if zone == "single":
+        return 1
+    return 0
+
+
+def _log_score_debug(
+    px: float,
+    py: float,
+    center: Tuple[float, float],
+    wires: Optional[Tuple[float, ...]],
+    *,
+    number: int,
+    zone: str,
+    score: int,
+) -> None:
+    cx, cy = float(center[0]), float(center[1])
+    dx, dy = float(px) - cx, float(py) - cy
+    radius = math.hypot(dx, dy)
+    raw_angle = math.atan2(dx, -dy)
+    theta = math.degrees(raw_angle) % 360.0
+    if wires is not None and len(wires) >= SEGMENT_COUNT - 2:
+        slot, _a0, _a1, _n = _segment_slot_from_wires(theta, wires)
+    else:
+        slot = _segment_slot_from_theta(theta, 0)
+    print(
+        f"[SCORE_DEBUG] point=({float(px):.3f},{float(py):.3f}) "
+        f"center=({cx:.3f},{cy:.3f}) dx={dx:.3f} dy={dy:.3f} radius={radius:.3f} "
+        f"raw_angle={raw_angle:.6f} normalized_angle={theta:.3f} "
+        f"segment_index={int(slot)} segment={int(number)} "
+        f"multiplier={_zone_multiplier(zone, score)} zone={zone} score={int(score)}",
+        flush=True,
+    )
+
+
+def draw_score_function_boundaries(
+    img: np.ndarray,
+    *,
+    out_size: int = FITLINE_SIZE,
+    cal: Optional[BoardCalibration] = None,
+    cals: Optional[List[Optional[BoardCalibration]]] = None,
+    color: Tuple[int, int, int] = (0, 220, 255),
+    thickness: int = 1,
+    label: bool = True,
+) -> None:
+    """Radial wires of the live score_topdown_point function (not an ideal overlay)."""
+    if img is None or img.size == 0:
+        return
+    center, board_r = _board_center_and_r(int(out_size))
+    rings = scoring_ring_radii(int(out_size), cal=cal, cals=cals)
+    r_out = float(rings.get("double_outer", board_r))
+    wires = _score_wire_thetas(int(out_size), cal=cal, cals=cals)
+    cx, cy = float(center[0]), float(center[1])
+    icx, icy = int(round(cx)), int(round(cy))
+    for i, ang in enumerate(wires):
+        st, ct = _angle_sin_cos(float(ang))
+        x1 = int(round(cx + r_out * st))
+        y1 = int(round(cy + r_out * ct))
+        cv2.line(img, (icx, icy), (x1, y1), color, thickness, cv2.LINE_AA)
+        if label:
+            lx = int(round(cx + r_out * 1.04 * st))
+            ly = int(round(cy + r_out * 1.04 * ct))
+            cv2.putText(
+                img,
+                f"W{i}",
+                (lx - 6, ly + 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    cv2.circle(img, (icx, icy), 2, color, 1, cv2.LINE_AA)
+
+
+def _log_score_geom_sanity(
+    out_size: int,
+    center: Tuple[float, float],
+    wires: Optional[Tuple[float, ...]],
+) -> None:
+    """Confirm scoring uses warp canvas center + calibrated topdown wires. No math change."""
+    exp = (int(out_size) - 1) * 0.5
+    cx, cy = float(center[0]), float(center[1])
+    if abs(cx - exp) > 1e-3 or abs(cy - exp) > 1e-3:
+        print(
+            f"[SCORE_GEOM] BUG scoring center=({cx:.3f},{cy:.3f}) "
+            f"!= warp_canvas_center=({exp:.3f},{exp:.3f}) "
+            f"out_size={int(out_size)}",
+            flush=True,
+        )
+    if wires is None:
+        print(
+            "[SCORE_GEOM] NOTE wire_mode=nominal — calibrated_topdown_wire_thetas unavailable",
+            flush=True,
+        )
+        return
+    n = len(wires)
+    if n < SEGMENT_COUNT:
+        print(
+            f"[SCORE_GEOM] NOTE calibrated wires n={n} expected={SEGMENT_COUNT}",
+            flush=True,
+        )
+    gaps: List[float] = []
+    for i in range(n):
+        a0 = float(wires[i]) % 360.0
+        a1 = float(wires[(i + 1) % n]) % 360.0
+        gaps.append((a1 - a0) % 360.0)
+    if gaps:
+        mn = float(min(gaps))
+        mx = float(max(gaps))
+        mean = float(sum(gaps) / len(gaps))
+        print(
+            f"[SCORE_GEOM] wires n={n} clockwise_gaps_deg "
+            f"mean={mean:.2f} min={mn:.2f} max={mx:.2f}",
+            flush=True,
+        )
+        if mn < 8.0 or mx > 30.0 or abs(mean - 18.0) > 2.0:
+            print(
+                "[SCORE_GEOM] NOTE wire spacing irregular (still using these calibrated bounds)",
+                flush=True,
+            )
+
+
+def extract_yfit_motion_layer(
+    topdown_bgr: np.ndarray,
+    ref_gray: np.ndarray,
+    *,
+    cam_idx: int = -1,
+) -> DartDetectResult:
+    """Board-gated soft motion in FITLINE_SIZE space — no FitLine."""
+    h, w = topdown_bgr.shape[:2]
+    cx_out, view_r, board_r = _warp_radii(w)
+    cur_gray = cv2.cvtColor(topdown_bgr, cv2.COLOR_BGR2GRAY)
+    if ref_gray.shape != cur_gray.shape:
+        ref_gray = cv2.resize(ref_gray, (w, h), interpolation=cv2.INTER_AREA)
+    raw_diff = cv2.absdiff(cur_gray, ref_gray)
+    diff_mean = float(np.mean(raw_diff))
+    mask = _motion_mask(ref_gray, cur_gray)
+    board_mask = np.zeros((h, w), dtype=np.uint8)
+    det_r = max(float(view_r), float(board_r) * float(BOARD_SISAL_EDGE_FRAC) * 0.92)
+    det_r = min(det_r, float(cx_out) - 1.0)
+    cv2.circle(board_mask, (int(cx_out), int(cx_out)), int(round(det_r)), 255, -1)
+    mask = cv2.bitwise_and(mask, mask, mask=board_mask)
+    n_px = int(np.count_nonzero(mask))
+    soft = _soft_motion_gray_for_fit(raw_diff, board_mask)
+    soft = _gate_soft_motion_for_fit(soft, mask)
+    k = int(FITLINE_BLUR_KSIZE)
+    if k >= 3:
+        if k % 2 == 0:
+            k += 1
+        soft = cv2.GaussianBlur(soft.astype(np.float32), (k, k), float(FITLINE_BLUR_SIGMA))
+        soft = np.clip(np.round(soft), 0, 255).astype(np.uint8)
+    reason = ""
+    if n_px < MOTION_MIN_PIXELS:
+        reason = "low_motion"
+    elif n_px > MOTION_MAX_PIXELS:
+        reason = "high_motion"
+    elif _motion_is_speckle(mask):
+        reason = "no_blob"
+    return DartDetectResult(
+        cam_idx=cam_idx,
+        found=False,
+        motion_pixels=n_px,
+        diff_mean=diff_mean,
+        reject_reason=reason,
+        motion_gray=mask,
+        motion_raw=raw_diff.copy(),
+        fit_gray=soft,
+        fit_ds_gray=soft,
+        fit_scale_x=1.0,
+        fit_scale_y=1.0,
+    )
+
+
+def _yfit_motion_image(soft: np.ndarray) -> np.ndarray:
+    """float32 motion weights in [0,1]; zeros below FITLINE_WEIGHT_EPS."""
+    out = np.zeros(soft.shape, dtype=np.float32)
+    if soft is None or soft.size == 0:
+        return out
+    m = soft > float(FITLINE_WEIGHT_EPS)
+    if np.any(m):
+        out[m] = soft[m].astype(np.float32) * (1.0 / 255.0)
+    return out
+
+
+def _yfit_angle_bank() -> dict:
+    """Cached 1° sin/cos tables (invariant across hits)."""
+    key = ("deg1",)
+    bank = _YFIT_RAY_BANK.get(key)
+    if bank is None:
+        rad = np.deg2rad(np.arange(0.0, 360.0, 1.0, dtype=np.float64))
+        bank = {
+            "rad": rad.astype(np.float32),
+            "ct": np.cos(rad).astype(np.float32),
+            "st": np.sin(rad).astype(np.float32),
+        }
+        _YFIT_RAY_BANK[key] = bank
+    return bank
+
+
+def _yfit_fused_bbox(
+    union: np.ndarray,
+    *,
+    margin: int,
+    cx: float,
+    cy: float,
+    board_lim: float,
+) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(union > 0)
+    if int(xs.size) <= 0:
+        return None
+    h, w = union.shape[:2]
+    m = int(max(0, margin))
+    x0 = int(max(0, int(xs.min()) - m))
+    y0 = int(max(0, int(ys.min()) - m))
+    x1 = int(min(w - 1, int(xs.max()) + m))
+    y1 = int(min(h - 1, int(ys.max()) + m))
+    r = float(board_lim)
+    x0 = int(max(x0, int(np.floor(cx - r))))
+    y0 = int(max(y0, int(np.floor(cy - r))))
+    x1 = int(min(x1, int(np.ceil(cx + r))))
+    y1 = int(min(y1, int(np.ceil(cy + r))))
+    if x1 < x0 or y1 < y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _yfit_grid_xy(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    step: float,
+    cx: float,
+    cy: float,
+    board_lim: float,
+    mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    st = max(int(round(float(step))), 1)
+    xs = np.arange(int(x0), int(x1) + 1, st, dtype=np.int32)
+    ys = np.arange(int(y0), int(y1) + 1, st, dtype=np.int32)
+    if xs.size <= 0 or ys.size <= 0:
+        z = np.zeros((0,), dtype=np.int32)
+        return z, z
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    rr = (xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2
+    keep = rr <= (float(board_lim) * float(board_lim))
+    if mask is not None:
+        ix = np.clip(xx, 0, mask.shape[1] - 1)
+        iy = np.clip(yy, 0, mask.shape[0] - 1)
+        keep = keep & (mask[iy, ix] > 0)
+    return xx[keep].astype(np.int32), yy[keep].astype(np.int32)
+
+
+def _yfit_argmax_theta_sparse(
+    wn: np.ndarray,
+    u0: np.ndarray,
+    v0: np.ndarray,
+    px: np.ndarray,
+    py: np.ndarray,
+    ct: np.ndarray,
+    st: np.ndarray,
+    *,
+    ray_len: float,
+    corridor: float,
+    n_bins: int,
+    coverage_w: float = 0.65,
+    tight_w: float = 0.35,
+    balance_pen: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """best_theta(P)=argmax support(P,theta).
+
+    u0/v0 are (N, A) pixel projections, built once per camera/angle-set.
+    Inner work is NumPy on (K, N); angles with no v-overlap are skipped.
+    Distance-weighted corridor (Gaussian on perpendicular v) + mild L/R
+    imbalance penalty. Defaults match experimental full Y-FIT.
+    """
+    k = int(px.size)
+    a = int(ct.size)
+    n = int(wn.size)
+    best = np.zeros(k, dtype=np.float32)
+    best_i = np.zeros(k, dtype=np.int32)
+    if k <= 0 or a <= 0 or n <= 0:
+        return best, best_i
+    sigma = np.float32(max(float(corridor), 1e-6))
+    cutoff = np.float32(float(YFIT_DIST_CUTOFF_SIGMA) * float(sigma))
+    tau = np.float32(max(float(YFIT_BIN_TAU), 1e-6))
+    pen = np.float32(
+        float(YFIT_BALANCE_PENALTY) if balance_pen is None else float(balance_pen)
+    )
+    cov_w = np.float32(float(coverage_w))
+    t_w = np.float32(float(tight_w))
+    n_bins = max(int(n_bins), 4)
+    inv_l = np.float32(float(n_bins) / max(float(ray_len), 1e-6))
+    ray_len_f = np.float32(ray_len)
+    wn_f = wn.astype(np.float32, copy=False)
+    px_f = px.astype(np.float32, copy=False)
+    py_f = py.astype(np.float32, copy=False)
+    pu = px_f[:, None] * ct[None, :] + py_f[:, None] * st[None, :]
+    pv = -px_f[:, None] * st[None, :] + py_f[:, None] * ct[None, :]
+    u0_c = u0.astype(np.float32, copy=False)
+    v0_c = v0.astype(np.float32, copy=False)
+    for ai in range(a):
+        vn = v0_c[:, ai]
+        pvn = pv[:, ai]
+        if float(pvn.max()) < float(vn.min()) - float(cutoff) or float(pvn.min()) > float(vn.max()) + float(cutoff):
+            continue
+        u = u0_c[None, :, ai] - pu[:, ai][:, None]
+        v = vn[None, :] - pvn[:, None]
+        near = (u >= 0.0) & (u <= ray_len_f) & (np.abs(v) <= cutoff)
+        kk, jj = np.nonzero(near)
+        if int(kk.size) <= 0:
+            continue
+        vv = v[kk, jj]
+        cc = wn_f[jj] * np.exp(np.float32(-0.5) * np.square(vv / sigma))
+        ww = wn_f[jj]
+        num = np.bincount(kk, weights=cc, minlength=k).astype(np.float32)
+        den = np.bincount(kk, weights=ww, minlength=k).astype(np.float32)
+        tight = num / (den + np.float32(1e-9))
+        left_m = vv < 0.0
+        right_m = vv > 0.0
+        left = np.bincount(kk[left_m], weights=cc[left_m], minlength=k).astype(np.float32)
+        right = np.bincount(kk[right_m], weights=cc[right_m], minlength=k).astype(np.float32)
+        imb = np.abs(left - right) / (left + right + np.float32(1e-9))
+        bb = np.clip((u[kk, jj] * inv_l).astype(np.int32), 0, n_bins - 1)
+        mass = np.bincount(kk * n_bins + bb, weights=cc, minlength=k * n_bins)
+        acc = mass.reshape(k, n_bins).astype(np.float32, copy=False)
+        coverage = (acc / (acc + tau)).mean(axis=1)
+        scores = cov_w * coverage + t_w * tight - pen * imb
+        np.maximum(scores, 0.0, out=scores)
+        better = scores > best
+        best[better] = scores[better]
+        best_i[better] = ai
+    return best, best_i
+
+
+def _yfit_empty_stats() -> Dict[str, float]:
+    return {
+        "bbox_x0": -1.0,
+        "bbox_y0": -1.0,
+        "bbox_x1": -1.0,
+        "bbox_y1": -1.0,
+        "coarse_P_count": 0.0,
+        "coarse_angle_evals": 0.0,
+        "coarse_ms": 0.0,
+        "fine_P_count": 0.0,
+        "fine_angle_evals": 0.0,
+        "fine_ms": 0.0,
+        "total_yfit_ms": 0.0,
+    }
+
+
+def run_yfit_search(
+    layers: List[DartDetectResult],
+    *,
+    board_center: Tuple[float, float],
+    board_r: float,
+) -> Tuple[
+    Optional[Tuple[float, float]],
+    Dict[int, Tuple[float, float, float]],
+    float,
+    Dict[str, float],
+]:
+    """Joint P + independent per-cam short-ray search.
+
+    Returns (P, {cam: (vx,vy,support)}, total, profile_stats).
+    score(P) = sum_cam argmax_theta support(P, theta). No theta product search.
+    """
+    t_all = time.perf_counter()
+    stats = _yfit_empty_stats()
+    ray_len = float(YFIT_RAY_LENGTH_FRAC) * float(board_r)
+    corridor = float(YFIT_CORRIDOR_PX)
+    n_bins = int(YFIT_U_BINS)
+    cx, cy = float(board_center[0]), float(board_center[1])
+    size = FITLINE_SIZE
+    imgs: Dict[int, np.ndarray] = {}
+    union = None
+    for r in layers:
+        soft = r.fit_ds_gray if r.fit_ds_gray is not None else r.fit_gray
+        if soft is None:
+            continue
+        if soft.shape[0] != size or soft.shape[1] != size:
+            soft = cv2.resize(soft, (size, size), interpolation=cv2.INTER_AREA)
+        img = _yfit_motion_image(soft)
+        imgs[int(r.cam_idx)] = img
+        m = (soft > float(FITLINE_WEIGHT_EPS)).astype(np.uint8)
+        union = m if union is None else cv2.bitwise_or(union, m)
+    if union is None or int(np.count_nonzero(union)) <= 0 or not imgs:
+        stats["total_yfit_ms"] = (time.perf_counter() - t_all) * 1000.0
+        return None, {}, 0.0, stats
+
+    board_lim = float(board_r) * 1.08
+    bbox = _yfit_fused_bbox(
+        union,
+        margin=int(round(float(YFIT_SEARCH_MARGIN_PX))),
+        cx=cx,
+        cy=cy,
+        board_lim=board_lim,
+    )
+    if bbox is None:
+        stats["total_yfit_ms"] = (time.perf_counter() - t_all) * 1000.0
+        return None, {}, 0.0, stats
+    x0, y0, x1, y1 = bbox
+    stats["bbox_x0"] = float(x0)
+    stats["bbox_y0"] = float(y0)
+    stats["bbox_x1"] = float(x1)
+    stats["bbox_y1"] = float(y1)
+    margin = int(round(float(YFIT_SEARCH_MARGIN_PX)))
+    kdil = max(3, (margin * 2 + 1) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kdil, kdil))
+    near_motion = cv2.dilate(union, kernel, iterations=1)
+
+    bank = _yfit_angle_bank()
+    ct_all = bank["ct"]
+    st_all = bank["st"]
+    rad_all = bank["rad"]
+    pix: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    coarse_step_deg = max(int(round(float(YFIT_COARSE_ANGLE_DEG))), 1)
+    coarse_idx = np.arange(0, 360, coarse_step_deg, dtype=np.int32)
+    n_coarse_ang = int(coarse_idx.size)
+    ct_c = ct_all[coarse_idx]
+    st_c = st_all[coarse_idx]
+    for cam, img in imgs.items():
+        ys, xs = np.nonzero(img > 0)
+        if int(xs.size) <= 0:
+            continue
+        xs_f = xs.astype(np.float32)
+        ys_f = ys.astype(np.float32)
+        wn = img[ys, xs].astype(np.float32, copy=False)
+        # One (N, A_coarse) projection table per camera per hit.
+        u0c = xs_f[:, None] * ct_c[None, :] + ys_f[:, None] * st_c[None, :]
+        v0c = -xs_f[:, None] * st_c[None, :] + ys_f[:, None] * ct_c[None, :]
+        pix[int(cam)] = (xs_f, ys_f, wn, u0c, v0c)
+    cam_ids = [int(c) for c in sorted(pix.keys())]
+    if not cam_ids:
+        stats["total_yfit_ms"] = (time.perf_counter() - t_all) * 1000.0
+        return None, {}, 0.0, stats
+
+    def _joint(px, py, ang_idx: np.ndarray, *, coarse_table: bool):
+        tot = np.zeros(int(px.size), dtype=np.float32)
+        loc: Dict[int, np.ndarray] = {}
+        sc: Dict[int, np.ndarray] = {}
+        ct = ct_all[ang_idx]
+        st = st_all[ang_idx]
+        col = None
+        if coarse_table:
+            step = int(ang_idx[1] - ang_idx[0]) if int(ang_idx.size) > 1 else 1
+            if step % coarse_step_deg == 0 and int(ang_idx[0]) % coarse_step_deg == 0:
+                col = (ang_idx // coarse_step_deg).astype(np.int32)
+        for cam in cam_ids:
+            xs_f, ys_f, wn, u0c, v0c = pix[cam]
+            if col is not None:
+                u0 = u0c[:, col]
+                v0 = v0c[:, col]
+            else:
+                u0 = xs_f[:, None] * ct[None, :] + ys_f[:, None] * st[None, :]
+                v0 = -xs_f[:, None] * st[None, :] + ys_f[:, None] * ct[None, :]
+            s, li = _yfit_argmax_theta_sparse(
+                wn, u0, v0, px, py, ct, st,
+                ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+            )
+            sc[cam] = s
+            loc[cam] = li
+            tot += s
+        return tot, loc, sc
+
+    def _set_best(px, py, tot, loc, sc, ang_idx):
+        wi = int(np.argmax(tot))
+        p = (float(px[wi]), float(py[wi]))
+        total = float(tot[wi])
+        abs_i: Dict[int, int] = {}
+        dirs: Dict[int, Tuple[float, float, float, float]] = {}
+        for cam in cam_ids:
+            ai = int(ang_idx[int(loc[cam][wi])])
+            abs_i[cam] = ai
+            dirs[cam] = (
+                float(ct_all[ai]),
+                float(st_all[ai]),
+                float(sc[cam][wi]),
+                float(rad_all[ai]),
+            )
+        return p, total, abs_i, dirs
+
+    t_coarse = time.perf_counter()
+    step_c = float(YFIT_COARSE_XY_STEP)
+    step_0 = float(max(step_c * 2.0, step_c))
+    ang_0 = max(int(coarse_step_deg) * 2, int(coarse_step_deg))
+    idx_0 = np.arange(0, 360, ang_0, dtype=np.int32)
+    px_0, py_0 = _yfit_grid_xy(
+        x0, y0, x1, y1, step_0, cx, cy, board_lim, mask=near_motion,
+    )
+    n_eval_p = 0
+    n_eval_ang = 0
+    if int(px_0.size) <= 0:
+        stats["coarse_ms"] = (time.perf_counter() - t_coarse) * 1000.0
+        stats["total_yfit_ms"] = (time.perf_counter() - t_all) * 1000.0
+        return None, {}, 0.0, stats
+    tot0, loc0, sc0 = _joint(px_0, py_0, idx_0, coarse_table=True)
+    n_eval_p += int(px_0.size)
+    n_eval_ang += int(px_0.size) * int(idx_0.size) * len(cam_ids)
+    best_p, best_total, best_abs, best_dir = _set_best(px_0, py_0, tot0, loc0, sc0, idx_0)
+
+    win = int(max(round(step_0), round(step_c)))
+    cx0 = int(round(best_p[0]))
+    cy0 = int(round(best_p[1]))
+    px_c, py_c = _yfit_grid_xy(
+        max(x0, cx0 - win), max(y0, cy0 - win),
+        min(x1, cx0 + win), min(y1, cy0 + win),
+        step_c, cx, cy, board_lim, mask=near_motion,
+    )
+    if int(px_c.size) > 0:
+        totc, locc, scc = _joint(px_c, py_c, coarse_idx, coarse_table=True)
+        n_eval_p += int(px_c.size)
+        n_eval_ang += int(px_c.size) * n_coarse_ang * len(cam_ids)
+        p1, t1, a1, d1 = _set_best(px_c, py_c, totc, locc, scc, coarse_idx)
+        if t1 >= best_total:
+            best_p, best_total, best_abs, best_dir = p1, t1, a1, d1
+    stats["coarse_P_count"] = float(n_eval_p)
+    stats["coarse_angle_evals"] = float(n_eval_ang)
+    stats["coarse_ms"] = (time.perf_counter() - t_coarse) * 1000.0
+
+    fine_span = int(round(float(YFIT_FINE_XY_RADIUS)))
+    fx0 = max(x0, int(round(best_p[0])) - fine_span)
+    fy0 = max(y0, int(round(best_p[1])) - fine_span)
+    fx1 = min(x1, int(round(best_p[0])) + fine_span)
+    fy1 = min(y1, int(round(best_p[1])) + fine_span)
+    px_f, py_f = _yfit_grid_xy(
+        fx0, fy0, fx1, fy1, float(YFIT_FINE_XY_STEP), cx, cy, board_lim
+    )
+    span_deg = int(round(float(YFIT_FINE_ANGLE_SPAN_DEG)))
+    fine_idx_cam: Dict[int, np.ndarray] = {}
+    n_fine_ang = 0
+    for cam in cam_ids:
+        cdeg = int(best_abs[cam]) % 360
+        idxs = np.array([(cdeg + d) % 360 for d in range(-span_deg, span_deg + 1)], dtype=np.int32)
+        fine_idx_cam[cam] = idxs
+        n_fine_ang += int(idxs.size)
+    stats["fine_P_count"] = float(px_f.size)
+    stats["fine_angle_evals"] = float(int(px_f.size) * n_fine_ang)
+
+    t_fine = time.perf_counter()
+    if int(px_f.size) > 0:
+        fine_total = np.zeros(int(px_f.size), dtype=np.float32)
+        fine_local: Dict[int, np.ndarray] = {}
+        fine_scores: Dict[int, np.ndarray] = {}
+        for cam in cam_ids:
+            idx = fine_idx_cam[cam]
+            xs_f, ys_f, wn, _u0c, _v0c = pix[cam]
+            ct = ct_all[idx]
+            st = st_all[idx]
+            u0 = xs_f[:, None] * ct[None, :] + ys_f[:, None] * st[None, :]
+            v0 = -xs_f[:, None] * st[None, :] + ys_f[:, None] * ct[None, :]
+            s, li = _yfit_argmax_theta_sparse(
+                wn, u0, v0, px_f, py_f, ct, st,
+                ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+            )
+            fine_scores[cam] = s
+            fine_local[cam] = li
+            fine_total += s
+        wif = int(np.argmax(fine_total))
+        fine_best = float(fine_total[wif])
+        if fine_best >= best_total:
+            best_total = fine_best
+            best_p = (float(px_f[wif]), float(py_f[wif]))
+            for cam in cam_ids:
+                ai = int(fine_idx_cam[cam][int(fine_local[cam][wif])])
+                best_abs[cam] = ai
+                best_dir[cam] = (
+                    float(ct_all[ai]),
+                    float(st_all[ai]),
+                    float(fine_scores[cam][wif]),
+                    float(rad_all[ai]),
+                )
+    stats["fine_ms"] = (time.perf_counter() - t_fine) * 1000.0
+    stats["total_yfit_ms"] = (time.perf_counter() - t_all) * 1000.0
+
+    out_dir = {
+        cam: (float(v[0]), float(v[1]), float(v[2])) for cam, v in best_dir.items()
+    }
+    return best_p, out_dir, float(best_total), stats
+
+
+def yfit_to_fused(
+    layers: List[DartDetectResult],
+    p_xy: Tuple[float, float],
+    dirs: Dict[int, Tuple[float, float, float]],
+    total: float,
+    *,
+    board_calibrator: Optional[BoardCalibrator],
+    yfit_ms: float,
+) -> FusedDartResult:
+    px, py = float(p_xy[0]), float(p_xy[1])
+    ray_len = float(YFIT_RAY_LENGTH_FRAC) * float(_board_center_and_r(FITLINE_SIZE)[1])
+    ring_cals: List[Optional[BoardCalibration]] = []
+    per_cam: List[DartDetectResult] = []
+    used: List[int] = []
+    for r in layers:
+        cam = int(r.cam_idx)
+        d = dirs.get(cam)
+        if board_calibrator is not None:
+            ring_cals.append(board_calibrator.get(cam))
+        if d is None:
+            per_cam.append(r)
+            continue
+        vx, vy, sup = d
+        nn = float(np.hypot(vx, vy)) or 1.0
+        vx, vy = vx / nn, vy / nn
+        r.found = True
+        r.tip_xy = (px, py)
+        r.radius_tip = (px, py)
+        r.line_vx = float(vx)
+        r.line_vy = float(vy)
+        r.line_x0 = px
+        r.line_y0 = py
+        r.line_angle_deg = _fitline_angle_deg(vx, vy)
+        r.yfit_support = float(sup)
+        r.confidence = float(np.clip(sup, 0.0, 1.0))
+        r.reject_reason = ""
+        per_cam.append(r)
+        used.append(cam)
+
+    number, zone, score = score_topdown_point(
+        px, py, out_size=FITLINE_SIZE, cals=ring_cals
+    )
+    conf = float(np.clip(total / max(len(used), 1), 0.0, 1.0))
+    reject = ""
+    if score <= 0:
+        zone, score, number = "miss", 0, 0
+        reject = "miss"
+    return FusedDartResult(
+        found=True,
+        tip_xy=(px, py),
+        confidence=conf,
+        segment_number=number,
+        zone_name=zone,
+        score=score,
+        cam_indices=used,
+        per_cam=per_cam,
+        reject_reason=reject,
+        stage2_roi_tip_xy=(px, py),
+        stage2_roi_radius=ray_len,
+        yfit_total=float(total),
+        yfit_ms=float(yfit_ms),
+    )
+
+
+def _distance_yfit_enabled() -> bool:
+    return DART_TIP_ESTIMATOR == "distance_yfit"
+
+
+def dyfit_estimate_to_fused(
+    layers: List[DartDetectResult],
+    est: _dyfit.DistanceYFitEstimate,
+    *,
+    board_calibrator: Optional[BoardCalibrator],
+    mode: str = "distance_yfit",
+) -> FusedDartResult:
+    dirs: Dict[int, Tuple[float, float, float]] = {}
+    for cam, ang in est.per_cam_angle.items():
+        vx, vy = _dyfit.ray_direction(ang)
+        dirs[int(cam)] = (float(vx), float(vy), float(est.per_cam_score.get(int(cam), 0.0)))
+    fused = yfit_to_fused(
+        layers,
+        (float(est.x), float(est.y)),
+        dirs,
+        float(est.score),
+        board_calibrator=board_calibrator,
+        yfit_ms=float(est.runtime_ms),
+    )
+    conf = float(np.clip(est.score, 0.0, 1.0))
+    if len(est.usable_cams) == 2:
+        conf *= float(DYFIT_2CAM_CONF_SCALE)
+    fused.confidence = conf
+    fused.yfit_total = float(est.score)
+    fused.yrefine_mode = str(mode)
+    fused.yrefine_accepted = True
+    fused.yrefine_p = (float(est.x), float(est.y))
+    fused.yrefine_p0 = (
+        (float(est.coarse_seed[0]), float(est.coarse_seed[1]))
+        if est.coarse_seed is not None
+        else fused.yrefine_p
+    )
+    fused.yrefine_dir = {int(c): (float(v[0]), float(v[1])) for c, v in dirs.items()}
+    fused.yrefine_scores = {int(c): float(v) for c, v in est.per_cam_score.items()}
+    fused.stage2_roi_radius = float(_dyfit.RAY_LENGTH)
+    return fused
+
+
+def _yrefine_wrap_delta_deg(a: float, b: float) -> float:
+    return float((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def _yrefine_outward_theta_deg(vx: float, vy: float) -> float:
+    """Ray from tip along shaft (opposite FitLine tipward orientation)."""
+    return float(np.degrees(np.arctan2(-float(vy), -float(vx))) % 360.0)
+
+
+def _yrefine_cam_seed_theta(r: DartDetectResult) -> float:
+    if abs(float(r.stage1_vx)) + abs(float(r.stage1_vy)) > 1e-6:
+        return _yrefine_outward_theta_deg(r.stage1_vx, r.stage1_vy)
+    return _yrefine_outward_theta_deg(r.line_vx, r.line_vy)
+
+
+def _yrefine_deg_list(center: float, span: float, step: float) -> np.ndarray:
+    step = max(float(step), 0.25)
+    span = max(float(span), 0.0)
+    n = int(round(2.0 * span / step)) + 1
+    n = max(n, 1)
+    return (float(center) + np.linspace(-span, span, n, dtype=np.float64)) % 360.0
+
+
+def _yrefine_local_xy(
+    p0: Tuple[float, float],
+    radius: float,
+    step: float,
+    cx: float,
+    cy: float,
+    board_lim: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    r = int(round(float(radius)))
+    st = max(int(round(float(step))), 1)
+    x0 = int(round(float(p0[0])))
+    y0 = int(round(float(p0[1])))
+    xs = np.arange(x0 - r, x0 + r + 1, st, dtype=np.int32)
+    ys = np.arange(y0 - r, y0 + r + 1, st, dtype=np.int32)
+    if xs.size <= 0 or ys.size <= 0:
+        z = np.zeros((0,), dtype=np.int32)
+        return z, z
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    rr = (xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2
+    keep = rr <= (float(board_lim) * float(board_lim))
+    return xx[keep].astype(np.int32), yy[keep].astype(np.int32)
+
+
+def _yrefine_spread_tier(spread: float, suspicious: bool) -> str:
+    """tight = fast normal hit; mid/wide only when FitLine disagrees."""
+    sp = float(spread)
+    if sp >= float(YREFINE_SPREAD_WIDE):
+        return "wide"
+    if sp >= float(YREFINE_SPREAD_TIGHT) or bool(suspicious):
+        return "mid"
+    return "tight"
+
+
+def _yrefine_p_radius(tier: str) -> float:
+    if tier == "wide":
+        return float(YREFINE_P_RADIUS_WIDE)
+    if tier == "mid":
+        return float(YREFINE_P_RADIUS_MID)
+    return float(YREFINE_P_RADIUS_TIGHT)
+
+
+def _yrefine_max_dp(tier: str) -> float:
+    if tier == "wide":
+        return float(YREFINE_MAX_DP_WIDE)
+    if tier == "mid":
+        return float(YREFINE_MAX_DP_MID)
+    return float(YREFINE_MAX_DP_TIGHT)
+
+
+def _yrefine_ang_span(tier: str, problem: bool) -> float:
+    if tier == "wide":
+        return float(YREFINE_ANG_WIDE_BAD if problem else YREFINE_ANG_WIDE_GOOD)
+    if tier == "mid":
+        return float(YREFINE_ANG_MID_BAD if problem else YREFINE_ANG_MID_GOOD)
+    return float(YREFINE_ANG_TIGHT)
+
+
+def _yrefine_p_on_edge(
+    p: Tuple[float, float],
+    origin: Tuple[float, float],
+    radius: float,
+) -> bool:
+    return (abs(float(p[0]) - float(origin[0])) >= float(radius) - 0.51) or (
+        abs(float(p[1]) - float(origin[1])) >= float(radius) - 0.51
+    )
+
+
+def _yrefine_expand_radius(old_radius: float, max_dp: float) -> float:
+    bumped = float(old_radius) + 8.0
+    return min(float(YREFINE_P_RADIUS_EXPAND_CAP), float(max_dp), bumped)
+
+
+def _yrefine_problem_cams(fused: FusedDartResult) -> set:
+    cams = [r for r in fused.per_cam if r.found]
+    bad: set = set()
+    qs = [float(r.fitq_quality) for r in cams]
+    med = float(np.median(qs)) if qs else 0.0
+    used = {int(c) for c in fused.cam_indices}
+    for r in cams:
+        if float(r.fitq_quality) < float(YREFINE_LOW_Q):
+            bad.add(int(r.cam_idx))
+        if float(r.fitq_s1s2_angle) > float(YREFINE_S1S2_JUMP_DEG):
+            bad.add(int(r.cam_idx))
+        if qs and float(r.fitq_quality) < med - 0.18:
+            bad.add(int(r.cam_idx))
+        if used and int(r.cam_idx) not in used:
+            bad.add(int(r.cam_idx))
+    if int(fused.fitq_recovery_cam) >= 0:
+        bad.add(int(fused.fitq_recovery_cam))
+    if fused.fitq_suspicious and not bad and cams:
+        bad.add(int(min(cams, key=lambda c: float(c.fitq_quality)).cam_idx))
+    return bad
+
+
+def _yrefine_cc_axis(
+    xs: np.ndarray, ys: np.ndarray
+) -> Tuple[Optional[Tuple[float, float]], Tuple[float, float]]:
+    """Principal axis of a CC, or None if the blob is too round/small."""
+    if int(xs.size) < 8:
+        mx = float(np.mean(xs)) if int(xs.size) else 0.0
+        my = float(np.mean(ys)) if int(ys.size) else 0.0
+        return None, (mx, my)
+    mx = float(np.mean(xs))
+    my = float(np.mean(ys))
+    x = np.stack([xs.astype(np.float64) - mx, ys.astype(np.float64) - my], axis=1)
+    _u, s, vt = np.linalg.svd(x, full_matrices=False)
+    if s.size < 2 or float(s[0]) < float(YREFINE_SATELLITE_ELONG_RATIO) * max(
+        float(s[1]), 1e-6
+    ):
+        return None, (mx, my)
+    vx, vy = float(vt[0, 0]), float(vt[0, 1])
+    n = float(np.hypot(vx, vy)) or 1.0
+    return (vx / n, vy / n), (mx, my)
+
+
+def _yrefine_keep_dart_motion(img: np.ndarray) -> Tuple[np.ndarray, int, int]:
+    """Keep pixels near the bright dart; drop faint board-wire specks.
+
+    Floor the image *before* CC so dim dots cannot 8-connect onto the shaft.
+    Dilate the bright core a few px so dart edges stay. Ray objective unchanged.
+    Small bright satellites *beside* the dart (not along the shaft) are punched
+    out so they cannot rotate the Y ray parallel to another camera.
+    Returns (filtered_img, n_kept, n_all).
+    """
+    if img is None or img.size == 0:
+        z = img if img is not None else np.zeros((0, 0), dtype=np.float32)
+        return z, 0, 0
+    nz = img > 1e-6
+    n_all = int(np.count_nonzero(nz))
+    if n_all < 16:
+        return img, n_all, n_all
+    hi = float(np.percentile(img[nz], float(YREFINE_NOISE_PCTL)))
+    core_thr = max(1e-4, float(YREFINE_NOISE_CORE_FRAC) * hi)
+    core = (img >= core_thr).astype(np.uint8)
+    n_lab, labels, stats, cents = cv2.connectedComponentsWithStats(core, connectivity=8)
+    labs = [
+        lab
+        for lab in range(1, int(n_lab))
+        if int(stats[lab, cv2.CC_STAT_AREA]) >= int(YREFINE_NOISE_CORE_MIN_AREA)
+    ]
+    if not labs:
+        return img, n_all, n_all
+    largest = max(labs, key=lambda i: int(stats[i, cv2.CC_STAT_AREA]))
+    max_area = float(stats[largest, cv2.CC_STAT_AREA])
+    ys_l, xs_l = np.where(labels == largest)
+    axis, origin = _yrefine_cc_axis(xs_l, ys_l)
+    keep_labs = set()
+    sat = np.zeros(img.shape[:2], dtype=np.uint8)
+    for lab in labs:
+        area = float(stats[lab, cv2.CC_STAT_AREA])
+        if lab == largest or axis is None or area >= float(YREFINE_SATELLITE_AREA_FRAC) * max_area:
+            keep_labs.add(lab)
+            continue
+        cx, cy = float(cents[lab, 0]), float(cents[lab, 1])
+        dx, dy = cx - origin[0], cy - origin[1]
+        vx, vy = axis
+        perp = abs(dx * (-vy) + dy * vx)
+        if perp <= float(YREFINE_SATELLITE_PERP_PX):
+            keep_labs.add(lab)
+        else:
+            sat[labels == lab] = 255
+    core_keep = np.zeros(img.shape[:2], dtype=np.uint8)
+    for lab in keep_labs:
+        core_keep[labels == lab] = 255
+    if int(np.count_nonzero(core_keep)) < 6:
+        return img, n_all, n_all
+    rad = max(0, int(YREFINE_NOISE_DILATE_PX))
+    if rad > 0:
+        k = 2 * rad + 1
+        kernel = np.ones((k, k), dtype=np.uint8)
+        core_keep = cv2.dilate(core_keep, kernel, iterations=1)
+    if int(np.count_nonzero(sat)) > 0:
+        core_keep[sat > 0] = 0
+    keep = np.where(core_keep > 0, img, 0).astype(np.float32, copy=False)
+    n_keep = int(np.count_nonzero(keep > 1e-6))
+    if n_keep < max(12, n_all // 8):
+        return img, n_all, n_all
+    return keep, n_keep, n_all
+
+
+def _yrefine_pix_from_cam(r: DartDetectResult) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    soft = r.fit_ds_gray if r.fit_ds_gray is not None else r.fit_gray
+    if soft is None:
+        return None
+    if soft.shape[0] != FITLINE_SIZE or soft.shape[1] != FITLINE_SIZE:
+        soft = cv2.resize(soft, (FITLINE_SIZE, FITLINE_SIZE), interpolation=cv2.INTER_AREA)
+    img = _yfit_motion_image(soft)
+    img, n_keep, n_all = _yrefine_keep_dart_motion(img)
+    if n_keep < n_all:
+        print(
+            f"[YREFINE] denoise cam{int(r.cam_idx)} kept={n_keep}/{n_all}",
+            flush=True,
+        )
+    ys, xs = np.nonzero(img > 0)
+    if int(xs.size) <= 0:
+        return None
+    return (
+        xs.astype(np.float32),
+        ys.astype(np.float32),
+        img[ys, xs].astype(np.float32, copy=False),
+    )
+
+
+def _yrefine_score_grid(
+    pix: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    px: np.ndarray,
+    py: np.ndarray,
+    ang: Dict[int, np.ndarray],
+    *,
+    ray_len: float,
+    corridor: float,
+    n_bins: int,
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    loc: Dict[int, np.ndarray] = {}
+    sc: Dict[int, np.ndarray] = {}
+    for cam, (xs, ys, wn) in pix.items():
+        deg = ang[cam]
+        rad = np.deg2rad(deg)
+        ct = np.cos(rad).astype(np.float32)
+        st = np.sin(rad).astype(np.float32)
+        u0 = xs[:, None] * ct[None, :] + ys[:, None] * st[None, :]
+        v0 = -xs[:, None] * st[None, :] + ys[:, None] * ct[None, :]
+        s, li = _yfit_argmax_theta_sparse(
+            wn, u0, v0, px, py, ct, st,
+            ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+            coverage_w=float(YREFINE_COV_W),
+            tight_w=float(YREFINE_TIGHT_W),
+        )
+        sc[cam] = s
+        loc[cam] = li
+    return loc, sc
+
+
+def _yrefine_alive_cams(sc: Dict[int, np.ndarray]) -> List[int]:
+    cams = sorted(sc.keys())
+    alive = [
+        c for c in cams
+        if sc[c].size > 0 and float(np.max(sc[c])) >= float(YREFINE_ALIVE_SUPPORT)
+    ]
+    if len(alive) < 2:
+        return cams
+    return alive
+
+
+def _yrefine_objectives(sc: Dict[int, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Global P scores from per-camera supports. No FitLine distance term.
+
+    sum: old behaviour (one strong cam can dominate).
+    mean / min / geom: comparison objectives on live cameras.
+    consensus: 0.5*mean + 0.5*min. A cam with no support anywhere in this
+    grid is dropped from min/mean/geom/consensus so it cannot flatten min to 0.
+    """
+    z = np.zeros((0,), dtype=np.float32)
+    empty = {k: z for k in ("sum", "mean", "min", "geom", "consensus")}
+    if not sc:
+        return empty
+    cams = sorted(sc.keys())
+    stack = np.stack([sc[c] for c in cams], axis=0).astype(np.float32, copy=False)
+    alive = _yrefine_alive_cams(sc)
+    live = np.stack([sc[c] for c in alive], axis=0).astype(np.float32, copy=False)
+    mean = live.mean(axis=0)
+    mn = live.min(axis=0)
+    geom = np.exp(np.mean(np.log(np.clip(live, 1e-6, None)), axis=0)).astype(np.float32)
+    return {
+        "sum": stack.sum(axis=0),
+        "mean": mean.astype(np.float32, copy=False),
+        "min": mn.astype(np.float32, copy=False),
+        "geom": geom,
+        "consensus": (0.5 * mean + 0.5 * mn).astype(np.float32),
+    }
+
+
+def _yrefine_scores_at(sc: Dict[int, np.ndarray], i: int, cams: Optional[List[int]] = None) -> List[float]:
+    keys = cams if cams is not None else sorted(sc.keys())
+    return [float(sc[c][i]) for c in keys]
+
+
+def _yrefine_obj_scalars(scores: List[float]) -> Dict[str, float]:
+    if not scores:
+        return {k: 0.0 for k in ("sum", "mean", "min", "geom", "consensus")}
+    a = np.asarray(scores, dtype=np.float64)
+    mean = float(a.mean())
+    mn = float(a.min())
+    geom = float(np.exp(np.mean(np.log(np.clip(a, 1e-6, None)))))
+    return {
+        "sum": float(a.sum()),
+        "mean": mean,
+        "min": mn,
+        "geom": geom,
+        "consensus": 0.5 * mean + 0.5 * mn,
+    }
+
+
+def _yrefine_pick(
+    obj_name: str,
+    agg: Dict[str, np.ndarray],
+    loc: Dict[int, np.ndarray],
+    sc: Dict[int, np.ndarray],
+    ang: Dict[int, np.ndarray],
+    px: np.ndarray,
+    py: np.ndarray,
+) -> Tuple[Tuple[float, float], Dict[int, float], Dict[int, float], Dict[str, float]]:
+    key = obj_name if obj_name in agg and int(agg[obj_name].size) > 0 else "consensus"
+    arr = agg.get(key)
+    if arr is None or int(arr.size) <= 0:
+        return (0.0, 0.0), {}, {}, _yrefine_obj_scalars([])
+    wi = int(np.argmax(arr))
+    th: Dict[int, float] = {}
+    sc_p: Dict[int, float] = {}
+    for cam in sc:
+        th[cam] = float(ang[cam][int(loc[cam][wi])])
+        sc_p[cam] = float(sc[cam][wi])
+    return (
+        (float(px[wi]), float(py[wi])),
+        th,
+        sc_p,
+        _yrefine_obj_scalars(_yrefine_scores_at(sc, wi, _yrefine_alive_cams(sc))),
+    )
+
+
+def _yrefine_fmt_list(vals: List[float]) -> str:
+    return "[" + ", ".join(f"{v:.2f}" for v in vals) + "]"
+
+
+def _yrefine_log_obj_picks(
+    tag: str,
+    agg: Dict[str, np.ndarray],
+    sc: Dict[int, np.ndarray],
+    px: np.ndarray,
+    py: np.ndarray,
+) -> None:
+    for name in ("sum", "mean", "min", "geom", "consensus"):
+        arr = agg.get(name)
+        if arr is None or int(arr.size) <= 0:
+            continue
+        i = int(np.argmax(arr))
+        scores = _yrefine_scores_at(sc, i)
+        print(
+            f"[YREFINE][obj] {tag} {name} "
+            f"P=({float(px[i]):.1f},{float(py[i]):.1f}) "
+            f"scores={_yrefine_fmt_list(scores)} "
+            f"mean={float(agg['mean'][i]):.3f} min={float(agg['min'][i]):.3f} "
+            f"geom={float(agg['geom'][i]):.3f} consensus={float(agg['consensus'][i]):.3f} "
+            f"sum={float(agg['sum'][i]):.3f}",
+            flush=True,
+        )
+
+
+def _yrefine_coarse_fine(
+    pix: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]],
+    p_center: Tuple[float, float],
+    p_rad: float,
+    coarse_ang: Dict[int, np.ndarray],
+    *,
+    ray_len: float,
+    corridor: float,
+    n_bins: int,
+    cx: float,
+    cy: float,
+    board_lim: float,
+    obj_name: str,
+    log_tag: str,
+    origin: Optional[Tuple[float, float]] = None,
+    max_dp: Optional[float] = None,
+) -> Optional[dict]:
+    px_c, py_c = _yrefine_local_xy(
+        p_center, p_rad, float(YREFINE_COARSE_XY_STEP), cx, cy, board_lim
+    )
+    if origin is not None and max_dp is not None and int(px_c.size) > 0:
+        dist = np.hypot(
+            px_c.astype(np.float64) - float(origin[0]),
+            py_c.astype(np.float64) - float(origin[1]),
+        )
+        keep = dist <= float(max_dp) + 0.51
+        px_c = px_c[keep]
+        py_c = py_c[keep]
+    coarse_n = int(px_c.size)
+    if coarse_n <= 0:
+        return None
+    loc_c, sc_c = _yrefine_score_grid(
+        pix, px_c, py_c, coarse_ang,
+        ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+    )
+    agg_c = _yrefine_objectives(sc_c)
+    if log_tag:
+        _yrefine_log_obj_picks(log_tag, agg_c, sc_c, px_c, py_c)
+    p_sum_c, th_sum_c, sc_sum_c, obj_sum_c = _yrefine_pick(
+        "sum", agg_c, loc_c, sc_c, coarse_ang, px_c, py_c
+    )
+    best_p, best_th, best_sc, best_obj = _yrefine_pick(
+        obj_name, agg_c, loc_c, sc_c, coarse_ang, px_c, py_c
+    )
+    best_total = float(best_obj.get(obj_name, best_obj["consensus"]))
+    px_f, py_f = _yrefine_local_xy(
+        best_p, float(YREFINE_FINE_XY_RADIUS), float(YREFINE_FINE_XY_STEP),
+        cx, cy, board_lim,
+    )
+    fine_n = int(px_f.size)
+    fine_ang: Dict[int, np.ndarray] = {}
+    n_fine_ang = 0
+    for cam in pix:
+        fine_ang[cam] = _yrefine_deg_list(
+            best_th[cam], float(YREFINE_FINE_ANG_SPAN), float(YREFINE_FINE_ANG_STEP)
+        )
+        n_fine_ang += int(fine_ang[cam].size)
+    if fine_n > 0:
+        loc_f, sc_f = _yrefine_score_grid(
+            pix, px_f, py_f, fine_ang,
+            ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+        )
+        agg_f = _yrefine_objectives(sc_f)
+        if log_tag:
+            _yrefine_log_obj_picks(log_tag + "_fine", agg_f, sc_f, px_f, py_f)
+        p_f, th_f, sc_f_p, obj_f = _yrefine_pick(
+            obj_name, agg_f, loc_f, sc_f, fine_ang, px_f, py_f
+        )
+        if float(obj_f.get(obj_name, obj_f["consensus"])) >= best_total:
+            best_total = float(obj_f.get(obj_name, obj_f["consensus"]))
+            best_p, best_th, best_sc, best_obj = p_f, th_f, sc_f_p, obj_f
+    n_ang = sum(int(a.size) for a in coarse_ang.values())
+    return {
+        "best_p": best_p,
+        "best_th": best_th,
+        "best_sc": best_sc,
+        "best_obj": best_obj,
+        "p_sum": p_sum_c,
+        "sc_sum": sc_sum_c,
+        "obj_sum": obj_sum_c,
+        "th_sum": th_sum_c,
+        "coarse_n": coarse_n,
+        "fine_n": fine_n,
+        "n_ang": n_ang,
+        "sc_c": sc_c,
+        "alive": _yrefine_alive_cams(sc_c),
+    }
+
+
+def _fitline_cam_flee_px(
+    fused: FusedDartResult,
+) -> List[Tuple[int, float]]:
+    """Perpendicular distance of each used FitLine from the fused tip."""
+    tx, ty = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    used = {int(c) for c in fused.cam_indices} if fused.cam_indices else None
+    out: List[Tuple[int, float]] = []
+    for r in fused.per_cam:
+        if not r.found:
+            continue
+        if used is not None and int(r.cam_idx) not in used:
+            continue
+        x0, y0, vx, vy = _fitline_original_xyv(r)
+        d = _point_to_line_distance(x0, y0, vx, vy, tx, ty)
+        out.append((int(r.cam_idx), float(d)))
+    return out
+
+
+def _fitline_needs_yrefine(fused: FusedDartResult) -> Tuple[bool, float, str]:
+    """True when FitLine concurrence is untrustworthy.
+
+    Two lines always meet at a point, so 2-cam cannot measure flee — always
+    refine. 3+ cams: only if a used FitLine misses the fused tip.
+    """
+    flees = _fitline_cam_flee_px(fused)
+    if not flees:
+        return False, 0.0, ""
+    max_flee = max(d for _c, d in flees)
+    detail = "[" + ", ".join(f"{c}:{d:.2f}" for c, d in flees) + "]"
+    if len(flees) < 2:
+        return False, float(max_flee), detail
+    if len(flees) < 3:
+        return True, float(max_flee), detail
+    need = max_flee >= float(YREFINE_FLEE_PX)
+    return need, float(max_flee), detail
+
+
+def run_yrefine_local(
+    fused: FusedDartResult,
+    *,
+    board_calibrator: Optional[BoardCalibrator],
+) -> FusedDartResult:
+    """Local Y-refine around FitLine P0. Y P is final when valid; else FitLine."""
+    t0 = time.perf_counter()
+    p0 = (float(fused.tip_xy[0]), float(fused.tip_xy[1]))
+    fused.yrefine_p0 = p0
+    fused.yrefine_p = p0
+    fused.yrefine_seed_dir = {
+        int(r.cam_idx): (float(r.line_vx), float(r.line_vy))
+        for r in fused.per_cam
+        if r.found
+    }
+    need, max_flee, detail = _fitline_needs_yrefine(fused)
+    n_lines = len(_fitline_cam_flee_px(fused))
+    if not need:
+        fused.yrefine_mode = "skip"
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        print(
+            f"[YREFINE] skip good_intersect n={n_lines} max_flee={max_flee:.2f} "
+            f"cams={detail or '-'} thresh={float(YREFINE_FLEE_PX):.1f} — keep FitLine",
+            flush=True,
+        )
+        return fused
+    why = "2cam" if n_lines < 3 else "flee"
+    print(
+        f"[YREFINE] run {why} n={n_lines} max_flee={max_flee:.2f} cams={detail} "
+        f"thresh={float(YREFINE_FLEE_PX):.1f}",
+        flush=True,
+    )
+    try:
+        return _run_yrefine_local_body(fused, board_calibrator=board_calibrator, t0=t0, p0=p0)
+    except Exception as exc:
+        fused.yrefine_mode = "fail"
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[YREFINE] fail {exc!r} — keep FitLine", flush=True)
+        return fused
+
+
+def _run_yrefine_local_body(
+    fused: FusedDartResult,
+    *,
+    board_calibrator: Optional[BoardCalibrator],
+    t0: float,
+    p0: Tuple[float, float],
+) -> FusedDartResult:
+    line_cams = [r for r in fused.per_cam if r.found]
+    if len(line_cams) < 2:
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        fused.yrefine_mode = "skip"
+        print("[YREFINE] skip cams<2 — keep FitLine", flush=True)
+        return fused
+
+    pix: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for r in line_cams:
+        got = _yrefine_pix_from_cam(r)
+        if got is not None:
+            pix[int(r.cam_idx)] = got
+    if len(pix) < 2:
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        fused.yrefine_mode = "skip"
+        print("[YREFINE] skip no_motion — keep FitLine", flush=True)
+        return fused
+
+    problem = _yrefine_problem_cams(fused)
+    suspicious = bool(fused.fitq_suspicious) or bool(problem)
+    spread = float(fused.fitq_pair_spread)
+    tier = _yrefine_spread_tier(spread, suspicious)
+    mode = "suspicious" if (suspicious or tier != "tight") else "normal"
+    fused.yrefine_mode = mode
+    p_rad = _yrefine_p_radius(tier)
+    max_dp = _yrefine_max_dp(tier)
+    fused.yrefine_search_radius = float(p_rad)
+    cam_span: Dict[int, float] = {}
+    for r in line_cams:
+        cam = int(r.cam_idx)
+        if cam not in pix:
+            continue
+        cam_span[cam] = _yrefine_ang_span(tier, cam in problem)
+
+    ray_len = float(YFIT_RAY_LENGTH_FRAC) * float(_board_center_and_r(FITLINE_SIZE)[1])
+    corridor = float(YFIT_CORRIDOR_PX)
+    n_bins = int(YFIT_U_BINS)
+    (cx, cy), board_r = _board_center_and_r(FITLINE_SIZE)
+    board_lim = float(board_r) * 1.08
+
+    seed_th: Dict[int, float] = {}
+    p0x = np.array([p0[0]], dtype=np.float32)
+    p0y = np.array([p0[1]], dtype=np.float32)
+    for r in line_cams:
+        cam = int(r.cam_idx)
+        if cam not in pix:
+            continue
+        th_a = _yrefine_cam_seed_theta(r)
+        th_b = (th_a + 180.0) % 360.0
+        flip = np.array([th_a, th_b], dtype=np.float64)
+        loc, sc = _yrefine_score_grid(
+            {cam: pix[cam]}, p0x, p0y, {cam: flip},
+            ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+        )
+        seed_th[cam] = float(flip[int(loc[cam][0])])
+
+    seed_ang = {cam: np.array([seed_th[cam]], dtype=np.float64) for cam in seed_th}
+    _seed_loc, seed_sc_grid = _yrefine_score_grid(
+        pix, p0x, p0y, seed_ang,
+        ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+    )
+    seed_scores = _yrefine_scores_at(seed_sc_grid, 0) if seed_sc_grid else []
+    seed_alive = (
+        _yrefine_scores_at(seed_sc_grid, 0, _yrefine_alive_cams(seed_sc_grid))
+        if seed_sc_grid
+        else []
+    )
+    seed_obj = _yrefine_obj_scalars(seed_alive)
+
+    coarse_ang: Dict[int, np.ndarray] = {}
+    n_ang_eval = 0
+    for cam, span in cam_span.items():
+        if cam not in seed_th:
+            continue
+        coarse_ang[cam] = _yrefine_deg_list(
+            seed_th[cam], span, float(YREFINE_COARSE_ANG_STEP)
+        )
+        n_ang_eval += int(coarse_ang[cam].size)
+    pix = {c: pix[c] for c in coarse_ang if c in pix}
+    if len(pix) < 2 or not coarse_ang:
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        fused.yrefine_mode = "skip"
+        print("[YREFINE] skip no_angles — keep FitLine", flush=True)
+        return fused
+
+    obj_name = str(YREFINE_OBJECTIVE)
+    t_c = time.perf_counter()
+    got = _yrefine_coarse_fine(
+        pix, p0, p_rad, coarse_ang,
+        ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+        cx=cx, cy=cy, board_lim=board_lim, obj_name=obj_name, log_tag="coarse",
+        origin=p0, max_dp=max_dp,
+    )
+    if got is None:
+        fused.yfit_ms = (time.perf_counter() - t0) * 1000.0
+        print("[YREFINE] skip empty_grid — keep FitLine", flush=True)
+        return fused
+    sc_c0 = got["sc_c"]
+    print(
+        f"[YREFINE] alive_cams={got['alive']} "
+        f"max_support=[{', '.join(f'{c}:{float(np.max(sc_c0[c])):.2f}' for c in sorted(sc_c0))}]",
+        flush=True,
+    )
+    coarse_ms = (time.perf_counter() - t_c) * 1000.0
+    best_p = got["best_p"]
+    best_th = got["best_th"]
+    best_sc = got["best_sc"]
+    best_obj = got["best_obj"]
+    p_sum = got["p_sum"]
+    sc_sum_p = got["sc_sum"]
+    obj_sum = got["obj_sum"]
+    coarse_n = int(got["coarse_n"])
+    fine_n = int(got["fine_n"])
+    coarse_ang_evals = coarse_n * n_ang_eval
+    fine_ang_evals = fine_n * int(got["n_ang"])
+    expanded = False
+    edge_before = _yrefine_p_on_edge(best_p, p0, p_rad)
+    edge_after = edge_before
+    used_radius = float(p_rad)
+
+    # One expansion pass: edge + (suspicious or large spread). Never on tight/fast hits.
+    if edge_before and tier != "tight":
+        new_rad = _yrefine_expand_radius(p_rad, max_dp)
+        if new_rad > p_rad + 0.51:
+            old_p = best_p
+            old_score = float(best_obj["consensus"])
+            t_e = time.perf_counter()
+            got_e = _yrefine_coarse_fine(
+                pix, p0, new_rad, coarse_ang,
+                ray_len=ray_len, corridor=corridor, n_bins=n_bins,
+                cx=cx, cy=cy, board_lim=board_lim, obj_name=obj_name,
+                log_tag="expand",
+                origin=p0, max_dp=max_dp,
+            )
+            expand_ms = (time.perf_counter() - t_e) * 1000.0
+            if got_e is not None:
+                new_p = got_e["best_p"]
+                new_score = float(got_e["best_obj"]["consensus"])
+                edge_after = _yrefine_p_on_edge(new_p, p0, new_rad)
+                print(
+                    f"[YREFINE_EXPAND] old_radius={p_rad:.1f} new_radius={new_rad:.1f} "
+                    f"old_best_P=({old_p[0]:.1f},{old_p[1]:.1f}) "
+                    f"new_best_P=({new_p[0]:.1f},{new_p[1]:.1f}) "
+                    f"old_score={old_score:.3f} new_score={new_score:.3f} "
+                    f"edge_before={int(edge_before)} edge_after={int(edge_after)} "
+                    f"expand_ms={expand_ms:.1f}",
+                    flush=True,
+                )
+                if new_score + 1e-9 >= old_score:
+                    best_p = new_p
+                    best_th = got_e["best_th"]
+                    best_sc = got_e["best_sc"]
+                    best_obj = got_e["best_obj"]
+                    p_sum = got_e["p_sum"]
+                    sc_sum_p = got_e["sc_sum"]
+                    obj_sum = got_e["obj_sum"]
+                    coarse_n = int(got_e["coarse_n"])
+                    fine_n = int(got_e["fine_n"])
+                    coarse_ang_evals += coarse_n * n_ang_eval
+                    fine_ang_evals += fine_n * int(got_e["n_ang"])
+                    used_radius = float(new_rad)
+                    expanded = True
+                    fused.yrefine_search_radius = float(new_rad)
+            else:
+                print(
+                    f"[YREFINE_EXPAND] old_radius={p_rad:.1f} new_radius={new_rad:.1f} "
+                    f"empty_grid expand_ms={expand_ms:.1f}",
+                    flush=True,
+                )
+
+    fine_ms = (time.perf_counter() - t_c) * 1000.0 - coarse_ms
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    fused.yfit_ms = float(total_ms)
+    fused.yfit_total = float(best_obj["consensus"])
+    fused.yrefine_p = best_p
+    fused.yrefine_expanded = bool(expanded)
+    fused.yrefine_dir = {}
+    fused.yrefine_scores = {}
+    for cam, th in best_th.items():
+        rad = np.deg2rad(th)
+        vx, vy = float(np.cos(rad)), float(np.sin(rad))
+        nn = float(np.hypot(vx, vy)) or 1.0
+        fused.yrefine_dir[int(cam)] = (vx / nn, vy / nn)
+        fused.yrefine_scores[int(cam)] = float(best_sc.get(cam, 0.0))
+
+    dpx = best_p[0] - p0[0]
+    dpy = best_p[1] - p0[1]
+    delta_p = float(np.hypot(dpx, dpy))
+    ang_deltas = []
+    absurd = False
+    for cam in sorted(best_th.keys()):
+        dth = abs(_yrefine_wrap_delta_deg(best_th[cam], seed_th[cam]))
+        ang_deltas.append(dth)
+        if dth > float(YREFINE_ABSURD_ANG_DEG):
+            absurd = True
+    min_cam = float(YREFINE_MIN_CAM_SUSP if (suspicious or tier != "tight") else YREFINE_MIN_CAM_NORMAL)
+    scores = [float(best_sc.get(c, 0.0)) for c in sorted(best_th.keys())]
+    on_edge = _yrefine_p_on_edge(best_p, p0, used_radius)
+    fused.yrefine_on_edge = bool(on_edge)
+    n_ok = sum(1 for s in scores if s >= min_cam)
+    weak = n_ok < 2
+    new_cons = float(best_obj["consensus"])
+    seed_cons = float(seed_obj["consensus"])
+    improved = new_cons > seed_cons
+    too_far = delta_p > float(max_dp) + 1e-6
+    # FitLine is seed only. Y P is final whenever the refine is valid.
+    # Fallback to FitLine only if the result is unusable (too few cams / no support).
+    valid = (not weak) and math.isfinite(float(best_p[0])) and math.isfinite(float(best_p[1]))
+    accept = bool(valid)
+    print(
+        f"[YREFINE] mode={mode} tier={tier} spread={spread:.1f} "
+        f"P_radius={used_radius:.1f} max_dP={max_dp:.1f} "
+        f"P0=({p0[0]:.1f},{p0[1]:.1f}) P=({best_p[0]:.1f},{best_p[1]:.1f}) "
+        f"coarse_P_count={coarse_n} fine_P_count={fine_n} "
+        f"angle_evals={coarse_ang_evals + fine_ang_evals} "
+        f"coarse_ms={coarse_ms:.1f} fine_ms={fine_ms:.1f} total_ms={total_ms:.1f} "
+        f"delta_P={delta_p:.2f} "
+        f"angle_delta=[{', '.join(f'{d:.1f}' for d in ang_deltas)}] "
+        f"scores={_yrefine_fmt_list(scores)} n_ok={n_ok} "
+        f"valid={int(valid)} accept={int(accept)} edge={int(on_edge)} expanded={int(expanded)} "
+        f"too_far={int(too_far)} weak={int(weak)} improved={int(improved)} "
+        f"absurd={int(absurd)}",
+        flush=True,
+    )
+    print(
+        f"[YREFINE] "
+        f"seed_scores={_yrefine_fmt_list(seed_scores)} "
+        f"new_scores={_yrefine_fmt_list(scores)} "
+        f"seed_mean={seed_obj['mean']:.3f} new_mean={best_obj['mean']:.3f} "
+        f"seed_min={seed_obj['min']:.3f} new_min={best_obj['min']:.3f} "
+        f"seed_geom={seed_obj['geom']:.3f} new_geom={best_obj['geom']:.3f} "
+        f"seed_consensus={seed_cons:.3f} new_consensus={new_cons:.3f} "
+        f"dP={delta_p:.2f} valid={int(valid)} accept={int(accept)}",
+        flush=True,
+    )
+    print(
+        f"[YREFINE][cmp] OLD sum P=({p_sum[0]:.1f},{p_sum[1]:.1f}) "
+        f"scores={_yrefine_fmt_list([sc_sum_p[c] for c in sorted(sc_sum_p)])} "
+        f"consensus={obj_sum['consensus']:.3f} sum={obj_sum['sum']:.3f}",
+        flush=True,
+    )
+    print(
+        f"[YREFINE][cmp] NEW consensus P=({best_p[0]:.1f},{best_p[1]:.1f}) "
+        f"scores={_yrefine_fmt_list(scores)} "
+        f"consensus={new_cons:.3f} sum={best_obj['sum']:.3f}",
+        flush=True,
+    )
+    print(
+        f"[YREFINE] old_ang=[{', '.join(f'{seed_th[c]:.1f}' for c in sorted(seed_th))}] "
+        f"new_ang=[{', '.join(f'{best_th[c]:.1f}' for c in sorted(best_th))}]",
+        flush=True,
+    )
+
+    if not accept:
+        fused.yrefine_accepted = False
+        print("[YREFINE] invalid — keep FitLine", flush=True)
+        return fused
+
+    px, py = best_p
+    fused.yrefine_accepted = True
+    fused.tip_xy = (px, py)
+    fused.stage2_roi_tip_xy = (px, py)
+    ring_cals: List[Optional[BoardCalibration]] = []
+    for r in fused.per_cam:
+        cam = int(r.cam_idx)
+        if board_calibrator is not None:
+            ring_cals.append(board_calibrator.get(cam))
+        if cam not in best_th:
+            continue
+        th = best_th[cam]
+        rad = np.deg2rad(th)
+        vx, vy = float(np.cos(rad)), float(np.sin(rad))
+        nn = float(np.hypot(vx, vy)) or 1.0
+        vx, vy = vx / nn, vy / nn
+        r.tip_xy = (px, py)
+        r.radius_tip = (px, py)
+        r.line_x0 = px
+        r.line_y0 = py
+        r.line_vx = vx
+        r.line_vy = vy
+        r.line_angle_deg = _fitline_angle_deg(vx, vy)
+        r.yfit_support = float(best_sc.get(cam, 0.0))
+    number, zone, score = score_topdown_point(
+        px, py, out_size=FITLINE_SIZE, cals=ring_cals
+    )
+    fused.segment_number = int(number)
+    fused.zone_name = str(zone)
+    fused.score = int(score)
+    if score <= 0:
+        fused.zone_name, fused.score, fused.segment_number = "miss", 0, 0
+        fused.reject_reason = "miss"
+    return fused
+
+
+def save_yrefine_debug(
+    fused: FusedDartResult,
+    empty_refs: Dict[int, np.ndarray],
+    *,
+    raw_frames: Optional[Dict[int, np.ndarray]] = None,
+    board_calibrator: Optional[BoardCalibrator] = None,
+    out_size: int = FITLINE_SIZE,
+) -> Optional[str]:
+    """Scoring-coordinate canvas + dim FitLine + Y rays + FIT/Y/FINAL points."""
+    if not _hit_motion_debug_enabled() or not fused.found:
+        return None
+    _ = empty_refs
+    _ = raw_frames
+    per_cam = {int(r.cam_idx): r for r in fused.per_cam if r.found}
+    size = int(out_size) if out_size > 0 else FITLINE_SIZE
+    cals = _score_cals_for_debug(board_calibrator)
+    p0x, p0y = float(fused.yrefine_p0[0]), float(fused.yrefine_p0[1])
+    if p0x == 0.0 and p0y == 0.0:
+        p0x, p0y = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    ypx, ypy = float(fused.yrefine_p[0]), float(fused.yrefine_p[1])
+    if ypx == 0.0 and ypy == 0.0:
+        ypx, ypy = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    fx, fy = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    canvas, meta = make_scoring_board_canvas(
+        out_size=size,
+        cals=cals,
+        near_points=[(p0x, p0y), (ypx, ypy), (fx, fy)],
+    )
+    rings: Dict[str, float] = meta["rings"]  # type: ignore[assignment]
+    ray = float(rings.get("double_outer", _board_center_and_r(size)[1]))
+
+    by_cam = per_cam
+    for cam, (vx, vy) in fused.yrefine_seed_dir.items():
+        r = by_cam.get(int(cam))
+        ox, oy = _dir_original_unit(float(vx), float(vy), r)
+        color = _hit_debug_cam_color(int(cam))
+        dim = (int(color[0] * 0.35), int(color[1] * 0.35), int(color[2] * 0.35))
+        _draw_fitline_on(canvas, p0x, p0y, ox, oy, dim, thickness=1)
+
+    dirs = fused.yrefine_dir if fused.yrefine_dir else {
+        int(r.cam_idx): (float(r.line_vx), float(r.line_vy))
+        for r in fused.per_cam
+        if r.found
+    }
+    for cam, (vx, vy) in dirs.items():
+        r = by_cam.get(int(cam))
+        ox, oy = _dir_original_unit(float(vx), float(vy), r)
+        color = _hit_debug_cam_color(int(cam))
+        x1 = int(round(ypx + ox * ray))
+        y1 = int(round(ypy + oy * ray))
+        x0 = int(round(ypx - ox * ray * 0.12))
+        y0 = int(round(ypy - oy * ray * 0.12))
+        cv2.line(canvas, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+        sc = float(fused.yrefine_scores.get(int(cam), 0.0))
+        lx = int(round(ypx + ox * 36.0))
+        ly = int(round(ypy + oy * 36.0))
+        cv2.putText(
+            canvas,
+            f"cam{int(cam)} s={sc:.2f}",
+            (lx, ly),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    _draw_marked_point(canvas, (p0x, p0y), (200, 200, 200), radius=3, cross=8)
+    _label_xy(canvas, (p0x, p0y), "FIT", (200, 200, 200), dx=8, dy=-12)
+    ycol = (0, 255, 255) if fused.yrefine_accepted else (0, 140, 255)
+    _draw_marked_point(canvas, (ypx, ypy), ycol, radius=3, cross=8)
+    _label_xy(canvas, (ypx, ypy), "Y", ycol, dx=8, dy=14)
+    cv2.circle(
+        canvas,
+        (int(round(fx)), int(round(fy))),
+        7,
+        (0, 255, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    if abs(fx - ypx) + abs(fy - ypy) > 1.5 or abs(fx - p0x) + abs(fy - p0y) > 1.5:
+        _label_xy(canvas, (fx, fy), "FINAL", (0, 255, 0), dx=-36, dy=-12)
+
+    fit_lab = _hit_score_label(p0x, p0y, out_size=size, cals=cals)
+    y_lab = _hit_score_label(ypx, ypy, out_size=size, cals=cals)
+    final_lab = _zone_short_label(fused.zone_name, int(fused.segment_number))
+    hud = [
+        f"FIT ({p0x:.1f},{p0y:.1f}) {fit_lab}",
+        f"Y   ({ypx:.1f},{ypy:.1f}) {y_lab}",
+        f"FINAL {final_lab}",
+        f"dP={float(np.hypot(ypx - p0x, ypy - p0y)):.2f} "
+        f"accept={int(fused.yrefine_accepted)} {fused.yrefine_mode}",
+    ]
+    near_wires: Dict[int, float] = meta["near_wires"]  # type: ignore[assignment]
+    if near_wires:
+        wi, dist = min(near_wires.items(), key=lambda kv: kv[1])
+        hud.append(f"wire {_wire_pair_label(wi)}  {dist:.2f}deg")
+    _draw_hud_lines(canvas, hud)
+
+    print(
+        f"FIT ({p0x:.1f},{p0y:.1f}) {fit_lab}  "
+        f"Y ({ypx:.1f},{ypy:.1f}) {y_lab}  FINAL {final_lab}",
+        flush=True,
+    )
+    stamp = time.strftime("%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    label = _zone_short_label(fused.zone_name, fused.segment_number)
+    stem = f"hit_{stamp}_{ms:03d}_{label}"
+    motion_dir = os.path.join(_debug_dir_path(), "motion")
+    try:
+        os.makedirs(motion_dir, exist_ok=True)
+    except OSError:
+        motion_dir = _debug_dir_path()
+    path = os.path.join(motion_dir, f"{stem}_yrefine.png")
+    _safe_imwrite(path, canvas)
+    print(f"[yrefine] debug {path}", flush=True)
+    return path
+
+
+def save_yfit_debug(
+    fused: FusedDartResult,
+    empty_refs: Dict[int, np.ndarray],
+    *,
+    raw_frames: Optional[Dict[int, np.ndarray]] = None,
+    board_calibrator: Optional[BoardCalibrator] = None,
+    out_size: int = FITLINE_SIZE,
+) -> Optional[str]:
+    """Scoring-coordinate canvas + shared P + short per-cam rays."""
+    if not _hit_motion_debug_enabled() or not fused.found:
+        return None
+    _ = empty_refs
+    _ = raw_frames
+    per_cam = list(fused.per_cam)
+    size = int(out_size) if out_size > 0 else FITLINE_SIZE
+    cals = _score_cals_for_debug(board_calibrator)
+    px, py = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    canvas, meta = make_scoring_board_canvas(
+        out_size=size,
+        cals=cals,
+        near_points=[(px, py)],
+    )
+    rings: Dict[str, float] = meta["rings"]  # type: ignore[assignment]
+    ray = float(rings.get("double_outer", 120.0))
+    hud = [
+        f"YFIT ({px:.1f},{py:.1f}) {_hit_score_label(px, py, out_size=size, cals=cals)}",
+        f"Y={fused.yfit_total:.2f}  {fused.yfit_ms:.0f}ms",
+    ]
+    near_wires: Dict[int, float] = meta["near_wires"]  # type: ignore[assignment]
+    if near_wires:
+        wi, dist = min(near_wires.items(), key=lambda kv: kv[1])
+        hud.append(f"wire {_wire_pair_label(wi)}  {dist:.2f}deg")
+    for r in per_cam:
+        if not r.found:
+            continue
+        x0, y0, vx, vy = _fitline_original_xyv(r)
+        color = _hit_debug_cam_color(r.cam_idx)
+        x1 = int(round(px + vx * ray))
+        y1 = int(round(py + vy * ray))
+        cv2.line(
+            canvas,
+            (int(round(px)), int(round(py))),
+            (x1, y1),
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        hud.append(f"cam{int(r.cam_idx)} s={r.yfit_support:.2f}")
+    _draw_marked_point(canvas, (px, py), (0, 255, 255), radius=3, cross=8)
+    _draw_hud_lines(canvas, hud)
+    stamp = time.strftime("%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    label = _zone_short_label(fused.zone_name, fused.segment_number)
+    stem = f"hit_{stamp}_{ms:03d}_{label}"
+    motion_dir = os.path.join(_debug_dir_path(), "motion")
+    try:
+        os.makedirs(motion_dir, exist_ok=True)
+    except OSError:
+        motion_dir = _debug_dir_path()
+    path = os.path.join(motion_dir, f"{stem}_yfit.png")
+    cv2.imwrite(path, canvas)
+    print(f"[yfit] debug {path}", flush=True)
+    return path
+
+
+def save_distance_yfit_debug(
+    fused: FusedDartResult,
+    empty_refs: Dict[int, np.ndarray],
+    *,
+    raw_frames: Optional[Dict[int, np.ndarray]] = None,
+    board_calibrator: Optional[BoardCalibrator] = None,
+    out_size: int = FITLINE_SIZE,
+    missing_cams: Optional[List[int]] = None,
+) -> Optional[str]:
+    """Scoring-board canvas + DYFIT P + usable rays + consensus HUD."""
+    if not _hit_motion_debug_enabled() or not fused.found:
+        return None
+    _ = empty_refs
+    _ = raw_frames
+    per_cam = list(fused.per_cam)
+    size = int(out_size) if out_size > 0 else FITLINE_SIZE
+    cals = _score_cals_for_debug(board_calibrator)
+    px, py = float(fused.tip_xy[0]), float(fused.tip_xy[1])
+    canvas, meta = make_scoring_board_canvas(
+        out_size=size,
+        cals=cals,
+        near_points=[(px, py)],
+    )
+    rings: Dict[str, float] = meta["rings"]  # type: ignore[assignment]
+    ray = float(_dyfit.RAY_LENGTH)
+    _ = rings
+    usable = [int(c) for c in fused.cam_indices]
+    miss = [int(c) for c in (missing_cams or [])]
+    if not miss:
+        seen = {int(r.cam_idx) for r in per_cam}
+        miss = sorted(int(c) for c in seen if c not in set(usable))
+    hud = [
+        f"DYFIT ({px:.1f},{py:.1f}) {_hit_score_label(px, py, out_size=size, cals=cals)}",
+        f"usable_cams={usable}",
+        f"consensus={fused.yfit_total:.3f}  {fused.yfit_ms:.1f}ms",
+    ]
+    used_set = set(usable)
+    drawn = set()
+    for r in per_cam:
+        cam = int(r.cam_idx)
+        if cam in used_set and r.found:
+            _x0, _y0, vx, vy = _fitline_original_xyv(r)
+            color = _hit_debug_cam_color(cam)
+            x1 = int(round(px + vx * ray))
+            y1 = int(round(py + vy * ray))
+            cv2.line(
+                canvas,
+                (int(round(px)), int(round(py))),
+                (x1, y1),
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            hud.append(f"cam{cam} s={float(r.yfit_support):.2f}")
+            drawn.add(cam)
+        else:
+            hud.append(f"cam{cam} = missing")
+            print(f"[DYFIT] cam{cam} = missing", flush=True)
+            drawn.add(cam)
+    for cam in miss:
+        if cam not in drawn:
+            hud.append(f"cam{cam} = missing")
+            print(f"[DYFIT] cam{cam} = missing", flush=True)
+    _draw_marked_point(canvas, (px, py), (0, 255, 255), radius=3, cross=8)
+    _draw_hud_lines(canvas, hud)
+    stamp = time.strftime("%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    label = _zone_short_label(fused.zone_name, fused.segment_number)
+    stem = f"hit_{stamp}_{ms:03d}_{label}"
+    motion_dir = os.path.join(_debug_dir_path(), "motion")
+    try:
+        os.makedirs(motion_dir, exist_ok=True)
+    except OSError:
+        motion_dir = _debug_dir_path()
+    path = os.path.join(motion_dir, f"{stem}_distance_yfit.png")
+    cv2.imwrite(path, canvas)
+    print(f"[dyfit] debug {path}", flush=True)
+    return path
 
 
 def detect_dart_on_topdown(
@@ -2689,6 +5264,20 @@ def detect_dart_on_topdown(
             motion_pixels=n_px,
             diff_mean=diff_mean,
             reject_reason="low_motion",
+            motion_gray=mask.copy(),
+            motion_raw=raw_diff.copy(),
+        )
+    if _motion_is_speckle(mask):
+        if save_debug:
+            _save_motion_debug(
+                cam_idx, mask, motion_pixels=n_px, diff_mean=diff_mean, status="no_blob"
+            )
+        return DartDetectResult(
+            cam_idx=cam_idx,
+            found=False,
+            motion_pixels=n_px,
+            diff_mean=diff_mean,
+            reject_reason="no_blob",
             motion_gray=mask.copy(),
             motion_raw=raw_diff.copy(),
         )
@@ -2751,7 +5340,7 @@ def detect_dart_on_topdown(
     number, zone, score = 0, "miss", 0
     if draw_fused_tip is not None:
         number, zone, score = score_topdown_point(
-            draw_fused_tip[0], draw_fused_tip[1], out_size=w, cal=cal
+            draw_fused_tip[0], draw_fused_tip[1], out_size=w, cal=cal, log_geom=False
         )
 
     debug = None
@@ -3055,6 +5644,13 @@ def fuse_multicam_lines(
             )
         return FusedDartResult(found=False, per_cam=per_cam, reject_reason="no_lines")
 
+    if len(line_cams) < int(FUSE_MIN_CAMS):
+        print(
+            f"[fuse] need_2cam n={len(line_cams)} — 1 line cannot locate a tip",
+            flush=True,
+        )
+        return FusedDartResult(found=False, per_cam=per_cam, reject_reason="need_2cam")
+
     # Scoring / board geometry match detection warp (= FITLINE_SIZE), not preview.
     board_center, board_r = _board_center_and_r(FITLINE_SIZE)
     # Uniform resize of full frame — same scale for all cams; use first cam's actual dims.
@@ -3074,7 +5670,12 @@ def fuse_multicam_lines(
         perf["fuse1"] = fuse1_ms
         perf["stage1"] = fuse1_ms
     if tip_ds is None:
-        return FusedDartResult(found=False, per_cam=per_cam, reject_reason="no_intersect")
+        reason = "no_intersect"
+        if len(all_line_cams) >= 2 and _max_line_cross(all_line_cams) < float(
+            FUSE_MIN_CROSS_2CAM
+        ):
+            reason = "parallel_lines"
+        return FusedDartResult(found=False, per_cam=per_cam, reject_reason=reason)
 
     stage1_tip_ds = (float(tip_ds[0]), float(tip_ds[1]))
     for r in all_line_cams:
@@ -3173,10 +5774,15 @@ def fuse_multicam_lines(
     tip_ds, residual, line_cams = _estimate_fused_tip_ds(all_line_cams, board_center_ds)
     _lap("fuse2", t_fuse2)
     if tip_ds is None:
+        reason = "no_intersect"
+        if len(all_line_cams) >= 2 and _max_line_cross(all_line_cams) < float(
+            FUSE_MIN_CROSS_2CAM
+        ):
+            reason = "parallel_lines"
         return FusedDartResult(
             found=False,
             per_cam=per_cam,
-            reject_reason="no_intersect",
+            reject_reason=reason,
             fitq_pair_spread=fitq_pair_spread,
             fitq_suspicious=fitq_suspicious,
             fitq_recovery_cam=fitq_recovery_cam,
@@ -3298,32 +5904,15 @@ def _estimate_fused_tip_ds(
     with; drops a fleeing outlier so one bad FitLine cannot dominate.
     """
     cams = list(line_cams)
-    tip_ds: Optional[Tuple[float, float]] = None
-    residual = 0.0
-    if len(cams) == 1:
-        r0 = cams[0]
-        tip_ds = _point_on_line_closest_to(
-            r0.line_x0,
-            r0.line_y0,
-            r0.line_vx,
-            r0.line_vy,
-            board_center_ds[0],
-            board_center_ds[1],
+    if len(cams) < 2:
+        return None, 0.0, cams
+    tip_ds, residual, cams = _fuse_tip_from_best_pair(cams, board_center_ds)
+    if tip_ds is None:
+        return None, 0.0, list(line_cams)
+    if len(cams) >= 3:
+        cams, tip_ds, residual = _fuse_drop_outlier_cam(
+            cams, tip_ds, residual, board_center_ds
         )
-        residual = 0.0
-    else:
-        tip_ds, residual, cams = _fuse_tip_from_best_pair(cams, board_center_ds)
-        if tip_ds is None:
-            cams = list(line_cams)
-            lines = [(r.line_x0, r.line_y0, r.line_vx, r.line_vy) for r in cams]
-            tip_ds, residual = intersect_lines_least_squares(
-                lines, board_center=board_center_ds
-            )
-        # Safety net: if consensus kept 3 but one still flees badly, drop it.
-        if tip_ds is not None and len(cams) >= 3:
-            cams, tip_ds, residual = _fuse_drop_outlier_cam(
-                cams, tip_ds, residual, board_center_ds
-            )
     return tip_ds, float(residual), cams
 
 
@@ -3336,7 +5925,7 @@ def _stage2_refit_lines_near_tip(
     scale_x: float,
     scale_y: float,
 ) -> None:
-    """In-place stage-2 FitLine: soft intensity inside tip circle only (no CC)."""
+    """In-place stage-2 FitLine: shaft CC in tip ROI, else original ROI PCA."""
     tip_orig = _map_ds_xy_to_original(tip_ds[0], tip_ds[1], scale_x, scale_y)
     radius_orig = float(radius_ds) * max(0.5 * (scale_x + scale_y), 1e-9)
     for r in line_cams:
@@ -3350,29 +5939,38 @@ def _stage2_refit_lines_near_tip(
         bc_cam = _map_original_xy_to_ds(
             board_center_orig[0], board_center_orig[1], sx, sy
         )
-        refined = _refit_fitline_near_tip(ds, tip_cam, r_cam, bc_cam)
-        if refined is None:
+        fallback = _refit_fitline_near_tip(ds, tip_cam, r_cam, bc_cam)
+        shaft_line, sel_xs, sel_ys, rej_xs, rej_ys = _select_shaft_components_stage2(
+            ds, tip_cam, r_cam, bc_cam, cam_idx=int(r.cam_idx)
+        )
+        r.shaft_sel_xs = sel_xs
+        r.shaft_sel_ys = sel_ys
+        r.shaft_rej_xs = rej_xs
+        r.shaft_rej_ys = rej_ys
+        chosen = shaft_line if shaft_line is not None else fallback
+        if chosen is None:
             continue
-        r.centerline_old_ds = (
-            float(refined[0]),
-            float(refined[1]),
-            float(refined[2]),
-            float(refined[3]),
-        )
-        chosen, bin_pts, accepted, reason, cand = _centerline_refit_stage2(
-            ds,
-            tip_cam,
-            r_cam,
-            refined,
-            bc_cam,
-            cam_idx=int(r.cam_idx),
-            scale_x=sx,
-            scale_y=sy,
-        )
-        r.centerline_pts_ds = list(bin_pts)
-        r.centerline_cand_ds = cand
-        r.centerline_accepted = bool(accepted)
-        r.centerline_reject_reason = str(reason)
+        if DEBUG_CENTERLINE_REFIT:
+            r.centerline_old_ds = (
+                float(chosen[0]),
+                float(chosen[1]),
+                float(chosen[2]),
+                float(chosen[3]),
+            )
+            _c, bin_pts, _acc, _reason, cand = _centerline_refit_stage2(
+                ds,
+                tip_cam,
+                r_cam,
+                chosen,
+                bc_cam,
+                cam_idx=int(r.cam_idx),
+                scale_x=sx,
+                scale_y=sy,
+            )
+            r.centerline_pts_ds = list(bin_pts)
+            r.centerline_cand_ds = cand
+            r.centerline_accepted = False
+            r.centerline_reject_reason = "debug_only_not_applied"
         vx, vy, x0, y0 = chosen
         r.line_vx = float(vx)
         r.line_vy = float(vy)
@@ -3765,6 +6363,169 @@ class DartMotionDetector:
 
     def _max_motion_pixels(self, per_cam: List[DartDetectResult]) -> int:
         return max((r.motion_pixels for r in per_cam), default=0)
+
+    def detect_yfit(
+        self,
+        board_calibrator: BoardCalibrator,
+        frames: Dict[int, Optional[np.ndarray]],
+    ) -> FusedDartResult:
+        """Joint Y-FIT on 3 warped motion layers. Does not call FitLine."""
+        t0 = time.perf_counter()
+        layers: List[DartDetectResult] = []
+        for cam_idx, frame in frames.items():
+            if frame is None:
+                continue
+            cal = board_calibrator.get(cam_idx)
+            if cal is None or not cal.is_valid() or cal.double_ellipse is None:
+                continue
+            warped = _warp_frame(board_calibrator, int(cam_idx), frame, cal)
+            ref = self._refs.get(int(cam_idx))
+            if warped is None or ref is None:
+                layers.append(
+                    DartDetectResult(
+                        cam_idx=int(cam_idx),
+                        found=False,
+                        reject_reason="no_ref" if ref is None else "warp_fail",
+                    )
+                )
+                continue
+            layers.append(
+                extract_yfit_motion_layer(warped, ref, cam_idx=int(cam_idx))
+            )
+        board_center, board_r = _board_center_and_r(FITLINE_SIZE)
+        usable = [r for r in layers if r.fit_ds_gray is not None and r.motion_pixels >= MOTION_MIN_PIXELS]
+        if len(usable) < 2:
+            return FusedDartResult(
+                found=False, per_cam=layers, reject_reason="no_motion", yfit_ms=(time.perf_counter() - t0) * 1000.0
+            )
+        p_xy, dirs, total, yfit_prof = run_yfit_search(
+            usable, board_center=board_center, board_r=board_r
+        )
+        yfit_ms = (time.perf_counter() - t0) * 1000.0
+        print(
+            f"[YFIT][prof] bbox=({yfit_prof['bbox_x0']:.0f},{yfit_prof['bbox_y0']:.0f})-"
+            f"({yfit_prof['bbox_x1']:.0f},{yfit_prof['bbox_y1']:.0f}) "
+            f"coarse_P={yfit_prof['coarse_P_count']:.0f} "
+            f"coarse_angle_evals={yfit_prof['coarse_angle_evals']:.0f} "
+            f"coarse_ms={yfit_prof['coarse_ms']:.1f} "
+            f"fine_P={yfit_prof['fine_P_count']:.0f} "
+            f"fine_angle_evals={yfit_prof['fine_angle_evals']:.0f} "
+            f"fine_ms={yfit_prof['fine_ms']:.1f} "
+            f"total_yfit_ms={yfit_prof['total_yfit_ms']:.1f}",
+            flush=True,
+        )
+        if p_xy is None or total < float(YFIT_MIN_TOTAL):
+            print(
+                f"[YFIT] fail total={total:.3f} ms={yfit_ms:.1f} cams={len(usable)}",
+                flush=True,
+            )
+            return FusedDartResult(
+                found=False,
+                per_cam=layers,
+                reject_reason="yfit_low_score",
+                yfit_total=float(total),
+                yfit_ms=yfit_ms,
+            )
+        fused = yfit_to_fused(
+            layers,
+            p_xy,
+            dirs,
+            total,
+            board_calibrator=board_calibrator,
+            yfit_ms=yfit_ms,
+        )
+        print(
+            f"[YFIT] P=({p_xy[0]:.1f},{p_xy[1]:.1f}) total={total:.3f} "
+            f"ms={yfit_ms:.1f} "
+            + " ".join(
+                f"cam{c}={dirs[c][2]:.2f}" for c in sorted(dirs)
+            ),
+            flush=True,
+        )
+        return fused
+
+    def detect_distance_yfit(
+        self,
+        board_calibrator: BoardCalibrator,
+        frames: Dict[int, Optional[np.ndarray]],
+    ) -> FusedDartResult:
+        """warpPolar distance-Y on separate warped motion layers (final_v2).
+
+        FitLine is not used for P. Caller falls back to FitLine/Y-refine if invalid.
+        """
+        t0 = time.perf_counter()
+        mode = "distance_yfit"
+        layers: List[DartDetectResult] = []
+        motion: Dict[int, np.ndarray] = {}
+        for cam_idx, frame in frames.items():
+            if frame is None:
+                continue
+            cal = board_calibrator.get(cam_idx)
+            if cal is None or not cal.is_valid() or cal.double_ellipse is None:
+                continue
+            warped = _warp_frame(board_calibrator, int(cam_idx), frame, cal)
+            ref = self._refs.get(int(cam_idx))
+            if warped is None or ref is None:
+                layers.append(
+                    DartDetectResult(
+                        cam_idx=int(cam_idx),
+                        found=False,
+                        reject_reason="no_ref" if ref is None else "warp_fail",
+                    )
+                )
+                continue
+            layer = extract_yfit_motion_layer(warped, ref, cam_idx=int(cam_idx))
+            layers.append(layer)
+            soft = layer.fit_ds_gray if layer.fit_ds_gray is not None else layer.fit_gray
+            if soft is not None:
+                motion[int(cam_idx)] = soft
+
+        board_center, _board_r = _board_center_and_r(FITLINE_SIZE)
+        est = _dyfit.estimate_dart_tip_distance_yfit(
+            motion,
+            board_center=board_center,
+            board_radius=float(_dyfit.MAX_IMPACT_RADIUS),
+        )
+        dyfit_ms = (time.perf_counter() - t0) * 1000.0
+        seen = {int(r.cam_idx) for r in layers}
+        missing = sorted(c for c in seen if c not in set(est.usable_cams))
+        for cam in missing:
+            print(f"[DYFIT] cam{int(cam)} = missing", flush=True)
+        print(
+            f"[DYFIT][prof] estimator={mode} usable={est.usable_cams} missing={missing} "
+            f"mask={est.mask_ms:.1f}ms dist={est.distance_transform_ms:.1f}ms "
+            f"seed={est.seed_ms:.1f}ms coarse={est.coarse_ms:.1f}ms "
+            f"fine={est.fine_ms:.1f}ms total={est.runtime_ms:.1f}ms wall={dyfit_ms:.1f}ms",
+            flush=True,
+        )
+        if not est.valid:
+            print(
+                f"[DYFIT] fail {est.reject_reason or 'invalid'} "
+                f"score={est.score:.3f} ms={dyfit_ms:.1f} usable={est.usable_cams}",
+                flush=True,
+            )
+            return FusedDartResult(
+                found=False,
+                per_cam=layers,
+                reject_reason=est.reject_reason or "dyfit_fail",
+                yfit_total=float(est.score),
+                yfit_ms=dyfit_ms,
+                yrefine_mode=mode,
+            )
+        fused = dyfit_estimate_to_fused(
+            layers, est, board_calibrator=board_calibrator, mode=mode
+        )
+        fused.yfit_ms = dyfit_ms
+        print(
+            f"[DYFIT] P=({est.x:.1f},{est.y:.1f}) consensus={est.score:.3f} "
+            f"ms={dyfit_ms:.1f} usable_cams={est.usable_cams} "
+            + " ".join(
+                f"cam{c}={est.per_cam_score.get(c, 0.0):.2f}"
+                for c in sorted(est.usable_cams)
+            ),
+            flush=True,
+        )
+        return fused
 
     def detect_cam(
         self,
@@ -4247,26 +7008,108 @@ class DartMotionDetector:
             wait_since_arm_ms = (t_proc - self._arm_t0) * 1000.0
         # Soft-threshold FitLine po kameri (downscaled) → tip = sjecište u ds, map natrag.
         t_detect = time.perf_counter()
-        per_cam = self.detect_all(board_calibrator, fire_frames, save_debug=False)
-        detect_ms = (time.perf_counter() - t_detect) * 1000.0
         fuse_perf: Dict[str, float] = {}
-        fused = fuse_multicam_lines(
-            per_cam, board_calibrator=board_calibrator, perf=fuse_perf
-        )
-        fused.per_cam = per_cam
-        fused = _apply_ml_tip_cached(fused, per_cam, board_calibrator)
+        fitline_debug_saved = False
+        dyfit_used = False
+        if _distance_yfit_enabled():
+            fused = self.detect_distance_yfit(board_calibrator, fire_frames)
+            per_cam = list(fused.per_cam)
+            detect_ms = (time.perf_counter() - t_detect) * 1000.0
+            fuse_perf["stage1"] = 0.0
+            fuse_perf["fuse1"] = 0.0
+            fuse_perf["stage2"] = float(fused.yfit_ms)
+            fuse_perf["fuse2"] = 0.0
+            fuse_perf["score"] = 0.0
+            if fused.found:
+                dyfit_used = True
+            else:
+                print(
+                    f"[DYFIT] fail {fused.reject_reason or 'unknown'} "
+                    f"— fallback {DART_DETECTOR_MODE}",
+                    flush=True,
+                )
+                t_detect = time.perf_counter()
+                fuse_perf = {}
+        if not dyfit_used:
+            if DART_DETECTOR_MODE == "yfit":
+                fused = self.detect_yfit(board_calibrator, fire_frames)
+                per_cam = list(fused.per_cam)
+                detect_ms = (time.perf_counter() - t_detect) * 1000.0
+                fuse_perf["stage1"] = 0.0
+                fuse_perf["fuse1"] = 0.0
+                fuse_perf["stage2"] = float(fused.yfit_ms)
+                fuse_perf["fuse2"] = 0.0
+                fuse_perf["score"] = 0.0
+            else:
+                per_cam = self.detect_all(board_calibrator, fire_frames, save_debug=False)
+                detect_ms = (time.perf_counter() - t_detect) * 1000.0
+                fused = fuse_multicam_lines(
+                    per_cam, board_calibrator=board_calibrator, perf=fuse_perf
+                )
+                fused.per_cam = per_cam
+                fused = _apply_ml_tip_cached(fused, per_cam, board_calibrator)
+                skip_refine = (not fused.found) or fused.reject_reason in (
+                    "miss_majority",
+                    "off_board_raw",
+                )
+                if DART_DETECTOR_MODE == "hybrid" and fused.found and not skip_refine:
+                    if save_debug and _hit_motion_debug_enabled():
+                        save_hit_fusion_debug(
+                            fused,
+                            self._empty_refs,
+                            raw_frames=fire_frames,
+                            board_calibrator=board_calibrator,
+                        )
+                        fitline_debug_saved = True
+                    t_yr = time.perf_counter()
+                    try:
+                        fused = run_yrefine_local(
+                            fused, board_calibrator=board_calibrator
+                        )
+                    except Exception as exc:
+                        print(f"[YREFINE] fail {exc!r} — keep FitLine", flush=True)
+                    fuse_perf["yrefine"] = (time.perf_counter() - t_yr) * 1000.0
         total_processing_ms = (time.perf_counter() - t_proc) * 1000.0
         total_arm_to_result_ms = (
             (time.perf_counter() - self._arm_t0) * 1000.0 if self._arm_t0 > 0.0 else total_processing_ms
         )
         # Debug / raw-shaft shadow nakon UI-ja — ne smiju blokirati prikaz hita.
         if save_debug and fused.found and _hit_motion_debug_enabled():
-            save_hit_fusion_debug(
-                fused,
-                self._empty_refs,
-                raw_frames=fire_frames,
-                board_calibrator=board_calibrator,
-            )
+            if dyfit_used:
+                save_distance_yfit_debug(
+                    fused,
+                    self._empty_refs,
+                    raw_frames=fire_frames,
+                    board_calibrator=board_calibrator,
+                )
+            elif DART_DETECTOR_MODE == "yfit":
+                save_yfit_debug(
+                    fused,
+                    self._empty_refs,
+                    raw_frames=fire_frames,
+                    board_calibrator=board_calibrator,
+                )
+            elif DART_DETECTOR_MODE == "hybrid":
+                save_yrefine_debug(
+                    fused,
+                    self._empty_refs,
+                    raw_frames=fire_frames,
+                    board_calibrator=board_calibrator,
+                )
+                if not fitline_debug_saved:
+                    save_hit_fusion_debug(
+                        fused,
+                        self._empty_refs,
+                        raw_frames=fire_frames,
+                        board_calibrator=board_calibrator,
+                    )
+            else:
+                save_hit_fusion_debug(
+                    fused,
+                    self._empty_refs,
+                    raw_frames=fire_frames,
+                    board_calibrator=board_calibrator,
+                )
 
         self._motion_state = "post_fire"
         self._armed_frames = 0
@@ -4281,7 +7124,17 @@ class DartMotionDetector:
                 f"stage2={float(fuse_perf.get('stage2', 0.0)):.1f}ms\n"
                 f"fuse2={float(fuse_perf.get('fuse2', 0.0)):.1f}ms\n"
                 f"score={float(fuse_perf.get('score', 0.0)):.1f}ms\n"
-                f"total_processing={total_processing_ms:.1f}ms\n"
+                + (
+                    f"yrefine={float(fuse_perf.get('yrefine', 0.0)):.1f}ms\n"
+                    if "yrefine" in fuse_perf
+                    else ""
+                )
+                + (
+                    f"dyfit={float(fused.yfit_ms):.1f}ms\n"
+                    if dyfit_used
+                    else ""
+                )
+                + f"total_processing={total_processing_ms:.1f}ms\n"
                 f"total_arm_to_result={total_arm_to_result_ms:.1f}ms",
                 flush=True,
             )
@@ -4398,6 +7251,453 @@ def _consensus_fuse_smoke_test() -> None:
     )
 
 
+def _yrefine_noise_smoke_test() -> None:
+    """Bright dart survives; faint specks — even 8-connected trails — are dropped."""
+    img = np.zeros((64, 64), dtype=np.float32)
+    img[20:28, 10:40] = 0.85
+    for i in range(8):
+        img[40 + (i % 2), 8 + i * 6] = 0.12
+    out, n_keep, n_all = _yrefine_keep_dart_motion(img)
+    dart = int(np.count_nonzero(out[20:28, 10:40] > 0))
+    specks = int(np.count_nonzero(out[38:44, :] > 0))
+    assert dart >= 20, f"denoise smoke: dart pixels {dart}"
+    assert specks == 0, f"denoise smoke: distant specks kept {specks}"
+
+    trail = np.zeros((64, 64), dtype=np.float32)
+    trail[20:28, 10:40] = 0.85
+    for i in range(14):
+        trail[28 + i, 39] = 0.15
+    out2, k2, a2 = _yrefine_keep_dart_motion(trail)
+    far = int(np.count_nonzero(out2[32:48, 37:42] > 0))
+    near_dart = int(np.count_nonzero(out2[20:28, 10:40] > 0))
+    assert near_dart >= 20, f"denoise smoke: attached dart lost {near_dart}"
+    assert far == 0, f"denoise smoke: attached trail kept {far} (kept={k2}/{a2})"
+
+    beside = np.zeros((64, 64), dtype=np.float32)
+    beside[20:28, 10:40] = 0.85
+    beside[12:16, 22:26] = 0.90
+    out3, k3, a3 = _yrefine_keep_dart_motion(beside)
+    dart3 = int(np.count_nonzero(out3[20:28, 10:40] > 0))
+    sat = int(np.count_nonzero(out3[12:16, 22:26] > 0))
+    assert dart3 >= 20, f"denoise smoke: dart lost next to satellite {dart3}"
+    assert sat == 0, f"denoise smoke: bright satellite kept {sat} (kept={k3}/{a3})"
+    print(
+        f"[yrefine noise smoke] OK kept={n_keep}/{n_all} trail_kept={k2}/{a2} "
+        f"sat_kept={k3}/{a3}",
+        flush=True,
+    )
+
+
+def _fuse_geometry_smoke_test() -> None:
+    """1-cam and near-parallel 2-cam must not invent a tip."""
+    one = [
+        DartDetectResult(
+            cam_idx=0,
+            found=True,
+            line_x0=160.0,
+            line_y0=40.0,
+            line_vx=0.2,
+            line_vy=1.0,
+            motion_pixels=80,
+        )
+    ]
+    tip, _res, _kept = _estimate_fused_tip_ds(one, board_center_ds=(150.0, 150.0))
+    assert tip is None, f"1-cam fuse must not project to center, got {tip}"
+
+    para = [
+        DartDetectResult(
+            cam_idx=0,
+            found=True,
+            line_x0=200.0,
+            line_y0=100.0,
+            line_vx=1.0,
+            line_vy=0.02,
+            motion_pixels=80,
+        ),
+        DartDetectResult(
+            cam_idx=2,
+            found=True,
+            line_x0=200.0,
+            line_y0=108.0,
+            line_vx=1.0,
+            line_vy=0.01,
+            motion_pixels=80,
+        ),
+    ]
+    tip2, _r2, _k2 = _fuse_tip_from_best_pair(para, board_center=(150.0, 150.0))
+    assert tip2 is None, f"parallel 2-cam must not intersect, got {tip2}"
+
+    good = [
+        DartDetectResult(
+            cam_idx=0,
+            found=True,
+            line_x0=150.0,
+            line_y0=150.0,
+            line_vx=1.0,
+            line_vy=0.0,
+            motion_pixels=80,
+        ),
+        DartDetectResult(
+            cam_idx=2,
+            found=True,
+            line_x0=150.0,
+            line_y0=150.0,
+            line_vx=0.0,
+            line_vy=1.0,
+            motion_pixels=80,
+        ),
+    ]
+    tip3, _r3, _k3 = _fuse_tip_from_best_pair(good, board_center=(150.0, 150.0))
+    assert tip3 is not None, "crossing 2-cam should intersect"
+    err = float(np.hypot(tip3[0] - 150.0, tip3[1] - 150.0))
+    assert err < 1.0, f"crossing 2-cam tip={tip3} err={err:.2f}"
+    print("[fuse geometry smoke] OK need_2cam + parallel_2cam + crossing_2cam", flush=True)
+
+
+def _yrefine_flee_gate_smoke_test() -> None:
+    """Y-refine only when a used FitLine misses the fused tip."""
+    concurrent = FusedDartResult(
+        found=True,
+        tip_xy=(150.0, 150.0),
+        cam_indices=[0, 2, 4],
+        per_cam=[
+            DartDetectResult(
+                cam_idx=0, found=True, line_x0=150.0, line_y0=150.0, line_vx=1.0, line_vy=0.0
+            ),
+            DartDetectResult(
+                cam_idx=2, found=True, line_x0=150.0, line_y0=150.0, line_vx=0.0, line_vy=1.0
+            ),
+            DartDetectResult(
+                cam_idx=4, found=True, line_x0=150.0, line_y0=150.0, line_vx=0.7, line_vy=0.7
+            ),
+        ],
+    )
+    need, max_flee, _d = _fitline_needs_yrefine(concurrent)
+    assert not need, f"concurrent 3-cam should skip Y, max_flee={max_flee:.2f}"
+
+    two = FusedDartResult(
+        found=True,
+        tip_xy=(150.0, 150.0),
+        cam_indices=[0, 2],
+        per_cam=[
+            DartDetectResult(
+                cam_idx=0, found=True, line_x0=150.0, line_y0=150.0, line_vx=1.0, line_vy=0.0
+            ),
+            DartDetectResult(
+                cam_idx=2, found=True, line_x0=150.0, line_y0=150.0, line_vx=0.0, line_vy=1.0
+            ),
+        ],
+    )
+    need_two, max_two, _dt = _fitline_needs_yrefine(two)
+    assert need_two, f"2-cam must run Y even if concurrent, max_flee={max_two:.2f}"
+
+    fleer = FusedDartResult(
+        found=True,
+        tip_xy=(150.0, 150.0),
+        cam_indices=[0, 2, 4],
+        per_cam=[
+            DartDetectResult(
+                cam_idx=0, found=True, line_x0=150.0, line_y0=150.0, line_vx=1.0, line_vy=0.0
+            ),
+            DartDetectResult(
+                cam_idx=2, found=True, line_x0=150.0, line_y0=150.0, line_vx=0.0, line_vy=1.0
+            ),
+            DartDetectResult(
+                cam_idx=4, found=True, line_x0=156.0, line_y0=150.0, line_vx=0.0, line_vy=1.0
+            ),
+        ],
+    )
+    need2, max_flee2, _d2 = _fitline_needs_yrefine(fleer)
+    assert need2, f"fleeing line should run Y, max_flee={max_flee2:.2f}"
+    assert max_flee2 >= float(YREFINE_FLEE_PX)
+    print(
+        f"[yrefine flee gate smoke] OK skip3={max_flee:.2f} run2cam={max_two:.2f} "
+        f"run_flee={max_flee2:.2f}",
+        flush=True,
+    )
+
+
+def _blob_gate_smoke_test() -> None:
+    speckle = np.zeros((80, 80), dtype=np.uint8)
+    for i in range(50):
+        speckle[4 + (i * 3) % 70, 5 + (i * 7) % 70] = 255
+    dart = np.zeros((80, 80), dtype=np.uint8)
+    dart[24:34, 12:52] = 255
+    thin = np.zeros((80, 80), dtype=np.uint8)
+    thin[40, 20:38] = 255  # 18 px shaft — must still count as a hit cam
+    assert _motion_is_speckle(speckle), "speckle field should reject"
+    assert not _motion_is_speckle(dart), "dart blob should pass"
+    assert not _motion_is_speckle(thin), "thin shaft should pass"
+    kept = _keep_large_motion_ccs(speckle, min_area=int(MOTION_MIN_BLOB_AREA))
+    assert int(np.count_nonzero(kept)) == 0, "speckle must be stripped from debug"
+    print(
+        f"[blob gate smoke] OK speckle={_motion_cc_stats(speckle)} "
+        f"dart={_motion_cc_stats(dart)} thin={_motion_cc_stats(thin)}",
+        flush=True,
+    )
+
+
+def _dyfit_blank() -> np.ndarray:
+    return np.zeros((FITLINE_SIZE, FITLINE_SIZE), dtype=np.uint8)
+
+
+def _dyfit_stroke_ray(
+    img: np.ndarray,
+    p: Tuple[float, float],
+    theta_deg: float,
+    length: float,
+    *,
+    thickness: int = 2,
+    value: int = 220,
+    skip: float = 0.0,
+    dash_on: float = 0.0,
+    dash_off: float = 0.0,
+    blob_u: float = 0.0,
+    blob_r: int = 0,
+) -> None:
+    px, py = float(p[0]), float(p[1])
+    rad = float(np.deg2rad(theta_deg))
+    vx, vy = float(np.cos(rad)), float(np.sin(rad))
+    if dash_on > 0.0:
+        t = float(skip)
+        while t < float(length):
+            t1 = min(t + float(dash_on), float(length))
+            cv2.line(
+                img,
+                (int(round(px + vx * t)), int(round(py + vy * t))),
+                (int(round(px + vx * t1)), int(round(py + vy * t1))),
+                int(value),
+                int(thickness),
+            )
+            t = t1 + float(dash_off if dash_off > 0.0 else dash_on)
+    else:
+        cv2.line(
+            img,
+            (int(round(px + vx * skip)), int(round(py + vy * skip))),
+            (int(round(px + vx * length)), int(round(py + vy * length))),
+            int(value),
+            int(thickness),
+        )
+    if blob_r > 0 and blob_u > 0.0:
+        cv2.circle(
+            img,
+            (int(round(px + vx * blob_u)), int(round(py + vy * blob_u))),
+            int(blob_r),
+            int(value),
+            -1,
+        )
+
+
+def _dyfit_test_layer(cam: int, img: np.ndarray, *, usable: bool = True) -> DartDetectResult:
+    n = int(np.count_nonzero(img))
+    return DartDetectResult(
+        cam_idx=int(cam),
+        found=False,
+        motion_pixels=n if usable else 0,
+        reject_reason="" if usable else "low_motion",
+        fit_gray=img,
+        fit_ds_gray=img,
+    )
+
+
+def _dyfit_search_p(
+    layers: List[DartDetectResult],
+) -> Tuple[Optional[Tuple[float, float]], float, List[int], float]:
+    motion: Dict[int, np.ndarray] = {}
+    for r in layers:
+        if r.reject_reason == "low_motion":
+            continue
+        g = r.fit_ds_gray if r.fit_ds_gray is not None else r.fit_gray
+        if g is None:
+            continue
+        motion[int(r.cam_idx)] = g
+    board_center, _br = _board_center_and_r(FITLINE_SIZE)
+    est = _dyfit.estimate_dart_tip_distance_yfit(
+        motion,
+        board_center=board_center,
+        board_radius=float(_dyfit.MAX_IMPACT_RADIUS),
+    )
+    return est.point, float(est.score), list(est.usable_cams), float(est.runtime_ms)
+
+
+def _distance_yfit_smoke_test() -> None:
+    """Synthetic layers + standalone-vs-production P match on fused_motion_raw."""
+    p_true = (150.0, 150.0)
+    th = {0: 0.0, 2: 90.0, 4: 225.0}
+    length = 52.0
+
+    def _three(*, skip: float = 0.0, dash: bool = False, flight: bool = False, drop: Optional[int] = None):
+        layers: List[DartDetectResult] = []
+        for cam, theta in th.items():
+            img = _dyfit_blank()
+            if drop is not None and int(cam) == int(drop):
+                layers.append(_dyfit_test_layer(cam, img, usable=False))
+                continue
+            _dyfit_stroke_ray(
+                img,
+                p_true,
+                theta,
+                length,
+                skip=skip,
+                dash_on=6.0 if dash else 0.0,
+                dash_off=4.0 if dash else 0.0,
+                blob_u=48.0 if flight and cam == 0 else 0.0,
+                blob_r=11 if flight and cam == 0 else 0,
+            )
+            layers.append(_dyfit_test_layer(cam, img))
+        return layers
+
+    p3, tot3, u3, ms3 = _dyfit_search_p(_three())
+    assert p3 is not None, "3-cam DYFIT should find P"
+    err3 = float(np.hypot(p3[0] - p_true[0], p3[1] - p_true[1]))
+    assert err3 <= 4.0, f"3-cam P={p3} err={err3:.2f}"
+    assert sorted(u3) == [0, 2, 4], f"usable {u3}"
+
+    p24, tot24, u24, _ms = _dyfit_search_p(_three(drop=0))
+    assert p24 is not None, "cam2+cam4 should locate P"
+    err24 = float(np.hypot(p24[0] - p_true[0], p24[1] - p_true[1]))
+    assert err24 <= 6.0, f"cam2+cam4 P={p24} err={err24:.2f}"
+    assert sorted(u24) == [2, 4]
+    drift24 = float(np.hypot(p24[0] - p3[0], p24[1] - p3[1]))
+    assert drift24 <= 6.0, f"P drifted {drift24:.2f}px when cam0 vanished"
+
+    p02, tot02, u02, _ms = _dyfit_search_p(_three(drop=4))
+    assert p02 is not None, "cam0+cam2 should locate P"
+    err02 = float(np.hypot(p02[0] - p_true[0], p02[1] - p_true[1]))
+    assert err02 <= 6.0, f"cam0+cam2 P={p02} err={err02:.2f}"
+    assert sorted(u02) == [0, 2]
+
+    p_fl, tot_fl, _u, _ms = _dyfit_search_p(_three(flight=True))
+    assert p_fl is not None, "flight-blob case should find P"
+    err_fl = float(np.hypot(p_fl[0] - p_true[0], p_fl[1] - p_true[1]))
+    assert err_fl <= 6.0, f"flight blob pulled P to {p_fl} err={err_fl:.2f}"
+
+    p_fr, tot_fr, _u, _ms = _dyfit_search_p(_three(dash=True))
+    assert p_fr is not None, "fragmented shaft should find P"
+    err_fr = float(np.hypot(p_fr[0] - p_true[0], p_fr[1] - p_true[1]))
+    assert err_fr <= 6.0, f"fragmented P={p_fr} err={err_fr:.2f}"
+
+    p_h, tot_h, _u, _ms = _dyfit_search_p(_three(skip=8.0))
+    assert p_h is not None, "tip hole should still find P"
+    err_h = float(np.hypot(p_h[0] - p_true[0], p_h[1] - p_true[1]))
+    assert err_h <= 8.0, f"tip-hole P={p_h} err={err_h:.2f}"
+
+    only0 = [
+        _three()[0],
+        _dyfit_test_layer(2, _dyfit_blank(), usable=False),
+        _dyfit_test_layer(4, _dyfit_blank(), usable=False),
+    ]
+    p1, tot1, u1, _ms = _dyfit_search_p(only0)
+    assert p1 is None, f"1-cam must fail, got P={p1}"
+    assert len(u1) < 2
+
+    print(
+        f"[distance_yfit smoke] OK 3cam={err3:.2f}px 2+4={err24:.2f} 0+2={err02:.2f} "
+        f"flight={err_fl:.2f} frag={err_fr:.2f} hole={err_h:.2f} "
+        f"ms3={ms3:.1f} c3={tot3:.3f} c24={tot24:.3f} c02={tot02:.3f} cfl={tot_fl:.3f}",
+        flush=True,
+    )
+
+    import importlib.util
+
+    v2_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "distance_yfit_warppolar_final_v2.py")
+    spec = importlib.util.spec_from_file_location("distance_yfit_warppolar_final_v2", v2_path)
+    assert spec is not None and spec.loader is not None
+    v2 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(v2)
+
+    def _paint_fused(drop=None, flight=False, dash=False, skip=0.0):
+        canvas = np.zeros((FITLINE_SIZE, FITLINE_SIZE, 3), dtype=np.uint8)
+        colors = {0: (0, 0, 255), 2: (0, 255, 0), 4: (255, 255, 0)}
+        for cam, theta in th.items():
+            if drop is not None and int(cam) == int(drop):
+                continue
+            tmp = _dyfit_blank()
+            _dyfit_stroke_ray(
+                tmp,
+                p_true,
+                theta,
+                length,
+                skip=skip,
+                dash_on=6.0 if dash else 0.0,
+                dash_off=4.0 if dash else 0.0,
+                blob_u=48.0 if flight and cam == 0 else 0.0,
+                blob_r=11 if flight and cam == 0 else 0,
+            )
+            col = np.array(colors[cam], dtype=np.uint8)
+            canvas[tmp > 0] = col
+        return canvas
+
+    cases = {
+        "3cam": _paint_fused(),
+        "cam2+cam4": _paint_fused(drop=0),
+        "cam0+cam2": _paint_fused(drop=4),
+        "flight": _paint_fused(flight=True),
+        "frag": _paint_fused(dash=True),
+        "hole": _paint_fused(skip=8.0),
+    }
+    compare_errs = []
+    compare_ms = []
+    for label, bgr in cases.items():
+        st, *_ = v2.run_yfit(bgr)
+        prod = _dyfit.estimate_from_fused_debug_png(bgr)
+        assert prod.valid, f"{label} production invalid, standalone P={st.p}"
+        err = float(np.hypot(prod.x - float(st.p[0]), prod.y - float(st.p[1])))
+        compare_errs.append(err)
+        compare_ms.append(float(prod.runtime_ms))
+        print(
+            f"[DYFIT][compare] {label} standalone=({st.p[0]:.1f},{st.p[1]:.1f}) "
+            f"prod=({prod.x:.1f},{prod.y:.1f}) err={err:.2f}px "
+            f"usable={prod.usable_cams} score={prod.score:.3f}/{st.score:.3f} "
+            f"mask={prod.mask_ms:.1f} seed={prod.seed_ms:.1f} "
+            f"coarse={prod.coarse_ms:.1f} fine={prod.fine_ms:.1f} total={prod.runtime_ms:.1f}",
+            flush=True,
+        )
+        assert err <= 0.51, f"{label} production P drifted {err:.2f}px from standalone"
+        assert abs(float(prod.score) - float(st.score)) < 1e-4, f"{label} score mismatch"
+
+    motion_dir = os.path.join(_debug_dir_path(), "motion")
+    n_png = 0
+    if os.path.isdir(motion_dir):
+        raws = sorted(f for f in os.listdir(motion_dir) if f.endswith("_fused_motion_raw.png"))
+        for name in raws:
+            path = os.path.join(motion_dir, name)
+            bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+            try:
+                st, *_ = v2.run_yfit(bgr)
+            except Exception as exc:
+                print(f"[DYFIT][compare] {name} standalone fail {exc!r}", flush=True)
+                continue
+            prod = _dyfit.estimate_from_fused_debug_png(bgr)
+            assert prod.valid, f"{name} production invalid, standalone P={st.p}"
+            err = float(np.hypot(prod.x - float(st.p[0]), prod.y - float(st.p[1])))
+            compare_errs.append(err)
+            compare_ms.append(float(prod.runtime_ms))
+            n_png += 1
+            print(
+                f"[DYFIT][compare] {name} standalone=({st.p[0]:.1f},{st.p[1]:.1f}) "
+                f"prod=({prod.x:.1f},{prod.y:.1f}) err={err:.2f}px "
+                f"usable={prod.usable_cams} score={prod.score:.3f} "
+                f"mask={prod.mask_ms:.1f} seed={prod.seed_ms:.1f} "
+                f"coarse={prod.coarse_ms:.1f} fine={prod.fine_ms:.1f} total={prod.runtime_ms:.1f}",
+                flush=True,
+            )
+            assert err <= 0.51, f"{name} production P drifted {err:.2f}px from standalone"
+    print(
+        f"[distance_yfit compare] OK synthetic={len(cases)} png={n_png} "
+        f"max_err={max(compare_errs):.2f}px mean_ms={float(np.mean(compare_ms)):.1f} "
+        f"max_ms={max(compare_ms):.1f}",
+        flush=True,
+    )
+
+
 if __name__ == "__main__":
     _fitline_smoke_test()
     _consensus_fuse_smoke_test()
+    _fuse_geometry_smoke_test()
+    _yrefine_flee_gate_smoke_test()
+    _blob_gate_smoke_test()
+    _yrefine_noise_smoke_test()
+    _distance_yfit_smoke_test()

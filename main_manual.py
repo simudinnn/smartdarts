@@ -2110,12 +2110,59 @@ def main():
         action="store_true",
         help="Use fake_cams/cam_0,cam_2,cam_4 images instead of USB cameras",
     )
+    parser.add_argument(
+        "--yfit",
+        action="store_true",
+        help="Use experimental Y-FIT detector instead of FitLine (also SMARTDARTS_DETECTOR=yfit)",
+    )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="FitLine seed + local Y-refine (default; also SMARTDARTS_DETECTOR=hybrid)",
+    )
+    parser.add_argument(
+        "--fitline",
+        action="store_true",
+        help="FitLine-only detector (disable hybrid Y-refine)",
+    )
+    parser.add_argument(
+        "--distance-yfit",
+        action="store_true",
+        help="Experimental warpPolar distance-Y estimator (SMARTDARTS_TIP_ESTIMATOR=distance_yfit)",
+    )
+    parser.add_argument(
+        "--distance-yfit-standalone",
+        action="store_true",
+        help="Alias for --distance-yfit (no FitLine seed; P comes only from distance_yfit)",
+    )
     args = parser.parse_args()
 
     fake_cams_dir = default_fake_cams_dir() if args.fakecams else None
     if fake_cams_dir is not None and not os.path.isdir(fake_cams_dir):
         print(f"[cam] --fakecams: folder ne postoji: {fake_cams_dir}", flush=True)
         return
+    if args.fitline:
+        detector_mode = "fitline"
+    elif args.yfit:
+        detector_mode = "yfit"
+    else:
+        detector_mode = "hybrid"
+    os.environ["SMARTDARTS_DETECTOR"] = detector_mode
+    import dart_detection as _dd
+
+    _dd.DART_DETECTOR_MODE = detector_mode
+    if args.distance_yfit_standalone or args.distance_yfit:
+        tip_mode = "distance_yfit"
+    else:
+        tip_mode = str(_dd.DART_TIP_ESTIMATOR)
+    _dd.DART_TIP_ESTIMATOR = tip_mode
+    _dd.DART_TIP_MODE = tip_mode
+    os.environ["SMARTDARTS_TIP_ESTIMATOR"] = tip_mode
+    os.environ["SMARTDARTS_TIP_MODE"] = tip_mode
+    print(
+        f"[dart] DART_DETECTOR_MODE={detector_mode} DART_TIP_ESTIMATOR={tip_mode}",
+        flush=True,
+    )
 
     if args.gui and not args.legacy_gui:
         try:

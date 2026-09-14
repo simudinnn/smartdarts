@@ -125,6 +125,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "KALIBRACIJA",
         "calibrate": "KALIBRIRAJ",
         "calibrating": "KALIBRIRAM...",
+        "calibrating_hint": "Tražim ploču na kamerama",
+        "starting_game": "POKREĆEM IGRU",
+        "starting_game_hint": "Kalibracija i priprema detekcije",
+        "please_wait": "Pričekajte",
+        "select_game_sub": "Odaberi način igre",
         "cal_incomplete": "Kalibracija nepotpuna — pokušaj ponovo",
         "ingame_cal_title": "PONOVI KALIBRACIJU?",
         "ingame_cal_s1": "Program loše detektira hitove?",
@@ -362,6 +367,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "CALIBRATION",
         "calibrate": "CALIBRATE",
         "calibrating": "CALIBRATING...",
+        "calibrating_hint": "Finding the board on cameras",
+        "starting_game": "STARTING GAME",
+        "starting_game_hint": "Calibration and detection setup",
+        "please_wait": "Please wait",
+        "select_game_sub": "Choose a game mode",
         "cal_incomplete": "Calibration incomplete — try again",
         "ingame_cal_title": "RECALIBRATE?",
         "ingame_cal_s1": "Hits not detecting well?",
@@ -597,6 +607,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "KALIBRIERUNG",
         "calibrate": "KALIBRIEREN",
         "calibrating": "KALIBRIERE...",
+        "calibrating_hint": "Suche das Board auf den Kameras",
+        "starting_game": "SPIEL STARTET",
+        "starting_game_hint": "Kalibrierung und Vorbereitung",
+        "please_wait": "Bitte warten",
+        "select_game_sub": "Spielmodus wählen",
         "cal_incomplete": "Kalibrierung unvollständig — erneut versuchen",
         "ingame_cal_title": "NEU KALIBRIEREN?",
         "ingame_cal_s1": "Treffer werden schlecht erkannt?",
@@ -833,6 +848,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "CALIBRAGE",
         "calibrate": "CALIBRER",
         "calibrating": "CALIBRAGE...",
+        "calibrating_hint": "Recherche de la cible sur les caméras",
+        "starting_game": "LANCEMENT DU JEU",
+        "starting_game_hint": "Calibrage et préparation",
+        "please_wait": "Veuillez patienter",
+        "select_game_sub": "Choisissez un mode",
         "cal_incomplete": "Calibration incomplète — réessayez",
         "ingame_cal_title": "RECALIBRER ?",
         "ingame_cal_s1": "Les touches sont mal détectées ?",
@@ -1069,6 +1089,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "CALIBRAZIONE",
         "calibrate": "CALIBRA",
         "calibrating": "CALIBRAZIONE...",
+        "calibrating_hint": "Cerco il bersaglio sulle telecamere",
+        "starting_game": "AVVIO PARTITA",
+        "starting_game_hint": "Calibrazione e preparazione",
+        "please_wait": "Attendere",
+        "select_game_sub": "Scegli una modalità",
         "cal_incomplete": "Calibrazione incompleta — riprova",
         "ingame_cal_title": "RICALIBRARE?",
         "ingame_cal_s1": "I tiri non vengono rilevati bene?",
@@ -1304,6 +1329,11 @@ _I18N: Dict[str, Dict[str, str]] = {
         "calibration": "CALIBRACIÓN",
         "calibrate": "CALIBRAR",
         "calibrating": "CALIBRANDO...",
+        "calibrating_hint": "Buscando la diana en las cámaras",
+        "starting_game": "INICIANDO PARTIDA",
+        "starting_game_hint": "Calibración y preparación",
+        "please_wait": "Espera un momento",
+        "select_game_sub": "Elige un modo de juego",
         "cal_incomplete": "Calibración incompleta — inténtalo de nuevo",
         "ingame_cal_title": "¿RECALIBRAR?",
         "ingame_cal_s1": "¿Los dardos se detectan mal?",
@@ -1916,6 +1946,14 @@ QLabel#SettingsSection {{
     color: #c8c8d0;
     font-size: 32px;
     font-weight: 700;
+}}
+QFrame#Card {{
+    background-color: rgba(10, 10, 16, 210);
+    border: 2px solid {btn_border};
+    border-radius: 24px;
+}}
+QWidget#LoadingOverlay {{
+    background-color: rgba(0, 0, 0, 188);
 }}
 """
     # Footer themed block uses Primary button fill — force dark gray border back for gray Footer.

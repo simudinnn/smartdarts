@@ -2,7 +2,7 @@
 
 Collect on the Pi (same 3 frames + hints the live button used):
 
-    set SMARTDARTS_CAL_SNAPSHOT=1
+    CAL_SNAPSHOT_ENABLED = True  in board_calibration.py
     press KALIBRIRAJ
 
 Then:

@@ -52,13 +52,15 @@ WARP_SIZE = 320
 WARP_BOARD_RADIUS_FRAC = 0.82
 WARP_VIEW_RADIUS_FRAC = 0.98
 WARP_OUTSIDE_EXTRAPOL = 0.28
-# Standardni omjeri prstenova (udaljenost / vanjski double rub = 170 mm).
+# WDF/PDC metal-wire radii / 170 mm face. Homography dest + scoring use these.
 RING_DOUBLE_OUTER_FRAC = 1.0
-RING_DOUBLE_INNER_FRAC = 161.0 / 170.0
-RING_TRIPLE_OUTER_FRAC = 108.0 / 170.0
-RING_TRIPLE_INNER_FRAC = 98.0 / 170.0
-RING_BULL_OUTER_FRAC = 16.9 / 170.0
+RING_DOUBLE_INNER_FRAC = 162.0 / 170.0
+RING_TRIPLE_OUTER_FRAC = 107.0 / 170.0
+RING_TRIPLE_INNER_FRAC = 99.0 / 170.0
+RING_BULL_OUTER_FRAC = 15.9 / 170.0
 RING_BULL_INNER_FRAC = 6.35 / 170.0
+# Warp RG residual vs RING_*: keep 1–5 px bias, reject wild colour bands.
+HOMOGRAPHY_RING_MAX_DEV_PX = 5.0
 BOARD_SISAL_EDGE_FRAC = 225.0 / 170.0
 DOUBLE_RING_SAMPLE_INNER = 1
 DOUBLE_RING_SAMPLE_OUTER = 1
@@ -78,25 +80,26 @@ BOARD_SEGMENT_NUMBERS: Tuple[int, ...] = (
     20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5,
 )
 SEG20_OVERLAY_BGR = (255, 60, 0)
-SEG20_OVERLAY_ALPHA = 0.52
+SEG20_OVERLAY_ALPHA = 0.60
 # Segment 20 na vrhu: lijeva zica 351°, desna 9° (12h=0°, clockwise).
 SEG20_LEFT_WIRE_DST_DEG = (360.0 - SEGMENT_STEP_DEG * 0.5) % 360.0
 DEBUG_WARP_SIZE = 200
+# Must match dart_detection.FITLINE_SIZE — scoring theta/rings/wires live here.
+FINAL_GEOM_DEBUG_SIZE = 300
 EDGE_REFINE_RANGE_DEG = 6.0
 EDGE_REFINE_STEP_DEG = 0.5
 CANNY_LOW = 40
 CANNY_HIGH = 120
 CALIBRATION_FILENAME = "board_calibration.json"
-# Production default False: do not write Canny/masked/wires/topdown PNGs.
-# Manual enable: set True here, or SMARTDARTS_CAL_DEBUG=1 in the environment.
-DEBUG_SAVE_CANNY_EDGES = False
-if os.environ.get("SMARTDARTS_CAL_DEBUG", "").strip().lower() in ("1", "true", "yes"):
-    DEBUG_SAVE_CANNY_EDGES = True
-CAL_SNAPSHOT_ENABLED = os.environ.get("SMARTDARTS_CAL_SNAPSHOT", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# Canny/masked/wires/topdown PNGs in debug_edges/. Flip True to dump.
+DEBUG_SAVE_CANNY_EDGES = True
+# Save KALIBRIRAJ frames + hints to debug_calibration/ for replay.
+CAL_SNAPSHOT_ENABLED = True
+# Experimental warp: one global projective homography from many board landmarks.
+# "legacy" = Stage1 H + Stage2 egg→circle (production).
+# "homography_landmarks" = cv2.findHomography(RANSAC) + single warpPerspective.
+# Override: SMARTDARTS_CAL_MODE=legacy|homography_landmarks
+CALIBRATION_MODE = os.environ.get("SMARTDARTS_CAL_MODE", "homography_landmarks").strip().lower()
 
 
 def _perf_ms(t0: float) -> float:
@@ -139,6 +142,12 @@ class BoardCalibration:
     # Stage1 omjeri pojasa (inner/outer) za 4-ring Stage2; 0 = koristi RING_* default.
     stage2_double_inner_ratio: float = 0.0
     stage2_triple_inner_ratio: float = 0.0
+    # Experimental: single camera→topdown homography (9 floats row-major).
+    warp_mode: str = "legacy"
+    landmark_H: Optional[Tuple[float, ...]] = None
+    landmark_H_size: int = 0
+    # segment20_offset baked into landmark_H at fit time. Nudge rotates dest about center.
+    landmark_H_offset: int = 0
 
     def is_valid(self) -> bool:
         return self.confidence >= 0.42 and self.bull_radius > 1.5
@@ -161,6 +170,14 @@ class BoardCalibration:
 
     def has_ring_align_warp(self) -> bool:
         return self.warp1_double_outer is not None and self.warp_ring_size > 0
+
+    def has_landmark_homography(self) -> bool:
+        return (
+            str(self.warp_mode) == "homography_landmarks"
+            and self.landmark_H is not None
+            and len(self.landmark_H) == 9
+            and int(self.landmark_H_size) > 0
+        )
 
 
 def _is_calibration_complete(cal: Optional[BoardCalibration]) -> bool:
@@ -534,44 +551,187 @@ def standard_ring_radii(double_outer_r: float) -> Dict[str, float]:
     }
 
 
+def _nominal_ring_fracs() -> Tuple[float, float, float, float]:
+    return (
+        float(RING_DOUBLE_OUTER_FRAC),
+        float(RING_DOUBLE_INNER_FRAC),
+        float(RING_TRIPLE_OUTER_FRAC),
+        float(RING_TRIPLE_INNER_FRAC),
+    )
+
+
+def _ring_fracs_from_ellipses(
+    ellipses: Dict[str, Ellipse],
+    board_r: float,
+) -> Tuple[float, float, float, float]:
+    br = max(float(board_r), 1e-6)
+    return (
+        _mean_ellipse_semi(ellipses["double_outer"]) / br,
+        _mean_ellipse_semi(ellipses["double_inner"]) / br,
+        _mean_ellipse_semi(ellipses["triple_outer"]) / br,
+        _mean_ellipse_semi(ellipses["triple_inner"]) / br,
+    )
+
+
+def _ring_fracs_sane(
+    fracs: Tuple[float, float, float, float],
+    *,
+    board_r: Optional[float] = None,
+) -> bool:
+    """True if warp-measured D/T fracs are a small residual, not a wrong band."""
+    d_out, d_in, t_out, t_in = (float(x) for x in fracs)
+    br = float(board_r) if board_r is not None and board_r > 1.0 else 120.0
+    max_dev = float(HOMOGRAPHY_RING_MAX_DEV_PX) / max(br, 80.0)
+    for val, nom in zip((d_out, d_in, t_out, t_in), _nominal_ring_fracs()):
+        if abs(val - nom) > max_dev:
+            return False
+    if not (t_in + 0.012 < t_out < d_in < d_out):
+        return False
+    if (d_out - d_in) < 0.018 or (t_out - t_in) < 0.018:
+        return False
+    return True
+
+
+def _measured_fracs_of(cal: "BoardCalibration") -> Optional[Tuple[float, float, float, float]]:
+    if cal.measured_double_outer_frac < 0.45:
+        return None
+    return (
+        float(cal.measured_double_outer_frac),
+        float(cal.measured_double_inner_frac),
+        float(cal.measured_triple_outer_frac),
+        float(cal.measured_triple_inner_frac),
+    )
+
+
+def _median_sane_ring_fracs(
+    live: List["BoardCalibration"],
+    *,
+    board_r: Optional[float] = None,
+) -> Optional[Tuple[float, float, float, float]]:
+    rows: List[Tuple[float, float, float, float]] = []
+    for cal in live:
+        tup = _measured_fracs_of(cal)
+        if tup is not None and _ring_fracs_sane(tup, board_r=board_r):
+            rows.append(tup)
+    if not rows:
+        return None
+    arr = np.median(np.asarray(rows, dtype=np.float64), axis=0)
+    return (float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3]))
+
+
+def _rings_from_fracs(
+    board_r: float,
+    fracs: Tuple[float, float, float, float],
+) -> Dict[str, float]:
+    d_out, d_in, t_out, t_in = fracs
+    br = float(board_r)
+    return {
+        "double_outer": br * d_out,
+        "double_inner": br * d_in,
+        "triple_outer": br * t_out,
+        "triple_inner": br * t_in,
+        "bull_outer": br * RING_BULL_OUTER_FRAC,
+        "bull_inner": br * RING_BULL_INNER_FRAC,
+        "sisal_edge": br * BOARD_SISAL_EDGE_FRAC,
+    }
+
+
+def _concentric_ring_ellipses(
+    out_size: int,
+    fracs: Tuple[float, float, float, float],
+) -> Dict[str, Ellipse]:
+    cx, _, board_r = _warp_radii(int(out_size))
+    d_out, d_in, t_out, t_in = fracs
+    return {
+        "double_outer": _circle_as_ellipse(cx, cx, board_r * d_out),
+        "double_inner": _circle_as_ellipse(cx, cx, board_r * d_in),
+        "triple_outer": _circle_as_ellipse(cx, cx, board_r * t_out),
+        "triple_inner": _circle_as_ellipse(cx, cx, board_r * t_in),
+    }
+
+
 def scoring_ring_radii(
     out_size: int,
     cal: Optional["BoardCalibration"] = None,
     cals: Optional[List[Optional["BoardCalibration"]]] = None,
 ) -> Dict[str, float]:
-    """Radijusi za scoring/overlay: izmjereni na warpu ako postoje, inače standardni omjeri."""
+    """Radijusi za scoring/overlay: izmjereni na warpu ako postoje, inače standardni omjeri.
+
+    Landmark dest: median RG-fit (sane, ~±5 px vs RING_*). Overlay i score
+    dijele iste krugove — blob-sjecište na pravom tripleu mora dati T, ne S.
+    """
     _, _, board_r = _warp_radii(int(out_size))
-    fracs: List[Tuple[float, float, float, float]] = []
     candidates: List[Optional[BoardCalibration]] = []
     if cal is not None:
         candidates.append(cal)
     if cals:
         candidates.extend(cals)
-    for c in candidates:
-        if c is not None and c.measured_double_outer_frac >= 0.45:
-            fracs.append(
-                (
-                    float(c.measured_double_outer_frac),
-                    float(c.measured_double_inner_frac),
-                    float(c.measured_triple_outer_frac),
-                    float(c.measured_triple_inner_frac),
-                )
-            )
+    live = [c for c in candidates if c is not None]
+    if _cals_use_landmark_dest(live):
+        sane = _median_sane_ring_fracs(live, board_r=board_r)
+        if sane is not None:
+            return _rings_from_fracs(board_r, sane)
+        return standard_ring_radii(board_r)
+    fracs: List[Tuple[float, float, float, float]] = []
+    for c in live:
+        tup = _measured_fracs_of(c)
+        if tup is not None:
+            fracs.append(tup)
     if fracs:
         arr = np.median(np.asarray(fracs, dtype=np.float64), axis=0)
-        d_out, d_in, t_out, t_in = (float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3]))
-        rings = {
-            "double_outer": board_r * d_out,
-            "double_inner": board_r * d_in,
-            "triple_outer": board_r * t_out,
-            "triple_inner": board_r * t_in,
-            "bull_outer": board_r * RING_BULL_OUTER_FRAC,
-            "bull_inner": board_r * RING_BULL_INNER_FRAC,
-            "sisal_edge": board_r * BOARD_SISAL_EDGE_FRAC,
-        }
-    else:
-        rings = standard_ring_radii(board_r)
-    return rings
+        return _rings_from_fracs(
+            board_r,
+            (float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])),
+        )
+    return standard_ring_radii(board_r)
+
+
+def _landmark_H_from_obj(obj: object) -> Optional[Tuple[float, ...]]:
+    if not isinstance(obj, (list, tuple)) or len(obj) != 9:
+        return None
+    try:
+        vals = tuple(float(x) for x in obj)
+    except (TypeError, ValueError):
+        return None
+    return vals
+
+
+def _homography_rotation_about(cx: float, cy: float, angle_deg: float) -> np.ndarray:
+    """3x3 dest rotation about (cx, cy). Positive angle = OpenCV CCW (y down)."""
+    a = math.radians(float(angle_deg))
+    c = math.cos(a)
+    s = math.sin(a)
+    return np.array(
+        [
+            [c, -s, float(cx) - c * float(cx) + s * float(cy)],
+            [s, c, float(cy) - s * float(cx) - c * float(cy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _scaled_landmark_H(cal: "BoardCalibration", out_size: int) -> Optional[np.ndarray]:
+    """Camera→topdown H at ``out_size``. Dest scales with (size-1) so center stays (n-1)/2.
+
+    Segment-20 arrow nudges rotate dest about the canvas center so the photo
+    moves immediately (same as legacy Stage1 H rebuild) without refitting H.
+    """
+    if not cal.has_landmark_homography() or cal.landmark_H is None:
+        return None
+    H = np.array(cal.landmark_H, dtype=np.float64).reshape(3, 3)
+    old = int(cal.landmark_H_size)
+    new = int(out_size)
+    if old > 1 and old != new:
+        s = float(new - 1) / float(max(1, old - 1))
+        S = np.array([[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        H = S @ H
+    delta = (int(cal.segment20_offset) - int(cal.landmark_H_offset)) % SEGMENT_COUNT
+    if delta != 0:
+        cx_out, _view_r, _board_r = _warp_radii(new if new > 1 else old)
+        # +1 offset → dest theta -= 18° → OpenCV angle -18° (12h moves toward 11).
+        H = _homography_rotation_about(cx_out, cx_out, -float(delta) * SEGMENT_STEP_DEG) @ H
+    return H
 
 
 def _ellipse_to_dict(ellipse: Ellipse) -> dict:
@@ -633,8 +793,24 @@ def scoring_ring_ellipses(
     cal: Optional["BoardCalibration"] = None,
     cals: Optional[List[Optional["BoardCalibration"]]] = None,
 ) -> Optional[Dict[str, Ellipse]]:
-    """Jajaste elipse double/triple na warpu (skalirane na out_size)."""
+    """Jajaste elipse double/triple na warpu (skalirane na out_size).
+
+    Landmark dest: koncentrični krugovi iz istih sane RG-fracs kao scoring_ring_radii.
+    """
     size = int(out_size)
+    live: List[BoardCalibration] = []
+    if cal is not None:
+        live.append(cal)
+    if cals:
+        for c in cals:
+            if c is not None:
+                live.append(c)
+    if _cals_use_landmark_dest(live):
+        _, _, board_r = _warp_radii(size)
+        sane = _median_sane_ring_fracs(live, board_r=board_r)
+        if sane is None:
+            return _nominal_final_ring_ellipses(size)
+        return _concentric_ring_ellipses(size, sane)
     candidates: List[BoardCalibration] = []
     if cal is not None and cal.has_warp_ring_ellipses():
         candidates.append(cal)
@@ -696,6 +872,233 @@ def _segment_slot_from_theta(theta_deg: float, segment20_offset: int = 0) -> int
     return (slot - int(segment20_offset)) % SEGMENT_COUNT
 
 
+def _circular_mean_deg(vals: List[float]) -> float:
+    if not vals:
+        return 0.0
+    s = sum(math.sin(math.radians(float(v))) for v in vals)
+    c = sum(math.cos(math.radians(float(v))) for v in vals)
+    return math.degrees(math.atan2(s, c)) % 360.0
+
+
+def _ang_abs_delta_deg(a: float, b: float) -> float:
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def _theta_in_clockwise_arc(theta_deg: float, a0: float, a1: float) -> bool:
+    span = (float(a1) - float(a0)) % 360.0
+    rel = (float(theta_deg) - float(a0)) % 360.0
+    if span <= 1e-6:
+        return True
+    return rel < span
+
+
+def _segment_slot_from_wires(
+    theta_deg: float,
+    wire_thetas_deg: Tuple[float, ...],
+) -> Tuple[int, float, float, float]:
+    """Theta (0°=gore, CW) između kalibriranih topdown žica.
+
+    ``wire_thetas_deg[0]`` = lijeva žica segmenta 20, zatim clockwise.
+    Slot k (žica k → k+1) = BOARD_SEGMENT_NUMBERS[k].
+    """
+    n = min(len(wire_thetas_deg), SEGMENT_COUNT)
+    th = float(theta_deg) % 360.0
+    if n < 8:
+        slot = _segment_slot_from_theta(th, 0)
+        nom = (SEG20_LEFT_WIRE_DST_DEG + slot * SEGMENT_STEP_DEG) % 360.0
+        return slot, nom, (nom + SEGMENT_STEP_DEG) % 360.0, 9.0
+    wires = [float(wire_thetas_deg[k]) % 360.0 for k in range(n)]
+    for k in range(n):
+        a0 = wires[k]
+        a1 = wires[(k + 1) % n]
+        if _theta_in_clockwise_arc(th, a0, a1):
+            nearest = min(_ang_abs_delta_deg(th, a0), _ang_abs_delta_deg(th, a1))
+            return k % SEGMENT_COUNT, a0, a1, nearest
+    slot = _segment_slot_from_theta(th, 0)
+    a0 = wires[slot % n]
+    a1 = wires[(slot + 1) % n]
+    nearest = min(_ang_abs_delta_deg(th, a0), _ang_abs_delta_deg(th, a1))
+    return slot, a0, a1, nearest
+
+
+def _topdown_theta_of_src_point(
+    cal: "BoardCalibration",
+    src_xy: Tuple[float, float],
+    out_size: int,
+) -> Optional[float]:
+    """Kamera-točka → theta na finalnom topdownu (0°=gore, clockwise)."""
+    if cal.double_ellipse is None or not cal.has_wires():
+        return None
+    size = int(out_size)
+    H_lm = _scaled_landmark_H(cal, size)
+    if H_lm is not None:
+        mapped = _homography_map_xy(H_lm, float(src_xy[0]), float(src_xy[1]))
+        if mapped is None:
+            return None
+        cx_out, _view_r, _board_r = _warp_radii(size)
+        dx, dy = mapped[0] - cx_out, mapped[1] - cx_out
+        if abs(dx) + abs(dy) < 1e-6:
+            return None
+        return math.degrees(math.atan2(dx, -dy)) % 360.0
+    H = _homography_topdown_seg20(
+        cal.center,
+        cal.double_ellipse,
+        cal.wire_angles_deg,
+        size,
+        cal.segment20_offset,
+    )
+    if H is None:
+        return None
+    pts = np.array([[[float(src_xy[0]), float(src_xy[1])]]], dtype=np.float32)
+    try:
+        dst = cv2.perspectiveTransform(pts, H.astype(np.float64))
+    except cv2.error:
+        return None
+    x1 = float(dst[0, 0, 0])
+    y1 = float(dst[0, 0, 1])
+    cx_out, _view_r, _board_r = _warp_radii(size)
+    if cal.has_ring_align_warp() and cal.warp1_double_outer is not None:
+        s = float(size) / float(max(1, cal.warp_ring_size))
+        if cal.warp1_center is not None:
+            bx = float(cal.warp1_center[0]) * s
+            by = float(cal.warp1_center[1]) * s
+        else:
+            ell = (
+                _resize_ellipse(cal.warp1_double_outer, s)
+                if abs(s - 1.0) > 1e-6
+                else cal.warp1_double_outer
+            )
+            bx, by = _ellipse_center(ell)
+        dx, dy = x1 - bx, y1 - by
+    else:
+        dx, dy = x1 - cx_out, y1 - cx_out
+    if abs(dx) + abs(dy) < 1e-6:
+        return None
+    return math.degrees(math.atan2(dx, -dy)) % 360.0
+
+
+def canonical_topdown_wire_thetas() -> Tuple[float, ...]:
+    """Dest 18° grid: index 0 = lijeva žica segmenta 20 (351°)."""
+    return tuple(
+        (SEG20_LEFT_WIRE_DST_DEG + k * SEGMENT_STEP_DEG) % 360.0
+        for k in range(SEGMENT_COUNT)
+    )
+
+
+def _cals_use_landmark_dest(
+    cands: List["BoardCalibration"],
+) -> bool:
+    """True kad svi predani calovi scoreaju u homography dest (kanonske žice)."""
+    if not cands:
+        return False
+    return all(c.has_landmark_homography() for c in cands)
+
+
+def calibrated_topdown_wire_thetas(
+    out_size: int,
+    *,
+    cal: Optional["BoardCalibration"] = None,
+    cals: Optional[List[Optional["BoardCalibration"]]] = None,
+) -> Optional[Tuple[float, ...]]:
+    """20 topdown žica, clockwise, index 0 = lijeva žica segmenta 20.
+
+    Homography dest već sjeda na kanonsku 18° mrežu (landmark ciljevi +
+    segment-20 rotacija u H). Reprojekcija Stage1-elipsa∩kamera-žica kroz H
+    je drugi fizički kontur — virtualne žice onda plutaju vs warped foto,
+    pa dart na rubu padne u krivi broj. Zato landmark calovi vraćaju
+    ``canonical_topdown_wire_thetas``.
+
+    Legacy Stage1+Stage2 i dalje warpira ``wire_angles_deg`` istom
+    homografijom (+ Stage2 kut od warp1 centra). ``segment20_offset``
+    rotira clockwise redoslijed na BOARD_SEGMENT_NUMBERS (20,1,18,...).
+    """
+    cands: List[BoardCalibration] = []
+    if cal is not None:
+        cands.append(cal)
+    if cals:
+        for c in cals:
+            if c is not None:
+                cands.append(c)
+    if _cals_use_landmark_dest(cands):
+        return canonical_topdown_wire_thetas()
+    acc: List[List[float]] = [[] for _ in range(SEGMENT_COUNT)]
+    for c in cands:
+        if c.has_landmark_homography():
+            continue
+        if not c.has_wires() or c.double_ellipse is None:
+            continue
+        n = min(len(c.wire_angles_deg), SEGMENT_COUNT)
+        if n < SEGMENT_COUNT - 2:
+            continue
+        sorted_idx = sorted(
+            range(n), key=lambda k: float(c.wire_angles_deg[k]) % 360.0
+        )
+        off = int(c.segment20_offset) % n
+        cw: List[Optional[float]] = []
+        ok = 0
+        for k in sorted_idx:
+            ang = float(c.wire_angles_deg[k])
+            pt = _ray_to_ellipse_edge_f(c.center, ang, c.double_ellipse)
+            if pt is None:
+                cw.append(None)
+                continue
+            th = _topdown_theta_of_src_point(c, (float(pt[0]), float(pt[1])), out_size)
+            cw.append(th)
+            if th is not None:
+                ok += 1
+        if ok < SEGMENT_COUNT - 2:
+            continue
+        for j in range(n):
+            th = cw[(j + off) % n]
+            if th is not None:
+                acc[j % SEGMENT_COUNT].append(float(th))
+    filled = sum(1 for row in acc if row)
+    if filled < SEGMENT_COUNT - 2:
+        return None
+    out: List[float] = []
+    for j in range(SEGMENT_COUNT):
+        if acc[j]:
+            out.append(_circular_mean_deg(acc[j]))
+        else:
+            out.append((SEG20_LEFT_WIRE_DST_DEG + j * SEGMENT_STEP_DEG) % 360.0)
+    return tuple(out)
+
+
+def describe_topdown_segment(
+    px: float,
+    py: float,
+    center_xy: Tuple[float, float],
+    *,
+    segment20_offset: int = 0,
+    wire_thetas_deg: Optional[Tuple[float, ...]] = None,
+) -> Dict[str, float | int | str]:
+    """Debug: theta, mode, wire pair, calibrated vs nominal segment."""
+    cx, cy = center_xy
+    theta = math.degrees(math.atan2(float(px) - cx, -(float(py) - cy))) % 360.0
+    nom_slot = _segment_slot_from_theta(theta, segment20_offset)
+    nominal = BOARD_SEGMENT_NUMBERS[nom_slot]
+    left_wire = (SEG20_LEFT_WIRE_DST_DEG + nom_slot * SEGMENT_STEP_DEG) % 360.0
+    right_wire = (left_wire + SEGMENT_STEP_DEG) % 360.0
+    nearest = min(_ang_abs_delta_deg(theta, left_wire), _ang_abs_delta_deg(theta, right_wire))
+    mode = "nominal"
+    number = nominal
+    if wire_thetas_deg is not None and len(wire_thetas_deg) >= SEGMENT_COUNT - 2:
+        slot, left_wire, right_wire, nearest = _segment_slot_from_wires(
+            theta, wire_thetas_deg
+        )
+        number = BOARD_SEGMENT_NUMBERS[slot % SEGMENT_COUNT]
+        mode = "calibrated_wires"
+    return {
+        "theta": theta,
+        "mode": mode,
+        "left_wire": left_wire,
+        "right_wire": right_wire,
+        "segment": int(number),
+        "nominal_segment": int(nominal),
+        "nearest_wire_dist_deg": nearest,
+    }
+
+
 def topdown_point_to_score(
     px: float,
     py: float,
@@ -704,11 +1107,45 @@ def topdown_point_to_score(
     segment20_offset: int = 0,
     rings: Optional[Dict[str, float]] = None,
     ring_ellipses: Optional[Dict[str, Ellipse]] = None,
+    wire_thetas_deg: Optional[Tuple[float, ...]] = None,
+    *,
+    log_geom: bool = True,
+    center_source: str = "warp_canvas_center:_board_center_and_r",
 ) -> Tuple[int, str, int]:
     """Top-down tocka -> (segment_number, zone_name, score)."""
     cx, cy = center_xy
     dx, dy = float(px) - cx, float(py) - cy
     r = math.hypot(dx, dy)
+    theta = math.degrees(math.atan2(dx, -dy)) % 360.0
+    nom_slot = _segment_slot_from_theta(theta, segment20_offset)
+    nominal_number = BOARD_SEGMENT_NUMBERS[nom_slot]
+    mode = "nominal"
+    left_wire = (SEG20_LEFT_WIRE_DST_DEG + nom_slot * SEGMENT_STEP_DEG) % 360.0
+    right_wire = (left_wire + SEGMENT_STEP_DEG) % 360.0
+    nearest = min(_ang_abs_delta_deg(theta, left_wire), _ang_abs_delta_deg(theta, right_wire))
+    number = nominal_number
+    if wire_thetas_deg is not None and len(wire_thetas_deg) >= SEGMENT_COUNT - 2:
+        slot, left_wire, right_wire, nearest = _segment_slot_from_wires(
+            theta, wire_thetas_deg
+        )
+        number = BOARD_SEGMENT_NUMBERS[slot % SEGMENT_COUNT]
+        mode = "calibrated_wires"
+    wire_mode = "calibrated" if mode == "calibrated_wires" else "nominal"
+    if log_geom:
+        print(
+            f"[SCORE_GEOM] center=({cx:.3f},{cy:.3f}) "
+            f"center_source={center_source} "
+            f"theta={theta:.2f} wire_mode={wire_mode} "
+            f"left_wire={left_wire:.2f} right_wire={right_wire:.2f} "
+            f"segment={number} nearest_wire_dist_deg={nearest:.2f} "
+            f"nominal_segment={nominal_number}",
+            flush=True,
+        )
+        if int(number) != int(nominal_number):
+            print(
+                f"[SCORE_GEOM] MISMATCH nominal={nominal_number} calibrated={number}",
+                flush=True,
+            )
 
     if ring_ellipses is not None:
         d_out = ring_ellipses["double_outer"]
@@ -726,9 +1163,6 @@ def topdown_point_to_score(
         mean_d = _mean_ellipse_semi(d_out)
         bull_inner = mean_d * RING_BULL_INNER_FRAC
         bull_outer = mean_d * RING_BULL_OUTER_FRAC
-        # Segment kut od centra warpa (seg.20 gore).
-        theta = math.degrees(math.atan2(dx, -dy)) % 360.0
-        number = BOARD_SEGMENT_NUMBERS[_segment_slot_from_theta(theta, segment20_offset)]
 
         if r <= bull_inner:
             return 50, "inner_bull", 50
@@ -757,9 +1191,6 @@ def topdown_point_to_score(
         return 50, "inner_bull", 50
     if r <= use_rings["bull_outer"]:
         return 25, "outer_bull", 25
-
-    theta = math.degrees(math.atan2(dx, -dy)) % 360.0
-    number = BOARD_SEGMENT_NUMBERS[_segment_slot_from_theta(theta, segment20_offset)]
 
     if use_rings["triple_inner"] <= r <= use_rings["triple_outer"]:
         return number, "triple", number * 3
@@ -873,6 +1304,543 @@ def _save_debug_calibration_pack(
         )
     except Exception:
         pass
+
+
+def _geom_debug_dir() -> str:
+    d = os.path.join(_debug_dir_path(), "calibration")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _fmt_xy(pt: Optional[Tuple[float, float]]) -> str:
+    if pt is None:
+        return "None"
+    return f"({float(pt[0]):.3f},{float(pt[1]):.3f})"
+
+
+def _dist_xy(
+    a: Optional[Tuple[float, float]],
+    b: Optional[Tuple[float, float]],
+) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _fmt_dist(
+    a: Optional[Tuple[float, float]],
+    b: Optional[Tuple[float, float]],
+) -> str:
+    d = _dist_xy(a, b)
+    return "None" if d is None else f"{d:.3f}"
+
+
+def _homography_map_xy(
+    H: np.ndarray, x: float, y: float
+) -> Optional[Tuple[float, float]]:
+    pts = np.array([[[float(x), float(y)]]], dtype=np.float32)
+    try:
+        out = cv2.perspectiveTransform(pts, H.astype(np.float64))
+    except cv2.error:
+        return None
+    return float(out[0, 0, 0]), float(out[0, 0, 1])
+
+
+def _invert_remap_src_to_dst(
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+    sx: float,
+    sy: float,
+    mask: Optional[np.ndarray] = None,
+    *,
+    max_err_px: float = 8.0,
+) -> Optional[Tuple[float, float, float]]:
+    """Dest (x,y) čiji remap izvor je najbliži kameri (sx,sy). Vraća (dx,dy,err_px)."""
+    dx = map_x.astype(np.float64) - float(sx)
+    dy = map_y.astype(np.float64) - float(sy)
+    d2 = dx * dx + dy * dy
+    if mask is not None:
+        d2 = np.where(mask > 0, d2, np.inf)
+    flat = int(np.argmin(d2))
+    h, w = d2.shape
+    iy, ix = divmod(flat, w)
+    err = float(np.sqrt(d2[iy, ix]))
+    if not np.isfinite(err) or err > max_err_px:
+        return None
+    win = 4
+    y0 = max(0, iy - win)
+    y1 = min(h, iy + win + 1)
+    x0 = max(0, ix - win)
+    x1 = min(w, ix + win + 1)
+    patch = d2[y0:y1, x0:x1]
+    wts = np.exp(-patch / max(err * err, 1e-6))
+    if mask is not None:
+        wts = wts * (mask[y0:y1, x0:x1] > 0).astype(np.float64)
+    s = float(np.sum(wts))
+    if s < 1e-9:
+        return float(ix), float(iy), err
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    return float(np.sum(xx * wts) / s), float(np.sum(yy * wts) / s), err
+
+
+def _put_geom_label(
+    img: np.ndarray,
+    text: str,
+    org: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    scale: float = 0.38,
+) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), bl = cv2.getTextSize(text, font, scale, 1)
+    x, y = int(org[0]), int(org[1])
+    x = max(1, min(x, img.shape[1] - tw - 2))
+    y = max(th + 2, min(y, img.shape[0] - bl - 1))
+    cv2.rectangle(img, (x - 1, y - th - 2), (x + tw + 1, y + bl + 1), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
+
+
+def _draw_geom_cross(
+    img: np.ndarray,
+    xy: Tuple[float, float],
+    color: Tuple[int, int, int],
+    *,
+    arm: int = 16,
+    thickness: int = 2,
+    circle_r: int = 4,
+) -> None:
+    x, y = int(round(xy[0])), int(round(xy[1]))
+    cv2.line(img, (x - arm, y), (x + arm, y), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x, y - arm), (x, y + arm), color, thickness, cv2.LINE_AA)
+    if circle_r > 0:
+        cv2.circle(img, (x, y), circle_r, color, 1, cv2.LINE_AA)
+
+
+def _draw_geom_x(
+    img: np.ndarray,
+    xy: Tuple[float, float],
+    color: Tuple[int, int, int],
+    *,
+    arm: int = 12,
+    thickness: int = 2,
+) -> None:
+    x, y = int(round(xy[0])), int(round(xy[1]))
+    cv2.line(img, (x - arm, y - arm), (x + arm, y + arm), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - arm, y + arm), (x + arm, y - arm), color, thickness, cv2.LINE_AA)
+
+
+def _draw_cv_ellipse(
+    img: np.ndarray,
+    ell: Ellipse,
+    color: Tuple[int, int, int],
+    thickness: int = 1,
+) -> None:
+    (ecx, ecy), (ew, eh), ang = ell
+    ax = max(1, int(round(float(ew) * 0.5)))
+    ay = max(1, int(round(float(eh) * 0.5)))
+    cv2.ellipse(
+        img,
+        (int(round(ecx)), int(round(ecy))),
+        (ax, ay),
+        float(ang),
+        0,
+        360,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def save_final_calibration_geometry_debug(
+    cam_idx: Optional[int],
+    frame_bgr: np.ndarray,
+    cal: BoardCalibration,
+    *,
+    out_size: int = FINAL_GEOM_DEBUG_SIZE,
+    all_cals: Optional[List[Optional[BoardCalibration]]] = None,
+) -> bool:
+    """Diagnostic overlay of the FINAL scoring topdown. Does not change calibration."""
+    if frame_bgr is None or not _is_calibration_complete(cal):
+        return False
+    size = int(out_size) if out_size > 0 else FINAL_GEOM_DEBUG_SIZE
+    h, w = frame_bgr.shape[:2]
+    maps = build_topdown_warp_maps(cal, out_size=size, frame_wh=(w, h))
+    if maps is None:
+        return False
+    map_x, map_y, mask = maps
+    warped = apply_topdown_warp_maps(frame_bgr, maps)
+    if warped is None or warped.size == 0:
+        return False
+
+    cx_out, _view_r, board_r = _warp_radii(size)
+    cal_center = (float(cx_out), float(cx_out))
+    scoring_center = cal_center
+    center_source = "warp_canvas_center:_board_center_and_r"
+
+    H = _homography_topdown_seg20(
+        cal.center,
+        cal.double_ellipse,
+        cal.wire_angles_deg,
+        size,
+        cal.segment20_offset,
+    )
+    stage1_bull = (
+        _homography_map_xy(H, float(cal.center[0]), float(cal.center[1]))
+        if H is not None
+        else None
+    )
+    ell_c = _ellipse_center(cal.double_ellipse) if cal.double_ellipse is not None else None
+    stage1_ellipse = (
+        _homography_map_xy(H, float(ell_c[0]), float(ell_c[1]))
+        if H is not None and ell_c is not None
+        else None
+    )
+
+    s_w1 = float(size) / float(max(1, cal.warp_ring_size)) if cal.warp_ring_size > 0 else 1.0
+    stage2_center_s1: Optional[Tuple[float, float]] = None
+    wire_theta_origin = "warp_canvas_center"
+    if cal.has_ring_align_warp() and cal.warp1_center is not None:
+        stage2_center_s1 = (
+            float(cal.warp1_center[0]) * s_w1,
+            float(cal.warp1_center[1]) * s_w1,
+        )
+        wire_theta_origin = "warp1_center_scaled (Stage1; _topdown_theta_of_src_point)"
+
+    inv = _invert_remap_src_to_dst(map_x, map_y, float(cal.center[0]), float(cal.center[1]), mask)
+    bull_warped: Optional[Tuple[float, float]] = None
+    bull_warp_err: Optional[float] = None
+    if inv is not None:
+        bull_warped = (inv[0], inv[1])
+        bull_warp_err = inv[2]
+
+    bull_detected = detect_bull_center_on_warp(warped)
+    bull_center = bull_detected if bull_detected is not None else bull_warped
+
+    ring_ellipses = scoring_ring_ellipses(size, cal=cal, cals=all_cals)
+    rings = scoring_ring_radii(size, cal=cal, cals=all_cals)
+    cam_ellipses = scoring_ring_ellipses(size, cal=cal, cals=None)
+    score_wires = calibrated_topdown_wire_thetas(size, cal=cal, cals=all_cals)
+    cam_wires = calibrated_topdown_wire_thetas(size, cal=cal, cals=None)
+    draw_wires = score_wires if score_wires is not None else cam_wires
+
+    ring_center: Optional[Tuple[float, float]] = None
+    if ring_ellipses is not None:
+        d_out = ring_ellipses["double_outer"]
+        ring_center = _ellipse_center(d_out)
+        mean_d = _mean_ellipse_semi(d_out)
+        r_bull_in = mean_d * RING_BULL_INNER_FRAC
+        r_bull_out = mean_d * RING_BULL_OUTER_FRAC
+        r_wire = max(float(rings["double_outer"]), mean_d)
+    else:
+        r_bull_in = float(rings["bull_inner"])
+        r_bull_out = float(rings["bull_outer"])
+        r_wire = float(rings["double_outer"])
+
+    overlay = warped.copy()
+    # Rings first (under wires/centers).
+    col_d = (0, 165, 255)  # orange double
+    col_t = (0, 255, 128)  # green triple
+    col_b = (255, 80, 80)  # blue-ish bull (BGR)
+    if ring_ellipses is not None:
+        _draw_cv_ellipse(overlay, ring_ellipses["double_outer"], col_d, 1)
+        _draw_cv_ellipse(overlay, ring_ellipses["double_inner"], col_d, 1)
+        _draw_cv_ellipse(overlay, ring_ellipses["triple_outer"], col_t, 1)
+        _draw_cv_ellipse(overlay, ring_ellipses["triple_inner"], col_t, 1)
+    else:
+        for key, col in (
+            ("double_outer", col_d),
+            ("double_inner", col_d),
+            ("triple_outer", col_t),
+            ("triple_inner", col_t),
+        ):
+            rr = max(1, int(round(float(rings[key]))))
+            cv2.circle(
+                overlay,
+                (int(round(cal_center[0])), int(round(cal_center[1]))),
+                rr,
+                col,
+                1,
+                cv2.LINE_AA,
+            )
+    cv2.circle(
+        overlay,
+        (int(round(cal_center[0])), int(round(cal_center[1]))),
+        max(1, int(round(r_bull_out))),
+        col_b,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.circle(
+        overlay,
+        (int(round(cal_center[0])), int(round(cal_center[1]))),
+        max(1, int(round(r_bull_in))),
+        col_b,
+        1,
+        cv2.LINE_AA,
+    )
+
+    col_wire = (0, 255, 255)  # yellow: scoring calibrated wires
+    if draw_wires is not None:
+        for i, ang in enumerate(draw_wires[:SEGMENT_COUNT]):
+            st, ct = _angle_sin_cos(float(ang))
+            x1 = int(round(cal_center[0] + r_wire * st))
+            y1 = int(round(cal_center[1] + r_wire * ct))
+            cv2.line(
+                overlay,
+                (int(round(cal_center[0])), int(round(cal_center[1]))),
+                (x1, y1),
+                col_wire,
+                1,
+                cv2.LINE_AA,
+            )
+            lx = int(round(cal_center[0] + r_wire * 1.04 * st))
+            ly = int(round(cal_center[1] + r_wire * 1.04 * ct))
+            _put_geom_label(overlay, f"W{i}", (lx - 6, ly + 3), col_wire, scale=0.32)
+
+    col_cal = (255, 0, 255)  # magenta CAL_CENTER
+    col_bull = (0, 255, 0)  # green BULL_CENTER
+    col_ringc = (255, 255, 0)  # cyan RING_CENTER
+    _draw_geom_cross(overlay, cal_center, col_cal, arm=18, thickness=2, circle_r=5)
+    _put_geom_label(
+        overlay,
+        "CAL",
+        (int(round(cal_center[0])) + 14, int(round(cal_center[1])) - 10),
+        col_cal,
+        scale=0.40,
+    )
+
+    if bull_center is not None:
+        _draw_geom_x(overlay, bull_center, col_bull, arm=11, thickness=2)
+        cv2.circle(
+            overlay,
+            (int(round(bull_center[0])), int(round(bull_center[1]))),
+            6,
+            col_bull,
+            1,
+            cv2.LINE_AA,
+        )
+        _put_geom_label(
+            overlay,
+            "BULL",
+            (int(round(bull_center[0])) + 14, int(round(bull_center[1])) + 16),
+            col_bull,
+            scale=0.40,
+        )
+        cv2.line(
+            overlay,
+            (int(round(cal_center[0])), int(round(cal_center[1]))),
+            (int(round(bull_center[0])), int(round(bull_center[1]))),
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        bdx = float(bull_center[0]) - float(cal_center[0])
+        bdy = float(bull_center[1]) - float(cal_center[1])
+        bdist = math.hypot(bdx, bdy)
+    else:
+        bdx = bdy = bdist = float("nan")
+
+    if ring_center is not None:
+        rc_dx = float(ring_center[0]) - float(cal_center[0])
+        rc_dy = float(ring_center[1]) - float(cal_center[1])
+        rc_dist = math.hypot(rc_dx, rc_dy)
+        if rc_dist > 0.35:
+            _draw_geom_cross(overlay, ring_center, col_ringc, arm=10, thickness=1, circle_r=3)
+            _put_geom_label(
+                overlay,
+                "RING",
+                (int(round(ring_center[0])) - 36, int(round(ring_center[1])) + 16),
+                col_ringc,
+                scale=0.36,
+            )
+
+    hud = [
+        f"cam={cam_idx} size={size} scoring FITLINE",
+        f"CAL_CENTER={_fmt_xy(cal_center)} src={center_source}",
+        f"BULL_CENTER={_fmt_xy(bull_center)} det={_fmt_xy(bull_detected)} warp={_fmt_xy(bull_warped)}",
+        (
+            f"center_delta=({bdx:+.3f},{bdy:+.3f}) center_error_px={bdist:.3f}"
+            if bull_center is not None
+            else "center_delta=None"
+        ),
+        f"stage1_bull={_fmt_xy(stage1_bull)} stage1_ellipse={_fmt_xy(stage1_ellipse)}",
+        f"stage2_center={_fmt_xy(stage2_center_s1)} final_scoring={_fmt_xy(scoring_center)}",
+        (
+            f"RING_CENTER={_fmt_xy(ring_center)} vs CAL={_fmt_dist(ring_center, cal_center)}px"
+            f" vs BULL={_fmt_dist(ring_center, bull_center)}px"
+            if ring_center is not None
+            else "RING_CENTER=None"
+        ),
+    ]
+    line_h = 14
+    panel_h = 8 + line_h * len(hud)
+    canvas = np.zeros((overlay.shape[0] + panel_h, overlay.shape[1], 3), dtype=np.uint8)
+    canvas[: overlay.shape[0]] = overlay
+    y_hud = overlay.shape[0] + 12
+    for line in hud:
+        cv2.putText(
+            canvas,
+            line,
+            (4, y_hud),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        y_hud += line_h
+
+    cam_tag = f"cam{int(cam_idx)}" if cam_idx is not None else "cam_unknown"
+    out_path = os.path.join(_geom_debug_dir(), f"{cam_tag}_final_geometry.png")
+    tmp_path = out_path + ".tmp.png"
+    try:
+        if not cv2.imwrite(tmp_path, canvas):
+            return False
+        os.replace(tmp_path, out_path)
+    except OSError:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+    wires_log = (
+        "[" + ", ".join(f"{float(a):.3f}" for a in draw_wires) + "]"
+        if draw_wires is not None
+        else "None"
+    )
+    print(f"[CAL_GEOM] cam={cam_idx}", flush=True)
+    print(f"[CAL_GEOM] cal_center={_fmt_xy(cal_center)}", flush=True)
+    print(f"[CAL_GEOM] bull_center={_fmt_xy(bull_center)}", flush=True)
+    if bull_center is not None:
+        print(
+            f"[CAL_GEOM] center_delta=({bdx:.3f},{bdy:.3f})",
+            flush=True,
+        )
+        print(f"[CAL_GEOM] center_error_px={bdist:.3f}", flush=True)
+    else:
+        print("[CAL_GEOM] center_delta=None", flush=True)
+        print("[CAL_GEOM] center_error_px=None", flush=True)
+    print(f"[CAL_GEOM] wire_angles_deg={wires_log}", flush=True)
+    print(
+        f"[CAL_GEOM] scoring_center_source={center_source} "
+        f"final_scoring_center={_fmt_xy(scoring_center)}",
+        flush=True,
+    )
+    print(
+        f"[SCORE_GEOM] center_source={center_source} "
+        f"center=({scoring_center[0]:.3f},{scoring_center[1]:.3f})",
+        flush=True,
+    )
+    print(f"[CAL_GEOM] stage1_bull_center={_fmt_xy(stage1_bull)}", flush=True)
+    print(f"[CAL_GEOM] stage1_ellipse_center={_fmt_xy(stage1_ellipse)}", flush=True)
+    print(f"[CAL_GEOM] stage2_center={_fmt_xy(stage2_center_s1)}", flush=True)
+    print(
+        f"[CAL_GEOM] dist stage1_bull-stage1_ellipse={_fmt_dist(stage1_bull, stage1_ellipse)}",
+        flush=True,
+    )
+    print(
+        f"[CAL_GEOM] dist stage1_bull-stage2_center={_fmt_dist(stage1_bull, stage2_center_s1)}",
+        flush=True,
+    )
+    print(
+        f"[CAL_GEOM] dist stage1_bull-final_scoring={_fmt_dist(stage1_bull, scoring_center)}",
+        flush=True,
+    )
+    print(
+        f"[CAL_GEOM] dist stage2_center-final_scoring={_fmt_dist(stage2_center_s1, scoring_center)}",
+        flush=True,
+    )
+    print(f"[CAL_GEOM] bull_detected={_fmt_xy(bull_detected)}", flush=True)
+    print(
+        f"[CAL_GEOM] bull_warped_from_cal.center={_fmt_xy(bull_warped)} "
+        f"invert_err_px={bull_warp_err}",
+        flush=True,
+    )
+    print(f"[CAL_GEOM] RING_CENTER={_fmt_xy(ring_center)}", flush=True)
+    if ring_center is not None:
+        print(
+            f"[CAL_GEOM] dist RING-CAL={_fmt_dist(ring_center, cal_center)} "
+            f"RING-BULL={_fmt_dist(ring_center, bull_center)}",
+            flush=True,
+        )
+    print(
+        f"[CAL_GEOM] calibrated_wire_theta_origin={wire_theta_origin}",
+        flush=True,
+    )
+    if cam_wires is not None and score_wires is not None and cam_wires != score_wires:
+        diffs = [
+            _ang_abs_delta_deg(float(a), float(b))
+            for a, b in zip(cam_wires, score_wires)
+        ]
+        print(
+            f"[CAL_GEOM] per-cam vs scoring wires max_abs_delta_deg={max(diffs):.3f}",
+            flush=True,
+        )
+    overlay_uses_scoring_center = True
+    if abs(cal_center[0] - scoring_center[0]) + abs(cal_center[1] - scoring_center[1]) > 1e-9:
+        overlay_uses_scoring_center = False
+    if not overlay_uses_scoring_center:
+        print(
+            "[CAL_GEOM] BUG overlay CAL_CENTER != scoring theta center",
+            flush=True,
+        )
+    if (
+        cal.has_ring_align_warp()
+        and stage2_center_s1 is not None
+        and _dist_xy(stage2_center_s1, scoring_center) is not None
+        and float(_dist_xy(stage2_center_s1, scoring_center)) > 0.5
+    ):
+        print(
+            "[CAL_GEOM] NOTE calibrated-wire thetas measured from warp1_center "
+            f"(Stage1 {_fmt_xy(stage2_center_s1)}) but scoring theta uses "
+            f"canvas {_fmt_xy(scoring_center)}",
+            flush=True,
+        )
+    if bull_center is not None and bdist > 0.5:
+        print(
+            f"[CAL_GEOM] NOTE center mismatch CAL vs physical/detected bull "
+            f"{bdist:.3f}px",
+            flush=True,
+        )
+    print(f"[CAL_GEOM] saved={out_path}", flush=True)
+    _ = cam_ellipses
+    return True
+
+
+def dump_final_calibration_geometry_debug(
+    frames: Dict[int, Optional[np.ndarray]],
+    cals: Dict[int, Optional[BoardCalibration]],
+    *,
+    out_size: int = FINAL_GEOM_DEBUG_SIZE,
+) -> int:
+    """Napiši camN_final_geometry.png za sve kompletne kalibracije s frameom."""
+    all_cals: List[Optional[BoardCalibration]] = [
+        cals.get(int(k)) for k in sorted(cals.keys())
+    ]
+    saved = 0
+    for cam_idx, frame in frames.items():
+        if frame is None:
+            continue
+        cal = cals.get(int(cam_idx))
+        if cal is None or not _is_calibration_complete(cal):
+            continue
+        try:
+            if save_final_calibration_geometry_debug(
+                int(cam_idx),
+                frame,
+                cal,
+                out_size=out_size,
+                all_cals=all_cals,
+            ):
+                saved += 1
+        except Exception as exc:
+            print(f"[CAL_GEOM] cam={cam_idx} dump failed: {exc}", flush=True)
+    return saved
 
 
 def save_topdown_warp_image(
@@ -991,6 +1959,11 @@ def _calibration_to_dict(cam_idx: int, cal: BoardCalibration) -> dict:
         if cal.stage2_triple_inner_ratio > 0.5:
             wr["stage2_triple_inner_ratio"] = float(cal.stage2_triple_inner_ratio)
         data["warp_rings"] = wr
+    if cal.has_landmark_homography():
+        data["warp_mode"] = str(cal.warp_mode)
+        data["landmark_H"] = [float(x) for x in cal.landmark_H]
+        data["landmark_H_size"] = int(cal.landmark_H_size)
+        data["landmark_H_offset"] = int(cal.landmark_H_offset) % SEGMENT_COUNT
     return data
 
 
@@ -1107,6 +2080,13 @@ def _calibration_from_dict(data: dict) -> Optional[BoardCalibration]:
             ),
             stage2_double_inner_ratio=float(wr.get("stage2_double_inner_ratio", 0.0) or 0.0),
             stage2_triple_inner_ratio=float(wr.get("stage2_triple_inner_ratio", 0.0) or 0.0),
+            warp_mode=str(data.get("warp_mode", "legacy") or "legacy"),
+            landmark_H=_landmark_H_from_obj(data.get("landmark_H")),
+            landmark_H_size=int(data.get("landmark_H_size", 0) or 0),
+            landmark_H_offset=int(
+                data.get("landmark_H_offset", data.get("segment20_offset", 0)) or 0
+            )
+            % SEGMENT_COUNT,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -2704,12 +3684,30 @@ def detect_triple_outer_ellipse_on_warp(
     return t_outer
 
 
+def _robust_ring_radius(vals: List[float], nominal: float, max_dev_px: float) -> float:
+    """Median of MAD inliers. Keep 1–max_dev_px residual; else nominal."""
+    nom = float(nominal)
+    if len(vals) < 16:
+        return nom
+    arr = np.asarray(vals, dtype=np.float64)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med))) + 1e-6
+    lim = max(1.25, 2.5 * mad)
+    inn = arr[np.abs(arr - med) <= lim]
+    if inn.size < 12:
+        return nom
+    out = float(np.median(inn))
+    if abs(out - nom) > float(max_dev_px):
+        return nom
+    return out
+
+
 def _measure_rg_ring_band_radii(
     warped: np.ndarray,
     *,
     board_r: Optional[float] = None,
 ) -> Optional[Dict[str, float]]:
-    """Na Stage2 warpu: unutarnji+vanjski rub RG pojasa za double i triple (bez morph close).
+    """Na warpu: unutarnji+vanjski rub RG pojasa za double i triple (bez morph close).
 
     Rubovi su rubovi boje (sisal), ne metalne žice — ali to je scoring zona.
     """
@@ -2726,12 +3724,14 @@ def _measure_rg_ring_band_radii(
 
     d_exp = br
     t_exp = br * float(RING_TRIPLE_OUTER_FRAC)
+    max_err = float(HOMOGRAPHY_RING_MAX_DEV_PX) + 1.0
+    min_w, max_w = 2.0, 14.0
     d_outs: List[float] = []
     d_inns: List[float] = []
     t_outs: List[float] = []
     t_inns: List[float] = []
 
-    for deg in range(0, 360, 3):
+    for deg in range(0, 360, 2):
         th = math.radians(float(deg))
         st, ct = math.sin(th), -math.cos(th)
         clusters: List[Tuple[float, float]] = []
@@ -2749,10 +3749,10 @@ def _measure_rg_ring_band_radii(
                     r0 = float(r)
                 r1 = float(r)
             elif in_run:
-                if r1 - r0 >= 1.2:
+                if min_w <= (r1 - r0) <= max_w:
                     clusters.append((r0, r1))
                 in_run = False
-        if in_run and r1 - r0 >= 1.2:
+        if in_run and min_w <= (r1 - r0) <= max_w:
             clusters.append((r0, r1))
 
         best_d: Optional[Tuple[float, float]] = None
@@ -2763,39 +3763,30 @@ def _measure_rg_ring_band_radii(
             mid = 0.5 * (a + b)
             d_err = abs(mid - d_exp)
             t_err = abs(mid - t_exp)
-            if d_err < best_d_err and mid >= br * 0.86:
+            if d_err < best_d_err and mid >= br * 0.90:
                 best_d_err = d_err
                 best_d = (a, b)
-            if t_err < best_t_err and br * 0.48 <= mid <= br * 0.78:
+            if t_err < best_t_err and br * 0.52 <= mid <= br * 0.74:
                 best_t_err = t_err
                 best_t = (a, b)
-        if best_d is not None and best_d_err <= br * 0.10:
+        if best_d is not None and best_d_err <= max_err:
             d_inns.append(best_d[0])
             d_outs.append(best_d[1])
-        if best_t is not None and best_t_err <= br * 0.12:
+        if best_t is not None and best_t_err <= max_err:
             t_inns.append(best_t[0])
             t_outs.append(best_t[1])
 
     if len(d_outs) < 24 or len(t_outs) < 24:
         return None
 
-    d_out = float(np.median(d_outs))
-    d_in = float(np.median(d_inns))
-    t_out = float(np.median(t_outs))
-    t_in = float(np.median(t_inns))
-
-    # Soft clamp oko nominale — odbaci divlje fitove.
     nom_di = br * RING_DOUBLE_INNER_FRAC
     nom_to = br * RING_TRIPLE_OUTER_FRAC
     nom_ti = br * RING_TRIPLE_INNER_FRAC
-    if abs(d_out - br) > br * 0.06:
-        d_out = br
-    if abs(d_in - nom_di) > br * 0.06:
-        d_in = nom_di
-    if abs(t_out - nom_to) > br * 0.08:
-        t_out = nom_to
-    if abs(t_in - nom_ti) > br * 0.08:
-        t_in = nom_ti
+    cap = float(HOMOGRAPHY_RING_MAX_DEV_PX)
+    d_out = _robust_ring_radius(d_outs, br, cap)
+    d_in = _robust_ring_radius(d_inns, nom_di, cap)
+    t_out = _robust_ring_radius(t_outs, nom_to, cap)
+    t_in = _robust_ring_radius(t_inns, nom_ti, cap)
     if d_in >= d_out - 1.0:
         d_in = max(1.0, d_out - 1.0)
     if t_in >= t_out - 1.0:
@@ -2813,7 +3804,7 @@ def detect_circular_rings_on_aligned_warp(
     *,
     nominal_board_r: Optional[float] = None,
 ) -> Optional[Dict[str, Ellipse]]:
-    """Na 2. warpu izmjeri double/triple inner+outer kao koncentrične krugove."""
+    """Na dest warpu izmjeri double/triple inner+outer kao koncentrične krugove."""
     if warped is None or warped.size == 0:
         return None
     h, w = warped.shape[:2]
@@ -2823,13 +3814,17 @@ def detect_circular_rings_on_aligned_warp(
     cx = cy = float(cx_out)
     measured = _measure_rg_ring_band_radii(warped, board_r=board_r)
     if measured is None:
-        return _nominal_final_ring_ellipses(w)
-    return {
+        return None
+    ell = {
         "double_outer": _circle_as_ellipse(cx, cy, measured["double_outer"]),
         "double_inner": _circle_as_ellipse(cx, cy, measured["double_inner"]),
         "triple_outer": _circle_as_ellipse(cx, cy, measured["triple_outer"]),
         "triple_inner": _circle_as_ellipse(cx, cy, measured["triple_inner"]),
     }
+    fracs = _ring_fracs_from_ellipses(ell, board_r)
+    if not _ring_fracs_sane(fracs, board_r=board_r):
+        return None
+    return ell
 
 
 def detect_scoring_ring_ellipses_on_warp(
@@ -4616,6 +5611,13 @@ def scale_board_calibration(cal: BoardCalibration, scale: float) -> BoardCalibra
         bull_radius=cal.bull_radius * s,
         double_ellipse=ellipse,
     )
+    if out.has_landmark_homography() and out.landmark_H is not None:
+        H = np.array(out.landmark_H, dtype=np.float64).reshape(3, 3)
+        sinv = np.array(
+            [[1.0 / s, 0.0, 0.0], [0.0, 1.0 / s, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        out = replace(out, landmark_H=tuple(float(x) for x in (H @ sinv).reshape(-1)))
     refresh_segment20_fields(out)
     return out
 
@@ -5350,6 +6352,13 @@ def build_topdown_warp_maps(
     if not cal.is_valid() or cal.double_ellipse is None:
         return None
     size = int(out_size) if out_size > 0 else DEBUG_WARP_SIZE
+    H_lm = _scaled_landmark_H(cal, size)
+    if H_lm is not None:
+        map_x, map_y = _homography_to_remap_maps(H_lm, size)
+        cx_out, view_r, _ = _warp_radii(size)
+        mask = np.zeros((size, size), dtype=np.uint8)
+        cv2.circle(mask, (int(round(cx_out)), int(round(cx_out))), int(view_r), 255, -1)
+        return map_x, map_y, mask
     wires = cal.wire_angles_deg if cal.has_wires() else ()
     mask1: Optional[np.ndarray] = None
 
@@ -5874,26 +6883,40 @@ class BoardCalibrator:
                     seed_t = old.warp1_triple_outer
                     seed_c = old.warp1_center
                 enrich_perf: Dict[str, float] = {}
-                new_cal = enrich_calibration_with_warp_rings(
-                    frame,
-                    new_cal,
-                    seed_warp1_d=seed_d,
-                    seed_warp1_t=seed_t,
-                    seed_center=seed_c,
-                    perf=enrich_perf,
-                )
-                _perf_cal(
-                    f"cam{cam_i} stage1_warp={float(enrich_perf.get('stage1_warp', 0.0)):.1f}ms"
-                )
-                _perf_cal(
-                    f"cam{cam_i} ring_measure={float(enrich_perf.get('ring_measure', 0.0)):.1f}ms"
-                )
-                _perf_cal(
-                    f"cam{cam_i} stage2={float(enrich_perf.get('stage2', 0.0)):.1f}ms"
-                )
-                # Jamstvo: Stage2 podaci uvijek postoje i spremaju se.
-                if not new_cal.has_ring_align_warp():
-                    new_cal = ensure_ring_align_warp(new_cal)
+                h_applied = False
+                if str(CALIBRATION_MODE).strip().lower() in (
+                    "homography_landmarks",
+                    "homography",
+                    "landmarks",
+                ):
+                    from homography_calibration import apply_homography_mode_or_none
+
+                    h_cal = apply_homography_mode_or_none(frame, new_cal, cam_idx=cam_i)
+                    if h_cal is not None:
+                        new_cal = h_cal
+                        h_applied = True
+                        _perf_cal(f"cam{cam_i} homography_landmarks=ok")
+                if not h_applied:
+                    new_cal = enrich_calibration_with_warp_rings(
+                        frame,
+                        new_cal,
+                        seed_warp1_d=seed_d,
+                        seed_warp1_t=seed_t,
+                        seed_center=seed_c,
+                        perf=enrich_perf,
+                    )
+                    _perf_cal(
+                        f"cam{cam_i} stage1_warp={float(enrich_perf.get('stage1_warp', 0.0)):.1f}ms"
+                    )
+                    _perf_cal(
+                        f"cam{cam_i} ring_measure={float(enrich_perf.get('ring_measure', 0.0)):.1f}ms"
+                    )
+                    _perf_cal(
+                        f"cam{cam_i} stage2={float(enrich_perf.get('stage2', 0.0)):.1f}ms"
+                    )
+                    # Jamstvo: Stage2 podaci uvijek postoje i spremaju se.
+                    if not new_cal.has_ring_align_warp():
+                        new_cal = ensure_ring_align_warp(new_cal)
                 _save_debug_calibration_pack(
                     cam_idx=cam_idx,
                     frame_bgr=frame,
@@ -5985,6 +7008,11 @@ class BoardCalibrator:
                 self._cals, cameras=[int(k) for k in frames.keys()]
             )
         _perf_cal(f"detect_all total={_perf_ms(t_all):.1f}ms")
+        if DEBUG_SAVE_CANNY_EDGES:
+            try:
+                dump_final_calibration_geometry_debug(frames, self._cals)
+            except Exception as exc:
+                print(f"[CAL_GEOM] dump failed: {exc}", flush=True)
         return incomplete
 
     def recalibrate_for_play(
@@ -6068,6 +7096,12 @@ class BoardCalibrator:
         self.invalidate_warp_cache(cam_idx)
         self.save()
 
+    def dump_final_geometry_debug(
+        self, frames: Dict[int, Optional[np.ndarray]]
+    ) -> int:
+        """Diagnostic: final scoring-geometry overlay per camera (no cal changes)."""
+        return dump_final_calibration_geometry_debug(frames, self._cals)
+
     def capture_topdown_all(self, frames: Dict[int, Optional[np.ndarray]]) -> int:
         """Snimi rotirani top-down pregled svih kalibriranih kamera u debug_edges/."""
         saved = 0
@@ -6079,6 +7113,10 @@ class BoardCalibrator:
                 continue
             if save_topdown_warp_from_calibration(cam_idx, frame, cal):
                 saved += 1
+        try:
+            dump_final_calibration_geometry_debug(frames, self._cals)
+        except Exception as exc:
+            print(f"[CAL_GEOM] dump failed: {exc}", flush=True)
         return saved
 
     def load(self, path: Optional[str] = None) -> None:
@@ -6095,7 +7133,12 @@ class BoardCalibrator:
                 if cal is not None:
                     refresh_segment20_fields(cal)
                     # Stari JSON bez warp_rings → dodaj nominalni Stage2 da double sjeda.
-                    if _is_calibration_complete(cal) and not cal.has_ring_align_warp():
+                    # Homography-landmarks cal must not get Stage2 egg→circle attached.
+                    if (
+                        _is_calibration_complete(cal)
+                        and not cal.has_ring_align_warp()
+                        and not cal.has_landmark_homography()
+                    ):
                         cal = ensure_ring_align_warp(cal)
                         dirty = True
                     self._cals[int(entry["cam_idx"])] = cal

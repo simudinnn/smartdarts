@@ -34,6 +34,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QColor,
     QIcon,
+    QPen,
+    QBrush,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -84,6 +86,28 @@ _UI_TICK_MS = 40 if _WEAK_HW else 33
 _SCORE_ANIM_MS = 32
 _PIXMAP_TRANSFORM = Qt.FastTransformation if _WEAK_HW else Qt.SmoothTransformation
 _TURN_ANIM_MS = 320 if _WEAK_HW else 420
+_PAGE_ANIM_MS = 90 if _WEAK_HW else 260
+_LOADING_FADE_MS = 90 if _WEAK_HW else 200
+_SCREEN_DEPTH = {
+    "standby": 0,
+    "select_game": 1,
+    "rules_x01": 2,
+    "rules_cricket": 2,
+    "rules_killer": 2,
+    "rules_around": 2,
+    "rules_halve": 2,
+    "tutorial_x01": 3,
+    "tutorial_cricket": 3,
+    "tutorial_killer": 3,
+    "tutorial_around": 3,
+    "tutorial_halve": 3,
+    "select_players": 4,
+    "clear_board": 5,
+    "playing": 6,
+    "exit_confirm": 7,
+    "settings": 20,
+    "calibration": 21,
+}
 _IDLE_WARN_SEC = 300.0
 _IDLE_EXIT_SEC = 60.0
 _IDLE_SCREENS = (
@@ -343,8 +367,8 @@ QPushButton {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 #54545e, stop:0.42 #3a3a42, stop:0.58 #3a3a42, stop:1 #2c2c34);
     color: #ffffff;
-    border: 3px solid #5a5a66;
-    border-radius: 14px;
+    border: 2px solid #6a6a76;
+    border-radius: 18px;
     padding: 18px 20px;
     font-size: 64px;
     font-weight: 800;
@@ -809,9 +833,10 @@ QLabel#WinnerSub {
     color: #d0d0d8;
 }
 QLabel#Title {
-    font-size: 93px;
+    font-size: 88px;
     font-weight: 800;
-    color: #ffffff;
+    color: #f6f3ec;
+    letter-spacing: 2px;
 }
 QLabel#SettingsTitle {
     font-size: 56px;
@@ -825,8 +850,9 @@ QLabel#SettingsSection {
     color: #d0d0d8;
 }
 QLabel#Subtitle {
-    font-size: 51px;
-    color: #b0b0b0;
+    font-size: 42px;
+    font-weight: 600;
+    color: #c4c0b8;
 }
 QLabel#PlayTitle {
     font-size: 51px;
@@ -930,14 +956,32 @@ QLabel#RoundLabel {
     color: #c8c8d0;
 }
 QFrame#Card {
-    background-color: #121a2a;
-    border: 4px solid #ffe000;
-    border-radius: 20px;
+    background-color: rgba(10, 10, 16, 210);
+    border: 2px solid rgba(255, 224, 0, 160);
+    border-radius: 24px;
 }
 QFrame#QrFrame {
     background-color: #ffffff;
-    border: 8px solid #ffffff;
+    border: 10px solid #ffffff;
     border-radius: 28px;
+}
+QWidget#LoadingOverlay {
+    background-color: rgba(0, 0, 0, 188);
+}
+QLabel#LoadingTitle {
+    font-size: 56px;
+    font-weight: 800;
+    color: #f6f3ec;
+    letter-spacing: 3px;
+}
+QLabel#LoadingSub {
+    font-size: 28px;
+    font-weight: 600;
+    color: #c8c4bc;
+}
+QFrame#PageGhost {
+    background: transparent;
+    border: none;
 }
 """
 
@@ -974,6 +1018,86 @@ class AnimButton(QPushButton):
         if self._flash_prev is not None:
             self.setStyleSheet(self._flash_prev)
             self._flash_prev = ""
+
+
+class DartSpinner(QWidget):
+    """Rotating ring spinner for calibration / game-start loading."""
+
+    def __init__(self, parent: Optional[QWidget] = None, size: int = 168) -> None:
+        super().__init__(parent)
+        self._angle = 0.0
+        self._size = max(96, int(size))
+        self.setFixedSize(self._size, self._size)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(1050)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.Linear)
+        self._anim.valueChanged.connect(self._set_angle)
+
+    def _set_angle(self, value) -> None:
+        self._angle = float(value)
+        self.update()
+
+    def start(self) -> None:
+        if self._anim.state() == QVariantAnimation.Stopped:
+            self._anim.start()
+
+    def stop(self) -> None:
+        self._anim.stop()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        side = min(self.width(), self.height())
+        if side < 8:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        cx = self.width() * 0.5
+        cy = self.height() * 0.5
+        p.translate(cx, cy)
+        accent = QColor(get_settings().button_color)
+        if not accent.isValid():
+            accent = QColor("#ffe000")
+        ring = QColor(255, 255, 255, 28)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(ring, max(2.0, side * 0.045)))
+        r_outer = side * 0.42
+        p.drawEllipse(QPoint(0, 0), int(r_outer), int(r_outer))
+        p.setPen(QPen(QColor(255, 255, 255, 18), max(1.5, side * 0.02)))
+        p.drawEllipse(QPoint(0, 0), int(side * 0.28), int(side * 0.28))
+        p.setBrush(QBrush(accent))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QPoint(0, 0), int(side * 0.07), int(side * 0.07))
+        p.rotate(self._angle)
+        pen = QPen(accent, max(3.0, side * 0.07))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        span = 68 * 16
+        p.drawArc(
+            int(-r_outer),
+            int(-r_outer),
+            int(r_outer * 2),
+            int(r_outer * 2),
+            0,
+            span,
+        )
+        dim = QColor(accent)
+        dim.setAlpha(90)
+        pen2 = QPen(dim, max(2.0, side * 0.045))
+        pen2.setCapStyle(Qt.RoundCap)
+        p.setPen(pen2)
+        p.drawArc(
+            int(-r_outer),
+            int(-r_outer),
+            int(r_outer * 2),
+            int(r_outer * 2),
+            90 * 16,
+            40 * 16,
+        )
+        p.end()
 
 
 def _rounded_pixmap(pix: QPixmap, radius: int) -> QPixmap:
@@ -3700,6 +3824,12 @@ class MainWindow(QMainWindow):
         self._build_killer_bull_overlay(root)
         self._build_ingame_cal_overlay(root)
         self._build_name_overlay(root)
+        self._build_loading_overlay(root)
+        self._page_ghost: Optional[QLabel] = None
+        self._page_anim: Optional[QParallelAnimationGroup] = None
+        self._page_animating = False
+        self._loading_anim: Optional[QPropertyAnimation] = None
+        self._standby_pulse: Optional[QVariantAnimation] = None
 
         self._wire_actions(root)
         self._last_ui_sig: Optional[str] = None
@@ -3924,6 +4054,9 @@ class MainWindow(QMainWindow):
             self.idle_overlay.raise_()
         if hasattr(self, "stats_overlay") and self.stats_overlay.isVisible():
             self.stats_overlay.raise_()
+        if hasattr(self, "loading_overlay") and self.loading_overlay.isVisible():
+            self.loading_overlay.setGeometry(0, 0, root.width(), root.height())
+            self.loading_overlay.raise_()
 
     def _update_settings_fab_visibility(self) -> None:
         if not hasattr(self, "settings_fab"):
@@ -3934,6 +4067,7 @@ class MainWindow(QMainWindow):
         idle_up = hasattr(self, "idle_overlay") and self.idle_overlay.isVisible()
         name_up = hasattr(self, "name_overlay") and self.name_overlay.isVisible()
         cal_up = bool(self.session.is_in_game_calibrating())
+        loading_up = self._is_loading()
         show = (
             screen not in ("settings",)
             and not pin_up
@@ -3941,10 +4075,231 @@ class MainWindow(QMainWindow):
             and not idle_up
             and not cal_up
             and not name_up
+            and not loading_up
         )
         self.settings_fab.setVisible(show)
         if show:
             self.settings_fab.raise_()
+
+    def _is_loading(self) -> bool:
+        return bool(
+            hasattr(self, "loading_overlay") and self.loading_overlay.isVisible()
+        )
+
+    def _build_loading_overlay(self, root: QWidget) -> None:
+        self.loading_overlay = QWidget(root)
+        self.loading_overlay.setObjectName("LoadingOverlay")
+        self.loading_overlay.hide()
+        self.loading_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        ol = QVBoxLayout(self.loading_overlay)
+        ol.setContentsMargins(40, 40, 40, 40)
+        ol.setAlignment(Qt.AlignCenter)
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(720)
+        card.setMaximumWidth(980)
+        cl = QVBoxLayout(card)
+        cl.setSpacing(18)
+        cl.setContentsMargins(48, 40, 48, 44)
+        cl.setAlignment(Qt.AlignCenter)
+        self.loading_spinner = DartSpinner(card, 176)
+        cl.addWidget(self.loading_spinner, 0, Qt.AlignCenter)
+        self.loading_title = QLabel("")
+        self.loading_title.setObjectName("LoadingTitle")
+        self.loading_title.setAlignment(Qt.AlignCenter)
+        self.loading_title.setWordWrap(True)
+        cl.addWidget(self.loading_title)
+        self.loading_sub = QLabel("")
+        self.loading_sub.setObjectName("LoadingSub")
+        self.loading_sub.setAlignment(Qt.AlignCenter)
+        self.loading_sub.setWordWrap(True)
+        cl.addWidget(self.loading_sub)
+        ol.addWidget(card, 0, Qt.AlignCenter)
+
+    def _show_loading(self, title: str, subtitle: str = "") -> None:
+        if not hasattr(self, "loading_overlay"):
+            return
+        self.loading_title.setText(title)
+        self.loading_sub.setText(subtitle)
+        self.loading_sub.setVisible(bool(subtitle))
+        if self.loading_overlay.isVisible():
+            self.loading_spinner.start()
+            self.loading_overlay.raise_()
+            QApplication.processEvents()
+            return
+        self.loading_overlay.setGeometry(
+            0, 0, self.centralWidget().width(), self.centralWidget().height()
+        )
+        self.loading_overlay.show()
+        self.loading_overlay.raise_()
+        self.loading_spinner.start()
+        self._fade_overlay(self.loading_overlay, True, _LOADING_FADE_MS)
+        self._update_settings_fab_visibility()
+        QApplication.processEvents()
+
+    def _hide_loading(self) -> None:
+        if not hasattr(self, "loading_overlay") or not self.loading_overlay.isVisible():
+            return
+
+        def _done() -> None:
+            self.loading_spinner.stop()
+            self.loading_overlay.hide()
+            self._update_settings_fab_visibility()
+
+        self._fade_overlay(self.loading_overlay, False, _LOADING_FADE_MS, done=_done)
+
+    def _fade_overlay(
+        self,
+        widget: QWidget,
+        show: bool,
+        ms: int,
+        done=None,
+    ) -> None:
+        if widget is None:
+            return
+        if _WEAK_HW or ms <= 40:
+            widget.setGraphicsEffect(None)
+            if show:
+                widget.show()
+            else:
+                widget.hide()
+            if done is not None:
+                done()
+            return
+        eff = widget.graphicsEffect()
+        if not isinstance(eff, QGraphicsOpacityEffect):
+            eff = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", widget)
+        anim.setDuration(max(40, int(ms)))
+        anim.setEasingCurve(QEasingCurve.OutCubic if show else QEasingCurve.InCubic)
+        anim.setStartValue(0.0 if show else 1.0)
+        anim.setEndValue(1.0 if show else 0.0)
+        if show:
+            widget.show()
+            widget.raise_()
+        def _finished() -> None:
+            if not show:
+                widget.hide()
+                widget.setGraphicsEffect(None)
+            if done is not None:
+                done()
+        anim.finished.connect(_finished)
+        anim.start()
+        widget._fade_anim = anim  # type: ignore[attr-defined]
+
+    def _stop_page_anim(self) -> None:
+        anim = getattr(self, "_page_anim", None)
+        if anim is not None:
+            anim.stop()
+            self._page_anim = None
+        ghost = getattr(self, "_page_ghost", None)
+        if ghost is not None:
+            ghost.hide()
+            ghost.setGraphicsEffect(None)
+        self._page_animating = False
+
+    def _transition_to_page(self, page: QWidget, screen: str) -> None:
+        cur = self.stack.currentWidget()
+        if cur is page:
+            return
+        prev = getattr(self, "_ui_screen", None)
+        if (
+            _WEAK_HW
+            or cur is None
+            or self._is_loading()
+            or prev is None
+        ):
+            self._stop_page_anim()
+            self.stack.setCurrentWidget(page)
+            return
+        self._stop_page_anim()
+        root = self.centralWidget()
+        if root is None:
+            self.stack.setCurrentWidget(page)
+            return
+        pix = self.stack.grab()
+        if pix.isNull():
+            self.stack.setCurrentWidget(page)
+            return
+        ghost = self._page_ghost
+        if ghost is None:
+            ghost = QLabel(root)
+            ghost.setObjectName("PageGhost")
+            ghost.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            ghost.setScaledContents(True)
+            self._page_ghost = ghost
+        geo = self.stack.geometry()
+        ghost.setPixmap(pix)
+        ghost.setGeometry(geo)
+        ghost.show()
+        ghost.raise_()
+        self.stack.setCurrentWidget(page)
+        self._page_animating = True
+        d0 = int(_SCREEN_DEPTH.get(str(prev), 0))
+        d1 = int(_SCREEN_DEPTH.get(str(screen), 0))
+        slide = 0
+        if d1 > d0:
+            slide = -56
+        elif d1 < d0:
+            slide = 56
+        eff = QGraphicsOpacityEffect(ghost)
+        ghost.setGraphicsEffect(eff)
+        fade = QPropertyAnimation(eff, b"opacity")
+        fade.setDuration(_PAGE_ANIM_MS)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.OutCubic)
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(fade)
+        if slide != 0:
+            move = QPropertyAnimation(ghost, b"pos")
+            move.setDuration(_PAGE_ANIM_MS)
+            move.setStartValue(geo.topLeft())
+            move.setEndValue(QPoint(geo.x() + slide, geo.y()))
+            move.setEasingCurve(QEasingCurve.OutCubic)
+            group.addAnimation(move)
+        def _done() -> None:
+            ghost.hide()
+            ghost.setGraphicsEffect(None)
+            self._page_animating = False
+            self._page_anim = None
+        group.finished.connect(_done)
+        self._page_anim = group
+        group.start()
+
+    def _on_standby_pulse(self, value) -> None:
+        if not hasattr(self, "standby_sub"):
+            return
+        eff = self.standby_sub.graphicsEffect()
+        if isinstance(eff, QGraphicsOpacityEffect):
+            eff.setOpacity(float(value))
+
+    def _set_standby_pulse(self, on: bool) -> None:
+        if not hasattr(self, "standby_sub"):
+            return
+        anim = getattr(self, "_standby_pulse", None)
+        if _WEAK_HW or not on:
+            if anim is not None:
+                anim.stop()
+            self.standby_sub.setGraphicsEffect(None)
+            return
+        eff = self.standby_sub.graphicsEffect()
+        if not isinstance(eff, QGraphicsOpacityEffect):
+            eff = QGraphicsOpacityEffect(self.standby_sub)
+            self.standby_sub.setGraphicsEffect(eff)
+        if anim is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(2200)
+            anim.setStartValue(0.52)
+            anim.setKeyValueAt(0.5, 1.0)
+            anim.setEndValue(0.52)
+            anim.setLoopCount(-1)
+            anim.setEasingCurve(QEasingCurve.InOutSine)
+            anim.valueChanged.connect(self._on_standby_pulse)
+            self._standby_pulse = anim
+        if anim.state() == QVariantAnimation.Stopped:
+            anim.start()
 
     def _wire_actions(self, root: QWidget) -> None:
         for btn in root.findChildren(QPushButton):
@@ -3955,6 +4310,8 @@ class MainWindow(QMainWindow):
     def _act(self, action: str) -> None:
         idle_up = hasattr(self, "idle_overlay") and self.idle_overlay.isVisible()
         if action in ("idle_quit", "idle_continue", "confirm_quit_yes", "confirm_quit_no"):
+            return
+        if self._is_loading():
             return
         if self._idle_active() and not idle_up:
             self._idle_note_activity()
@@ -3982,11 +4339,17 @@ class MainWindow(QMainWindow):
                 return
             self._open_name_editor(slot)
             return
+        if action == "calibration_detect":
+            t = get_settings().t
+            self._show_loading(t("calibrating"), t("calibrating_hint"))
+            QTimer.singleShot(80, self._run_deferred_settings_calibrate)
+            return
         if action in ("ingame_cal_confirm_empty", "ingame_cal_retry"):
+            t = get_settings().t
             self.session.handle_action(action)
             self._last_ui_sig = None
             self._sync_ingame_cal_overlay()
-            QApplication.processEvents()
+            self._show_loading(t("calibrating"), t("calibrating_hint"))
             QTimer.singleShot(200, self._run_deferred_ingame_cal)
             return
         self.session.handle_action(action)
@@ -3995,12 +4358,15 @@ class MainWindow(QMainWindow):
             self._apply_theme()
         self.refresh()
         if action == "clear_board_confirm":
-            self.clear_status.setText(get_settings().t("calibrating"))
-            self.clear_status.update()
-            self.clear_status.repaint()
-            self.repaint()
-            QApplication.processEvents()
-            QTimer.singleShot(600, self._run_deferred_clear_board_calibrate)
+            t = get_settings().t
+            auto = bool(get_settings().auto_calibrate)
+            title = t("calibrating") if auto else t("starting_game")
+            hint = t("starting_game_hint") if auto else t("please_wait")
+            self.clear_status.setText(title)
+            if hasattr(self, "clear_confirm_btn"):
+                self.clear_confirm_btn.setEnabled(False)
+            self._show_loading(title, hint)
+            QTimer.singleShot(400, self._run_deferred_clear_board_calibrate)
 
     def _on_settings_combo(self, kind: str) -> None:
         s = get_settings()
@@ -4764,15 +5130,28 @@ class MainWindow(QMainWindow):
         self._update_settings_fab_visibility()
 
     def _run_deferred_ingame_cal(self) -> None:
-        if not self.session.is_in_game_calibrating():
-            return
-        if str(self.session.ctx.get("_ingame_cal_phase") or "") != "busy":
-            return
-        self.session.run_in_game_calibrate()
-        self._last_ui_sig = None
-        self._ingame_cal_stills_loaded = False
-        self._sync_ingame_cal_overlay()
-        self.refresh()
+        try:
+            if not self.session.is_in_game_calibrating():
+                return
+            if str(self.session.ctx.get("_ingame_cal_phase") or "") != "busy":
+                return
+            self.session.run_in_game_calibrate()
+            self._last_ui_sig = None
+            self._ingame_cal_stills_loaded = False
+            self._sync_ingame_cal_overlay()
+            self.refresh()
+        finally:
+            self._hide_loading()
+
+    def _run_deferred_settings_calibrate(self) -> None:
+        try:
+            if self.session.screen != "calibration":
+                return
+            self.session.run_calibration_detect()
+            self._last_ui_sig = None
+            self.refresh()
+        finally:
+            self._hide_loading()
 
     def _show_pin(self, mode: str) -> None:
         t = get_settings().t
@@ -5072,15 +5451,20 @@ class MainWindow(QMainWindow):
             )
 
     def _run_deferred_clear_board_calibrate(self) -> None:
-        if self.session.screen != "clear_board":
-            return
-        if not self.session.ctx.get("_clear_board_pending_run"):
-            return
-        self.session.ctx["_clear_board_pending_run"] = False
-        self.session.ctx["_clear_board_pending_at"] = None
-        self.session.confirm_clear_board_and_start()
-        self._last_ui_sig = None
-        self.refresh()
+        try:
+            if self.session.screen != "clear_board":
+                return
+            if not self.session.ctx.get("_clear_board_pending_run"):
+                return
+            self.session.ctx["_clear_board_pending_run"] = False
+            self.session.ctx["_clear_board_pending_at"] = None
+            self.session.confirm_clear_board_and_start()
+            self._last_ui_sig = None
+            self.refresh()
+        finally:
+            if hasattr(self, "clear_confirm_btn"):
+                self.clear_confirm_btn.setEnabled(True)
+            self._hide_loading()
 
     def _ensure_mqtt_client(self) -> None:
         """Pokreni MQTT subscriber ako je način mqtt_qr (npr. nakon promjene u postavkama)."""
@@ -5516,7 +5900,14 @@ class MainWindow(QMainWindow):
         self.select_game_title.setObjectName("Title")
         self.select_game_title.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.select_game_title)
+        self.select_game_sub = QLabel("")
+        self.select_game_sub.setObjectName("Subtitle")
+        self.select_game_sub.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.select_game_sub)
+        lay.addSpacing(8)
         grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(18)
         modes = [
             ("301", "game:301"),
             ("501", "game:501"),
@@ -6347,6 +6738,8 @@ class MainWindow(QMainWindow):
                 self.settings_quit_lbl.setText(t("application"))
         if hasattr(self, "select_game_title"):
             self.select_game_title.setText(t("select_game"))
+        if hasattr(self, "select_game_sub"):
+            self.select_game_sub.setText(t("select_game_sub"))
         if hasattr(self, "select_players_title"):
             self.select_players_title.setText(t("select_players"))
         if hasattr(self, "select_players_continue"):
@@ -6746,10 +7139,11 @@ class MainWindow(QMainWindow):
         self._last_ui_sig = sig
         screen = snap["screen"]
         prev_screen = getattr(self, "_ui_screen", None)
-        self._ui_screen = screen
         page = self.pages.get(screen)
         if page is not None:
-            self.stack.setCurrentWidget(page)
+            self._transition_to_page(page, screen)
+        self._ui_screen = screen
+        self._set_standby_pulse(screen == "standby")
         lang = get_settings().language
         if self._i18n_lang != lang or self._i18n_screen != screen:
             self._i18n_lang = lang
@@ -7106,6 +7500,7 @@ class MainWindow(QMainWindow):
         self._killer_last_active_pi = None
         self._killer_finished_pis = set()
         self._hit_tags_prev = ["-", "-", "-"]
+        self._reset_hit_slot_widgets()
         if hasattr(self, "killer_numbers_lay") and self.killer_numbers_lay is not None:
             while self.killer_numbers_lay.count():
                 item = self.killer_numbers_lay.takeAt(0)
@@ -7114,6 +7509,34 @@ class MainWindow(QMainWindow):
                     w.deleteLater()
         if hasattr(self, "live_stack") and hasattr(self, "live_line"):
             self.live_stack.setCurrentWidget(self.live_line)
+
+    def _reset_hit_slot_widgets(self) -> None:
+        """Clear leftover hit-slot colors/text after leaving a match."""
+        for i in range(3):
+            prev = self._hit_anims[i] if i < len(self._hit_anims) else None
+            if prev is not None:
+                prev.stop()
+                self._hit_anims[i] = None
+            geo = self._hit_geo_restore[i] if i < len(self._hit_geo_restore) else None
+            if geo is not None and hasattr(self, "hit_btns") and i < len(self.hit_btns):
+                self.hit_btns[i].setGeometry(geo)
+            if i < len(self._hit_geo_restore):
+                self._hit_geo_restore[i] = None
+        empty_metal = _metal_bg("#1c1c22", "#2c2c34", "#141418")
+        empty_qss = (
+            "QPushButton#HitSlot { color: #777780; border-color: #5a5a68; "
+            f"{empty_metal} font-weight: 800; min-height: 0px; }}"
+            "QPushButton#HitSlot:hover, QPushButton#HitSlot:focus { "
+            f"color: #777780; border-color: #5a5a68; {empty_metal} }}"
+        )
+        if hasattr(self, "hit_btns"):
+            for b in self.hit_btns:
+                b.setText("-")
+                b.setStyleSheet(empty_qss + "QPushButton#HitSlot { font-size: 128px; }")
+        if hasattr(self, "manual_hit_btns"):
+            for b in self.manual_hit_btns:
+                b.setText("-")
+                b.setStyleSheet(empty_qss + "QPushButton#HitSlot { font-size: 72px; }")
 
     def _teardown_scoreboard_ui(self) -> None:
         """Leave/enter match: drop reused score widgets so leftover scores cannot animate."""
@@ -7125,6 +7548,9 @@ class MainWindow(QMainWindow):
             or self.score_box.count()
         ):
             self._clear_score_box()
+        else:
+            self._hit_tags_prev = ["-", "-", "-"]
+            self._reset_hit_slot_widgets()
 
     def _stop_cricket_turn_anim(self) -> None:
         if self._cricket_turn_anim is not None:
@@ -9259,8 +9685,8 @@ class MainWindow(QMainWindow):
             old_tag = self._hit_tags_prev[i] if i < len(self._hit_tags_prev) else "-"
             b.setText(new_tag)
             b.setEnabled(bool(enabled[i]))
+            _style_hit_btn(b, new_tag, font_px=128)
             if new_tag != old_tag:
-                _style_hit_btn(b, new_tag, font_px=128)
                 b.repaint()
                 if new_tag != "-":
                     self._animate_hit(i)
