@@ -1,5 +1,7 @@
 import cv2
 
+from camera_capture_config import force_capture_settings
+
 print("Pretraga dostupnih kamera...\n")
 
 found = False
@@ -7,6 +9,7 @@ found = False
 for i in range(10):
     print(f"Checking indexes {i}...", end=" ")
     cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+    force_capture_settings(cap)
 
     if not cap.isOpened():
         print("Not available")

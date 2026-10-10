@@ -1,19 +1,22 @@
 """Live UVC camera controls for Raspberry Pi (v4l2-ctl + OpenCV preview).
 
-Run on the Pi (kamere 0/2/4), while SmartDarts is NOT using the cameras:
+Run on the Pi while SmartDarts is NOT using the cameras. This tool opens all
+three board cameras (/dev/video0, /dev/video2 and /dev/video4) together at
+320x240, 15 FPS.
 
     python3 camera_controls.py
 
 Keys:
-  s      save to camera_controls.json (and apply to all cams)
+  0/2/4  select camera
+  s      save to camera_controls.json
   l      load from camera_controls.json
-  a      apply current values to ALL cameras
-  0/2/4  switch preview camera
+  a      apply current values to all three cameras
   w / x  previous / next control
   - / =  decrease / increase value (arrows also work)
   q / ESC  quit
 
 Kiosk učitava camera_controls.json pri otvaranju kamera (ako datoteka postoji).
+Every keyboard action is also available as a large touch button.
 """
 
 from __future__ import annotations
@@ -22,18 +25,35 @@ import json
 import os
 import re
 import shutil
-import ssl
 import subprocess
 import sys
-import threading
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+# Raspberry Pi Desktop exports Wayland for the PySide kiosk, but the OpenCV
+# wheel used by this standalone tool contains only the xcb HighGUI plugin.
+# This must be selected before importing cv2.
+if sys.platform.startswith("linux") and os.environ.get("QT_QPA_PLATFORM") == "wayland":
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 import cv2
 import numpy as np
 
+from camera_capture_config import (
+    CAPTURE_FPS,
+    CAPTURE_HEIGHT,
+    CAPTURE_WIDTH,
+)
+from calibration import CameraManager
+from led_ring import led_ring_off, led_ring_on
+
 CAMERA_INDICES: Tuple[int, ...] = (0, 2, 4)
+PREVIEW_WIDTH = 480
+PREVIEW_HEIGHT = 360
+UI_MIN_WIDTH = 960
 CONTROLS_FILENAME = "camera_controls.json"
+_INSTANCE_LOCK_PATH = "/tmp/smartdarts-camera-controls.lock"
 
 # Preferred order / labels for the most useful UVC knobs.
 _PREFERRED = (
@@ -201,17 +221,17 @@ def _ordered_names(ctrls: Dict[str, Ctrl]) -> List[str]:
     return pref + extra
 
 
-def _open_preview(index: int) -> Optional[cv2.VideoCapture]:
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap.release()
-        cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+def _button(img: np.ndarray, rect: Tuple[int, int, int, int], text: str, *, active: bool = False) -> None:
+    x1, y1, x2, y2 = rect
+    fill = (0, 190, 220) if active else (30, 205, 238)
+    border = (0, 235, 255)
+    cv2.rectangle(img, (x1, y1), (x2, y2), fill, -1)
+    cv2.rectangle(img, (x1, y1), (x2, y2), border, 2)
+    scale = 0.62 if len(text) <= 10 else 0.50
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    tx = x1 + max(4, (x2 - x1 - tw) // 2)
+    ty = y1 + (y2 - y1 + th) // 2
+    cv2.putText(img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, scale, (10, 10, 10), 2, cv2.LINE_AA)
 
 
 def _draw_ui(
@@ -220,64 +240,88 @@ def _draw_ui(
     ctrls: Dict[str, Ctrl],
     names: List[str],
     sel: int,
-) -> np.ndarray:
-    cell_w, cell_h = 320, 240
+    status: str = "",
+) -> Tuple[np.ndarray, List[Tuple[Tuple[int, int, int, int], str]]]:
+    cell_w, cell_h = PREVIEW_WIDTH, PREVIEW_HEIGHT
     gap = 8
     n = len(CAMERA_INDICES)
-    top = np.zeros((cell_h + 36, n * cell_w + (n - 1) * gap, 3), dtype=np.uint8)
+    content_w = n * cell_w + (n - 1) * gap
+    total_w = max(UI_MIN_WIDTH, content_w)
+    top = np.zeros((cell_h + 36, total_w, 3), dtype=np.uint8)
     top[:] = (24, 24, 28)
     for i, idx in enumerate(CAMERA_INDICES):
-        x = i * (cell_w + gap)
+        x = (total_w - content_w) // 2 + i * (cell_w + gap)
         fr = frames.get(idx)
         if fr is None:
             tile = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-            cv2.putText(tile, f"cam{idx} OFF", (70, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 200), 2)
+            cv2.putText(tile, f"cam{idx} OFF", (220, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 200), 2)
         else:
             tile = cv2.resize(fr, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
         if idx == active:
             cv2.rectangle(tile, (0, 0), (cell_w - 1, cell_h - 1), (0, 220, 220), 4)
         top[0:cell_h, x : x + cell_w] = tile
-        label = f"Kamera {idx}" + ("  [LIVE]" if idx == active else "")
+        live_state = "LIVE" if fr is not None else "OFF"
+        selected_state = " / ODABRANA" if idx == active else ""
+        label = f"Kamera {idx}  [{live_state}{selected_state}]"
         cv2.putText(top, label, (x + 8, cell_h + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 2)
 
-    row_h = 28
-    panel_h = 80 + max(8, len(names)) * row_h
+    row_h = 44
+    toolbar_h = 66
+    panel_h = toolbar_h + max(6, len(names)) * row_h + 12
     panel = np.zeros((panel_h, top.shape[1], 3), dtype=np.uint8)
     panel[:] = (18, 18, 22)
-    cv2.putText(
-        panel,
-        "s=save  l=load  a=apply-all  0/2/4=cam  w/x=ctrl  -/=value  q=quit",
-        (10, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (180, 180, 180),
-        1,
-    )
+    hit_regions: List[Tuple[Tuple[int, int, int, int], str]] = []
+    toolbar = [
+        *((f"KAMERA {idx}", f"camera:{idx}") for idx in CAMERA_INDICES),
+        ("SPREMI", "save"),
+        ("UCITAJ", "load"),
+        ("PRIMIJENI", "apply_all"),
+        ("IZLAZ", "quit"),
+    ]
+    margin, gap = 8, 7
+    bw = (panel.shape[1] - margin * 2 - gap * (len(toolbar) - 1)) // len(toolbar)
+    for j, (text, action) in enumerate(toolbar):
+        x1 = margin + j * (bw + gap)
+        rect = (x1, 8, x1 + bw, 55)
+        is_active = action == f"camera:{active}"
+        _button(panel, rect, text, active=is_active)
+        hit_regions.append((rect, action))
     for i, name in enumerate(names):
-        y = 56 + i * row_h
+        y = toolbar_h + i * row_h
         c = ctrls[name]
         selected = i == sel
         col = (0, 220, 220) if selected else (200, 200, 200)
-        bar_x1, bar_x2 = 360, top.shape[1] - 24
-        cv2.putText(panel, name, (12, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        minus_rect = (300, y + 4, 354, y + 39)
+        bar_x1, bar_x2 = 365, top.shape[1] - 74
+        plus_rect = (top.shape[1] - 63, y + 4, top.shape[1] - 9, y + 39)
+        cv2.putText(panel, name, (12, y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        _button(panel, minus_rect, "-", active=selected)
+        _button(panel, plus_rect, "+", active=selected)
+        hit_regions.append((minus_rect, f"minus:{i}"))
+        hit_regions.append((plus_rect, f"plus:{i}"))
+        hit_regions.append(((5, y, panel.shape[1] - 5, y + row_h - 1), f"select:{i}"))
         span = max(1, c.max_v - c.min_v)
         t = (c.value - c.min_v) / float(span)
         bx = int(bar_x1 + t * (bar_x2 - bar_x1))
-        cv2.rectangle(panel, (bar_x1, y + 8), (bar_x2, y + 18), (50, 50, 58), -1)
-        cv2.rectangle(panel, (bar_x1, y + 8), (max(bar_x1 + 1, bx), y + 18), col, -1)
+        cv2.rectangle(panel, (bar_x1, y + 12), (bar_x2, y + 31), (50, 50, 58), -1)
+        cv2.rectangle(panel, (bar_x1, y + 12), (max(bar_x1 + 1, bx), y + 31), col, -1)
         extra = ""
         if c.kind == "menu" and c.value in c.menu:
             extra = f" {c.menu[c.value]}"
-        cv2.putText(
-            panel,
-            f"{c.value}{extra}",
-            (bar_x1 - 120, y + 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            col,
-            1,
-        )
-    return np.vstack([top, panel])
+        value_text = f"{c.value}{extra}"
+        value_x = bar_x1 + 8
+        cv2.putText(panel, value_text, (value_x, y + 29), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(panel, value_text, (value_x, y + 29), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    if status:
+        cv2.putText(top, status[:90], (10, cell_h - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 235, 255), 2, cv2.LINE_AA)
+    # Panel actions use panel coordinates; offset them below the preview.
+    offset = top.shape[0]
+    hit_regions = [((x1, y1 + offset, x2, y2 + offset), action)
+                   for (x1, y1, x2, y2), action in hit_regions]
+    return np.vstack([top, panel]), hit_regions
 
 
 def _save(ctrls: Dict[str, Ctrl]) -> None:
@@ -304,50 +348,57 @@ def _load_into(ctrls: Dict[str, Ctrl], index: int) -> None:
     print(f"[camctl] loaded into cam{index}", flush=True)
 
 
-def _mqtt_led_on() -> None:
-    """Upali LED ring (isti broker/topic kao kiosk)."""
+def _claim_single_instance():
+    """Prevent repeated taps from opening several USB camera streams."""
+    if not sys.platform.startswith("linux"):
+        return None
     try:
-        import paho.mqtt.client as mqtt
-        from mqtt import BROKER_HOST, BROKER_PORT, PASSWORD, TOPIC, USERNAME
+        import fcntl
 
-        client = mqtt.Client()
-        client.username_pw_set(USERNAME, PASSWORD)
-        client.tls_set(
-            ca_certs=None,
-            certfile=None,
-            keyfile=None,
-            cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS_CLIENT,
-        )
-        client.connect(BROKER_HOST, BROKER_PORT, 60)
-        client.loop_start()
-        info = client.publish(TOPIC, "on", qos=1)
-        try:
-            info.wait_for_publish(timeout=5.0)
-        except Exception:
-            pass
-        client.loop_stop()
-        client.disconnect()
-        print(f"[camctl] MQTT 'on' -> {TOPIC}", flush=True)
-    except Exception as exc:
-        print(f"[camctl] MQTT on fail: {exc}", flush=True)
+        handle = open(_INSTANCE_LOCK_PATH, "w", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.write(str(os.getpid()))
+        handle.flush()
+        return handle
+    except (OSError, BlockingIOError):
+        print("[camctl] Camera Controls je vec pokrenut.", flush=True)
+        return False
 
 
 def main() -> int:
+    instance_lock = _claim_single_instance()
+    if instance_lock is False:
+        return 0
     if not _have_v4l2():
         print("v4l2-ctl nije u PATH — instaliraj v4l-utils (Raspberry Pi).", flush=True)
         print("  sudo apt install v4l-utils", flush=True)
         return 1
 
-    threading.Thread(target=_mqtt_led_on, daemon=True).start()
+    # Camera Controls always uses the original low-bandwidth three-camera
+    # profile, independently of the detector mode used by the kiosk process.
+    import camera_capture_config as capture_cfg
+    import calibration as calibration_module
 
-    caps: Dict[int, Optional[cv2.VideoCapture]] = {}
-    for idx in CAMERA_INDICES:
-        cap = _open_preview(idx)
-        caps[idx] = cap
-        print(f"[camctl] cam{idx}: {'OK' if cap is not None else 'FAIL'}", flush=True)
+    capture_cfg.SINGLE_CAMERA = False
+    capture_cfg.CAPTURE_WIDTH = 320
+    capture_cfg.CAPTURE_HEIGHT = 240
+    calibration_module.CAPTURE_WIDTH = 320
+    calibration_module.CAPTURE_HEIGHT = 240
+    calibration_module.CAMERA_INDICES = CAMERA_INDICES
+    calibration_module.CAMERA_LABELS = tuple(f"Kamera {idx}" for idx in CAMERA_INDICES)
 
-    active = next((i for i in CAMERA_INDICES if caps.get(i) is not None), CAMERA_INDICES[0])
+    # Camera Controls is an active board mode, just like calibration. Use the
+    # same GPIO17 controller as the main application.
+    led_ring_on()
+
+    # Reuse the capture manager with all three 320x240 streams.
+    active = CAMERA_INDICES[0]
+    camera_mgr = CameraManager()
+    camera_mgr.start()
+    camera_mgr.wait_for_frames(timeout_sec=12.0, min_cams=len(CAMERA_INDICES))
+    opened = camera_mgr.opened_indices()
+    if opened:
+        active = int(opened[0])
     ctrls = list_ctrls(active)
     if not ctrls:
         print(f"[camctl] nema V4L2 kontrola na /dev/video{active}", flush=True)
@@ -356,67 +407,110 @@ def main() -> int:
 
     win = "SmartDarts camera controls"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    print("[camctl] s=save l=load a=all-cams  arrows=adjust  q=quit", flush=True)
+    click_queue: List[Tuple[int, int]] = []
+    hit_regions: List[Tuple[Tuple[int, int, int, int], str]] = []
 
-    while True:
-        frames: Dict[int, Optional[np.ndarray]] = {}
-        for idx, cap in caps.items():
-            if cap is None or not cap.isOpened():
-                frames[idx] = None
-                continue
-            ok, fr = cap.read()
-            frames[idx] = fr if ok else None
-        img = _draw_ui(frames, active, ctrls, names, sel if names else 0)
-        cv2.imshow(win, img)
-        key = cv2.waitKey(30) & 0xFF
-        if key in (27, ord("q")):
-            break
-        if key == ord("0"):
-            active = 0
-            ctrls = list_ctrls(active)
-            names = _ordered_names(ctrls)
-            sel = 0
-        elif key == ord("2"):
-            active = 2
-            ctrls = list_ctrls(active)
-            names = _ordered_names(ctrls)
-            sel = 0
-        elif key == ord("4"):
-            active = 4
-            ctrls = list_ctrls(active)
-            names = _ordered_names(ctrls)
-            sel = 0
-        elif key == ord("s"):
+    def on_mouse(event, x, y, _flags, _userdata) -> None:
+        if event == cv2.EVENT_LBUTTONUP:
+            click_queue.append((int(x), int(y)))
+
+    cv2.setMouseCallback(win, on_mouse)
+    status = "Dodirni kameru ili + / -"
+    status_until = 0.0
+    print(f"[camctl] touch UI aktivan; kamere={opened}", flush=True)
+
+    def set_status(text: str) -> None:
+        nonlocal status, status_until
+        status = text
+        status_until = time.monotonic() + 3.0
+
+    def switch_camera(index: int) -> None:
+        nonlocal active, ctrls, names, sel
+        if index == active:
+            return
+        active = int(index)
+        ctrls = list_ctrls(active)
+        names = _ordered_names(ctrls)
+        sel = 0
+        live = camera_mgr.grab_frames().get(active) is not None
+        set_status(f"Kamera {active}: {'LIVE' if live else 'NEMA SIGNALA'}")
+
+    def adjust_control(index: int, direction: int) -> None:
+        nonlocal sel
+        if not names or not (0 <= index < len(names)):
+            return
+        sel = index
+        c = ctrls[names[sel]]
+        step = max(c.step, max(1, (c.max_v - c.min_v) // 50))
+        c.value = max(c.min_v, min(c.max_v, c.value + direction * step))
+        if set_ctrl(active, c.name, c.value):
+            set_status(f"{c.name}: {c.value}")
+        else:
+            set_status(f"Nije uspjelo: {c.name}")
+
+    def run_action(action: str) -> bool:
+        nonlocal sel
+        if action.startswith("camera:"):
+            switch_camera(int(action.split(":", 1)[1]))
+        elif action.startswith("select:"):
+            index = int(action.split(":", 1)[1])
+            if 0 <= index < len(names):
+                sel = index
+        elif action.startswith("minus:"):
+            adjust_control(int(action.split(":", 1)[1]), -1)
+        elif action.startswith("plus:"):
+            adjust_control(int(action.split(":", 1)[1]), 1)
+        elif action == "save":
             _save(ctrls)
             values = {n: c.value for n, c in ctrls.items()}
-            for idx in CAMERA_INDICES:
-                apply_values(idx, values)
-        elif key == ord("l"):
+            totals = [apply_values(idx, values) for idx in CAMERA_INDICES]
+            set_status(f"Spremljeno i primijenjeno: {totals}")
+        elif action == "load":
             _load_into(ctrls, active)
-        elif key == ord("a"):
+            set_status(f"Ucitano za kameru {active}")
+        elif action == "apply_all":
             values = {n: c.value for n, c in ctrls.items()}
-            for idx in CAMERA_INDICES:
-                n = apply_values(idx, values)
-                print(f"[camctl] apply-all cam{idx}: {n}", flush=True)
+            totals = [apply_values(idx, values) for idx in CAMERA_INDICES]
+            set_status(f"Primijenjeno na sve: {totals}")
+        elif action == "quit":
+            return False
+        return True
+
+    running = True
+    while running:
+        frames = camera_mgr.grab_frames()
+        shown_status = status if time.monotonic() < status_until else "Kamere 0 / 2 / 4 - 320x240 - controls"
+        img, hit_regions = _draw_ui(frames, active, ctrls, names, sel if names else 0, shown_status)
+        cv2.imshow(win, img)
+        key = cv2.waitKey(30) & 0xFF
+        while click_queue and running:
+            x, y = click_queue.pop(0)
+            for (x1, y1, x2, y2), action in hit_regions:
+                if x1 <= x <= x2 and y1 <= y <= y2:
+                    running = run_action(action)
+                    break
+        if key in (27, ord("q")):
+            break
+        if key in (ord("0"), ord("2"), ord("4")):
+            switch_camera(int(chr(key)))
+        elif key == ord("s"):
+            run_action("save")
+        elif key == ord("l"):
+            run_action("load")
+        elif key == ord("a"):
+            run_action("apply_all")
         elif names and key in (82, ord("w")):
             sel = (sel - 1) % len(names)
         elif names and key in (84, ord("x")):
             sel = (sel + 1) % len(names)
         elif names and key in (81, ord("-"), ord("_")):
-            c = ctrls[names[sel]]
-            step = max(c.step, max(1, (c.max_v - c.min_v) // 50))
-            c.value = max(c.min_v, c.value - step)
-            set_ctrl(active, c.name, c.value)
+            adjust_control(sel, -1)
         elif names and key in (83, ord("="), ord("+")):
-            c = ctrls[names[sel]]
-            step = max(c.step, max(1, (c.max_v - c.min_v) // 50))
-            c.value = min(c.max_v, c.value + step)
-            set_ctrl(active, c.name, c.value)
+            adjust_control(sel, 1)
 
-    for cap in caps.values():
-        if cap is not None:
-            cap.release()
+    camera_mgr.stop()
     cv2.destroyAllWindows()
+    led_ring_off()
     return 0
 
 

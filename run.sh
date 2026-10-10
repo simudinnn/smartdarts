@@ -11,4 +11,7 @@ if [ ! -x "venv/bin/python" ]; then
   ./venv/bin/pip install --upgrade pip
   ./venv/bin/pip install -r requirements.txt
 fi
-exec ./venv/bin/python main_manual.py --gui --kiosk "$@"
+if ! ./venv/bin/python -c "import cv2, PySide6, gpiozero, paho.mqtt.client, qrcode" 2>/dev/null; then
+  ./venv/bin/pip install -r requirements.txt
+fi
+exec ./venv/bin/python main_manual.py --gui --kiosk --fitline "$@"

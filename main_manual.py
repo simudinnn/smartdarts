@@ -3,7 +3,7 @@
 Manual-input darts kiosk app (no cameras, no detection).
 
 Keeps the same high-level flow as the camera app:
-- MQTT on/off control
+- MQTT QR start trigger
 - standby (QR) -> game selection -> player selection -> playing
 - fullscreen kiosk mode option
 
@@ -25,6 +25,7 @@ import os
 import random
 import signal
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -42,6 +43,7 @@ from calibration import (
     default_fake_cams_dir,
 )
 from board_calibration import BoardCalibrator
+from led_ring import led_ring_off, led_ring_on, led_ring_setup_low
 from dart_detection import (
     DartDetectResult,
     DartMotionDetector,
@@ -89,56 +91,6 @@ shutdown_requested = False
 def _on_sigint(_signum, _frame):
     global shutdown_requested
     shutdown_requested = True
-
-
-def send_mqtt_off():
-    try:
-        client = mqtt.Client()
-        client.username_pw_set(USERNAME, PASSWORD)
-        client.tls_set(
-            ca_certs=None,
-            certfile=None,
-            keyfile=None,
-            cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS_CLIENT,
-        )
-        client.connect(BROKER_HOST, BROKER_PORT, 60)
-        client.loop_start()
-        info = client.publish(TOPIC, "off", qos=1)
-        try:
-            info.wait_for_publish(timeout=5.0)
-        except Exception:
-            time.sleep(0.5)
-        client.loop_stop()
-        client.disconnect()
-        print(f"[MQTT] published 'off' -> {TOPIC}", flush=True)
-    except Exception as e:
-        print(f"[MQTT] send_mqtt_off failed: {e}", flush=True)
-
-
-def send_mqtt_on():
-    try:
-        client = mqtt.Client()
-        client.username_pw_set(USERNAME, PASSWORD)
-        client.tls_set(
-            ca_certs=None,
-            certfile=None,
-            keyfile=None,
-            cert_reqs=ssl.CERT_REQUIRED,
-            tls_version=ssl.PROTOCOL_TLS_CLIENT,
-        )
-        client.connect(BROKER_HOST, BROKER_PORT, 60)
-        client.loop_start()
-        info = client.publish(TOPIC, "on", qos=1)
-        try:
-            info.wait_for_publish(timeout=5.0)
-        except Exception:
-            time.sleep(0.5)
-        client.loop_stop()
-        client.disconnect()
-        print(f"[MQTT] published 'on' -> {TOPIC}", flush=True)
-    except Exception as e:
-        print(f"[MQTT] send_mqtt_on failed: {e}", flush=True)
 
 
 def _click_sound():
@@ -397,7 +349,6 @@ PLAYER_COLORS_BGR: Tuple[Tuple[int, int, int], ...] = (
     (0, 0, 0),        # crna (UI label/icon → bijela radi kontrasta)
 )
 
-WINNER_AUTO_EXIT_SEC = 30.0
 
 
 def _winner_screen_ready(game: Optional[Dict]) -> bool:
@@ -482,7 +433,7 @@ def _player_score_text(game: Dict, pi: int, pstate: Dict) -> str:
             return "DONE"
         want = targets[nxt]
         return "BULL" if str(want).lower() == "bull" else str(want)
-    if str(game.get("mode", "")).lower() in ("halve", "halve_it"):
+    if str(game.get("mode", "")).lower() in ("halve", "halve_it", "count_up"):
         return str(int(pstate.get("score", 0) or 0))
     return str(pstate.get("remaining", pstate.get("points", pstate.get("score", pstate.get("progress", 0)))))
 
@@ -1219,6 +1170,14 @@ def _killer_after_hit_registered(
     ctx: Dict, game: Dict, cur_idx: int, slot: int, hit: Optional[DetectedHit]
 ) -> None:
     """After a turn slot changes: resync live Killer lives/activation/bull steals."""
+    # Manual mode starts without the camera turn-start pass. Capture the same
+    # baseline here before the first hit so activation and life changes become
+    # live immediately instead of waiting for turn commit.
+    if _killer_is_play_phase(game) and not isinstance(ctx.get("_turn_players_snap"), list):
+        ctx["_turn_players_snap"] = copy.deepcopy(game.get("players") or [])
+        ctx["_turn_elim_snap"] = copy.deepcopy(game.get("eliminated_order") or [])
+        ctx["_turn_winner_snap"] = game.get("winner_player_idx")
+        ctx["_turn_placements_snap"] = copy.deepcopy(game.get("placements") or [])
     turn_hits = list(game.get("turn_hits") or [None, None, None])
     if 0 <= int(slot) < 3:
         turn_hits[int(slot)] = hit
@@ -1274,7 +1233,9 @@ def _killer_set_winner_if_any(game: Dict) -> None:
     if str(game.get("killer_phase", "play")).lower() == "assign":
         return
     players = game.get("players") or []
-    if not players:
+    # Require an actual elimination in a multi-player game. Besides matching
+    # Killer rules, this prevents incomplete/transient state ending the game.
+    if len(players) < 2 or not (game.get("eliminated_order") or []):
         return
     alive = [i for i, p in enumerate(players) if int(p.get("lives", 0)) > 0]
     if len(alive) > 1:
@@ -1437,7 +1398,7 @@ def _create_game(
     killer_phase = "play"
     names = [str(x or "")[:8] for x in (player_names or [])]
     for _ in range(n):
-        if mode in ("301", "501"):
+        if mode in ("101", "301", "501", "701"):
             players.append({"remaining": int(mode), "last_turn": [None, None, None], "is_in": False})
         elif mode in ("around", "around_the_world"):
             players.append({"next_target_idx": 0, "completed": False, "last_turn": [None, None, None]})
@@ -1461,7 +1422,7 @@ def _create_game(
                     "last_turn": [None, None, None],
                 }
             )
-        elif mode in ("halve", "halve_it"):
+        elif mode in ("halve", "halve_it", "count_up"):
             players.append({"score": 0, "last_turn": [None, None, None]})
         else:
             players.append({"remaining": 0, "last_turn": [None, None, None]})
@@ -1516,6 +1477,13 @@ def _create_game(
     if mode in ("halve", "halve_it"):
         halve_targets = _halve_build_targets(halve_mode)
 
+    count_up_rounds = int(rules_pending.get("count_up_rounds", 8) or 8)
+    if count_up_rounds not in (8, 12, 20):
+        count_up_rounds = 8
+    count_up_mode = str(rules_pending.get("count_up_mode", "normal")).lower()
+    if count_up_mode not in ("normal", "reverse"):
+        count_up_mode = "normal"
+
     game_rules = {
         "double_in": bool(rules_pending.get("double_in")),
         "double_out": bool(rules_pending.get("double_out")),
@@ -1529,6 +1497,8 @@ def _create_game(
         "around_order": around_order,
         "around_backstep": around_backstep,
         "halve_mode": halve_mode,
+        "count_up_rounds": count_up_rounds,
+        "count_up_mode": count_up_mode,
     }
     return {
         "mode": mode,
@@ -1628,7 +1598,7 @@ def _find_checkout_path(remaining: int, darts_left: int, double_out: bool) -> Op
 def _x01_live_score_line(game: Dict, cur_idx: int) -> Optional[str]:
     """Checkout prijedlog (bez live remaining — scoreboard se sam animira)."""
     mode = game.get("mode")
-    if mode not in ("301", "501"):
+    if mode not in ("101", "301", "501", "701"):
         return None
     rules = game.get("rules") or {}
     double_out = bool(rules.get("double_out"))
@@ -1654,7 +1624,7 @@ def _turn_fully_entered(turn_hits: List[Optional[DetectedHit]]) -> bool:
 
 def _x01_turn_is_bust(game: Dict, cur_idx: int, turn_hits: List[Optional[DetectedHit]]) -> bool:
     """True when entered darts (1–3) would bust the leg."""
-    if str(game.get("mode", "")).lower() not in ("301", "501"):
+    if str(game.get("mode", "")).lower() not in ("101", "301", "501", "701"):
         return False
     entered = [h for h in turn_hits if h is not None]
     if not entered:
@@ -1682,7 +1652,7 @@ def _x01_turn_is_bust(game: Dict, cur_idx: int, turn_hits: List[Optional[Detecte
 
 def _x01_turn_is_valid_checkout(game: Dict, cur_idx: int, turn_hits: List[Optional[DetectedHit]]) -> bool:
     """True when entered darts (1–3) legally finish the leg (incl. double-out on last scoring dart)."""
-    if str(game.get("mode", "")).lower() not in ("301", "501"):
+    if str(game.get("mode", "")).lower() not in ("101", "301", "501", "701"):
         return False
     entered = [h for h in turn_hits if h is not None]
     if not entered:
@@ -1783,7 +1753,7 @@ def _turn_can_submit(game: Dict, cur_idx: int, turn_hits: List[Optional[Detected
         return _killer_number_claimed_in_turn(game, cur_idx, turn_hits)
     if _turn_fully_entered(turn_hits):
         return True
-    if mode in ("301", "501"):
+    if mode in ("101", "301", "501", "701"):
         if _x01_turn_is_valid_checkout(game, cur_idx, turn_hits):
             return True
         if _x01_turn_is_bust(game, cur_idx, turn_hits):
@@ -1827,7 +1797,7 @@ def _turn_hits_display_line(game: Dict, cur_idx: int, turn_hits: List[Optional[D
 def _game_display_title(game: Dict) -> str:
     mode = str(game.get("mode", "GAME")).lower()
     rules = game.get("rules") or {}
-    if mode in ("301", "501"):
+    if mode in ("101", "301", "501", "701"):
         parts: List[str] = []
         if rules.get("double_in"):
             parts.append("DOUBLE IN")
@@ -1844,6 +1814,9 @@ def _game_display_title(game: Dict) -> str:
             "cut_throat": "CUT THROAT",
         }
         return f"CRICKET - {mode_labels.get(cmode, cmode.upper())}"
+    if mode == "count_up":
+        cmode = "MIN" if str(rules.get("count_up_mode", "normal")).lower() == "reverse" else "MAX"
+        return f"COUNT UP - {cmode}"
     if mode == "killer":
         act = str(rules.get("killer_activation", "double")).upper()
         phase = str(game.get("killer_phase", "play")).lower()
@@ -2009,6 +1982,25 @@ def _advance_round_if_needed(game: Dict, finished_idx: int, next_idx: int) -> No
             _halve_set_winner(game)
             if game.get("winner_player_idx") is not None and game.get("winner_at") is None:
                 game["winner_at"] = time.time()
+    elif str(game.get("mode", "")).lower() == "count_up":
+        rules = game.get("rules") or {}
+        limit = int(rules.get("count_up_rounds", 8) or 8)
+        if int(game.get("round_number", 1)) > limit:
+            reverse = str(rules.get("count_up_mode", "normal")).lower() == "reverse"
+            players = game.get("players") or []
+            ordered = sorted(
+                range(len(players)),
+                key=lambda pi: (
+                    int(players[pi].get("score", 0) or 0)
+                    if reverse
+                    else -int(players[pi].get("score", 0) or 0),
+                    pi,
+                ),
+            )
+            game["placements"] = ordered
+            game["winner_player_idx"] = ordered[0] if ordered else None
+            if game.get("winner_player_idx") is not None:
+                game["winner_at"] = time.time()
 
 
 def _pop_undo(game: Dict, gui_state: Dict, gui_ctx: Dict) -> bool:
@@ -2024,7 +2016,7 @@ def _pop_undo(game: Dict, gui_state: Dict, gui_ctx: Dict) -> bool:
 
 def _apply_turn_score(game: Dict, cur_idx: int, final_hits: List[Optional[DetectedHit]]) -> None:
     mode = game.get("mode")
-    if mode in ("301", "501"):
+    if mode in ("101", "301", "501", "701"):
         _apply_x01_turn(game, cur_idx, final_hits)
         return
 
@@ -2094,6 +2086,17 @@ def _apply_turn_score(game: Dict, cur_idx: int, final_hits: List[Optional[Detect
         _apply_halve_turn(game, cur_idx, final_hits)
         return
 
+    if mode == "count_up":
+        pstate = game["players"][cur_idx]
+        gained = sum(
+            int(h.hit_score.score)
+            for h in final_hits
+            if h is not None
+        )
+        pstate["score"] = int(pstate.get("score", 0) or 0) + gained
+        pstate["last_turn"] = final_hits
+        return
+
 
 def main():
     global shutdown_requested
@@ -2118,12 +2121,12 @@ def main():
     parser.add_argument(
         "--hybrid",
         action="store_true",
-        help="FitLine seed + local Y-refine (default; also SMARTDARTS_DETECTOR=hybrid)",
+        help="Experimental FitLine seed + local Y-refine",
     )
     parser.add_argument(
         "--fitline",
         action="store_true",
-        help="FitLine-only detector (disable hybrid Y-refine)",
+        help="FitLine-only detector (default; disable hybrid Y-refine)",
     )
     parser.add_argument(
         "--distance-yfit",
@@ -2135,18 +2138,36 @@ def main():
         action="store_true",
         help="Alias for --distance-yfit (no FitLine seed; P comes only from distance_yfit)",
     )
+    parser.add_argument("--ml", action="store_true", help="Experimental ML-only tip detection, without FitLine")
+    parser.add_argument("--single", action="store_true", help="One-camera 1280x720 experimental detector/data collection")
     args = parser.parse_args()
+
+    if args.single:
+        os.environ["SMARTDARTS_SINGLE_CAMERA"] = "1"
+        import camera_capture_config as _cc
+        import calibration as _cal
+        _cc.SINGLE_CAMERA=True; _cc.CAPTURE_WIDTH=1280; _cc.CAPTURE_HEIGHT=720
+        _cal.CAPTURE_WIDTH=1280; _cal.CAPTURE_HEIGHT=720
+        _cal.CAMERA_INDICES=(int(_cal.CAMERA_INDICES[0]),)
+        _cal.CAMERA_LABELS=(f"Kamera {_cal.CAMERA_INDICES[0]}",)
+        globals()["CAMERA_INDICES"]=_cal.CAMERA_INDICES
 
     fake_cams_dir = default_fake_cams_dir() if args.fakecams else None
     if fake_cams_dir is not None and not os.path.isdir(fake_cams_dir):
         print(f"[cam] --fakecams: folder ne postoji: {fake_cams_dir}", flush=True)
         return
-    if args.fitline:
+    if args.single:
+        detector_mode = "single"
+    elif args.ml:
+        detector_mode = "ml"
+    elif args.fitline:
         detector_mode = "fitline"
     elif args.yfit:
         detector_mode = "yfit"
-    else:
+    elif args.hybrid:
         detector_mode = "hybrid"
+    else:
+        detector_mode = "fitline"
     os.environ["SMARTDARTS_DETECTOR"] = detector_mode
     import dart_detection as _dd
 
@@ -2584,12 +2605,12 @@ def main():
             n_rows = 3
             cell_h = int((height - top - margin_bottom - gap_y * (n_rows - 1)) / n_rows)
             modes = [
-                ("game:301", "301"),
-                ("game:501", "501"),
+                ("game:x01", "X01"),
                 ("game:around", "AROUND"),
                 ("game:cricket", "CRICKET"),
                 ("game:killer", "KILLER"),
                 ("game:halve", "HALVE IT"),
+                ("game:count_up", "COUNT UP"),
             ]
             for idx, (bid, label) in enumerate(modes):
                 r = idx // 2
@@ -2601,7 +2622,7 @@ def main():
         elif screen == "rules_x01":
             mode = str(gui_state.get("selected_game_mode", "301")).upper()
             rules = gui_state.get("rules_pending") or {}
-            title = f"{mode} - PRAVILA"
+            title = "X01 - PRAVILA"
             title_scale = max(1.0, min(1.45, width / 420.0))
             (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, title_scale, 2)
             content_w = max(320, int(width * 0.90))
@@ -2617,6 +2638,16 @@ def main():
             title_y = block_top + th
             cv2.putText(panel, title, ((width - tw) // 2, title_y), cv2.FONT_HERSHEY_SIMPLEX, title_scale, UI["text"], 2)
             y_rules = title_y + title_gap
+            score_gap = max(8, int(width * 0.018))
+            score_w = (content_w - score_gap * 3) // 4
+            score_h = max(50, int(height * 0.085))
+            for idx, score in enumerate((101, 301, 501, 701)):
+                sx = x_left + idx * (score_w + score_gap)
+                add_button(
+                    f"x01_mode:{score}", sx, y_rules, sx + score_w, y_rules + score_h,
+                    str(score), active=True, style="rule_on" if mode == str(score) else "rule_off",
+                )
+            y_rules += score_h + max(14, int(height * 0.025))
             di_on = bool(rules.get("double_in"))
             do_on = bool(rules.get("double_out"))
             add_button(
@@ -3732,6 +3763,7 @@ def main():
         return all_ok, n_ref
 
     def _start_playing_after_clear_board() -> None:
+        led_ring_on()
         gui_state["screen"] = "playing"
         gui_ctx["_dart_turn_start_pending"] = True
         gui_ctx["_dart_no_ref_warned"] = False
@@ -4175,7 +4207,8 @@ def main():
             print(
                 f"[dart] empty probe px={max_px} td={int(getattr(dart_det, '_last_empty_td_px', 0))} "
                 f"raw={int(getattr(dart_det, '_last_empty_raw_px', 0))} diff={max_diff:.2f} "
-                f"(prag td<={EMPTY_BOARD_MAX_PIXELS} raw_hand>={EMPTY_BOARD_RAW_HAND_PIXELS} "
+                f"(prag td<={int(getattr(dart_det, '_last_empty_limit', EMPTY_BOARD_MAX_PIXELS))} "
+                f"raw_hand>={EMPTY_BOARD_RAW_HAND_PIXELS} "
                 f"diff<={EMPTY_BOARD_MAX_DIFF_MEAN})",
                 flush=True,
             )
@@ -4342,6 +4375,7 @@ def main():
         if gui_state.get("screen") == "calibration":
             return
         gui_state["_prev_screen"] = gui_state.get("screen", "standby")
+        led_ring_on()
         cam_mgr = gui_ctx.get("camera_mgr")
         if cam_mgr is not None:
             cam_mgr.start()
@@ -4365,12 +4399,18 @@ def main():
         gui_state["screen"] = prev
         gui_state["_prev_screen"] = None
         gui_ctx["buttons"] = []
+        if prev not in (
+            "select_game", "rules_x01", "rules_cricket", "rules_killer",
+            "select_players", "clear_board", "playing",
+        ):
+            led_ring_off()
 
     def _handle_nav_back() -> None:
         screen = gui_state.get("screen", "standby")
         mode = str(gui_state.get("selected_game_mode") or "")
         if screen == "select_game":
             gui_state["screen"] = "standby"
+            led_ring_off()
         elif screen == "rules_x01":
             gui_state["screen"] = "select_game"
         elif screen == "rules_cricket":
@@ -4378,7 +4418,7 @@ def main():
         elif screen == "rules_killer":
             gui_state["screen"] = "select_game"
         elif screen == "select_players":
-            if mode in ("301", "501"):
+            if mode in ("101", "301", "501", "701"):
                 gui_state["screen"] = "rules_x01"
             elif mode == "cricket":
                 gui_state["screen"] = "rules_cricket"
@@ -4478,6 +4518,8 @@ def main():
             if bid.startswith("game:"):
                 _click_sound()
                 mode = bid.split(":", 1)[1]
+                if mode == "x01":
+                    mode = "301"
                 gui_state["selected_game_mode"] = mode
                 gui_state["rules_pending"] = {
                     "double_in": False,
@@ -4492,7 +4534,7 @@ def main():
                     "around_backstep": 0,
                     "halve_mode": "standard",
                 }
-                if mode in ("301", "501"):
+                if mode in ("101", "301", "501", "701"):
                     gui_state["screen"] = "rules_x01"
                 elif mode == "cricket":
                     gui_state["screen"] = "rules_cricket"
@@ -4500,6 +4542,12 @@ def main():
                     gui_state["screen"] = "rules_killer"
                 else:
                     gui_state["screen"] = "select_players"
+                return
+            if bid.startswith("x01_mode:"):
+                _click_sound()
+                score = bid.split(":", 1)[1]
+                if score in ("101", "301", "501", "701"):
+                    gui_state["selected_game_mode"] = score
                 return
             if bid == "rule:double_in":
                 _click_sound()
@@ -4598,6 +4646,7 @@ def main():
                 all_hits.clear()
                 gui_ctx["editing_hit_slot"] = None
                 gui_ctx["_clear_board_status"] = ""
+                led_ring_on()
                 gui_state["screen"] = "clear_board"
                 return
             if bid == "request_exit_game":
@@ -4610,10 +4659,7 @@ def main():
                     gui_state["current_player_idx"] = 0
                     gui_ctx["game"] = None
                     all_hits.clear()
-                    try:
-                        send_mqtt_off()
-                    except Exception:
-                        pass
+                    led_ring_off()
                 else:
                     gui_state["screen"] = "exit_confirm"
                 return
@@ -4625,10 +4671,7 @@ def main():
                 gui_state["current_player_idx"] = 0
                 gui_ctx["game"] = None
                 all_hits.clear()
-                try:
-                    send_mqtt_off()
-                except Exception:
-                    pass
+                led_ring_off()
                 return
             if bid == "confirm_exit_no":
                 _click_sound()
@@ -4895,29 +4938,9 @@ def main():
         except Exception as e:
             print("[MQTT] GUI subscriber failed:", e)
 
-        try:
-            from kiosk_settings import get_settings as _gs
-
-            _skip_mqtt = _gs().start_mode == "always_on"
-        except Exception:
-            _skip_mqtt = False
-        if _skip_mqtt:
-            print("[MQTT] Startup skipped (always_on)")
-        else:
-            send_mqtt_on()
-            print("[MQTT] Startup 'on' sent")
+        led_ring_setup_low()
     else:
-        try:
-            from kiosk_settings import get_settings as _gs
-
-            _skip_mqtt = _gs().start_mode == "always_on"
-        except Exception:
-            _skip_mqtt = False
-        if _skip_mqtt:
-            print("[MQTT] Startup skipped (always_on, no GUI)")
-        else:
-            send_mqtt_on()
-            print("[MQTT] Startup 'on' sent (no GUI)")
+        led_ring_setup_low()
 
     if args.gui:
         cv2.namedWindow("Pikado", cv2.WINDOW_NORMAL)
@@ -4952,6 +4975,7 @@ def main():
                         cmd = mqtt_pending_cmd
                         mqtt_pending_cmd = None
                 if cmd == "on":
+                    led_ring_on()
                     gui_state["screen"] = "select_game"
                     gui_state["selected_game_mode"] = None
                     gui_state["num_players"] = 0
@@ -4959,37 +4983,22 @@ def main():
                     gui_ctx["game"] = None
                     all_hits.clear()
                 elif cmd == "off":
+                    led_ring_off()
                     gui_state["screen"] = "standby"
                     gui_state["selected_game_mode"] = None
                     gui_state["num_players"] = 0
                     gui_state["current_player_idx"] = 0
                     gui_ctx["game"] = None
                     all_hits.clear()
-
-            # Winner auto-return: after WINNER_AUTO_EXIT_SEC on winner screen, go back to standby.
-            g_auto = gui_ctx.get("game")
-            if (
-                gui_state.get("screen") == "playing"
-                and g_auto
-                and _winner_screen_ready(g_auto)
-            ):
-                t0 = g_auto.get("winner_shown_at")
-                if t0 is None:
-                    g_auto["winner_shown_at"] = time.time()
-                elif time.time() - float(t0) >= WINNER_AUTO_EXIT_SEC:
-                    gui_state["screen"] = "standby"
-                    gui_state["selected_game_mode"] = None
-                    gui_state["num_players"] = 0
-                    gui_state["current_player_idx"] = 0
-                    gui_ctx["game"] = None
-                    all_hits.clear()
-                    try:
-                        send_mqtt_off()
-                    except Exception:
-                        pass
 
             if args.gui:
                 screen = gui_state.get("screen", "standby")
+
+                if screen in (
+                    "select_game", "rules_x01", "rules_cricket", "rules_killer",
+                    "select_players", "clear_board", "playing", "calibration",
+                ):
+                    led_ring_on()
 
                 # Kamere: kalibracija + igra (auto-detekcija strijelica).
                 cam_mgr_guard = gui_ctx.get("camera_mgr")
@@ -5228,7 +5237,7 @@ def main():
                     else:
                         _enter_calibration()
                 elif key == ord("3"):
-                    send_mqtt_on()
+                    led_ring_on()
                 elif gui_state.get("screen") == "calibration" and key == 27:
                     _exit_calibration()
                 elif gui_state.get("screen") == "calibration" and key == ord("b"):
@@ -5286,9 +5295,8 @@ def main():
                 cv2.destroyAllWindows()
             except Exception:
                 pass
-        send_mqtt_off()
+        led_ring_off()
 
 
 if __name__ == "__main__":
     main()
-

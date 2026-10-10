@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from compact_log import print
+
 import math
 import os
 import time
@@ -43,7 +45,7 @@ from board_calibration import (
 )
 
 
-MOTION_DIFF_THRESH = 25
+MOTION_DIFF_THRESH = 20
 MOTION_MIN_PIXELS = 20
 MOTION_MAX_PIXELS = 12000
 # Scattered LED/empty-ref specks can sum past MOTION_MIN_PIXELS. Reject
@@ -56,14 +58,22 @@ MOTION_LOG_MIN_PIXELS = 6
 MOTION_ARM_PIXELS = 28
 MOTION_CLEAR_PIXELS = 12
 SETTLE_FRAME_DELAY = 2
+# Native 1280x720 single-camera samples: real darts were 760+ retained pixels,
+# while false edge/noise triggers were 33..223 before cleanup.
+SINGLE_MOTION_ARM_PIXELS = 120
+SINGLE_MIN_COMPONENT_AREA = 4
+# Empty native 720p samples contain at most ~223 retained noise pixels, while
+# a settled dart starts around 760. Used only for automatic player switching.
+SINGLE_EMPTY_BOARD_MAX_PIXELS = 320
 # FitLine (2-stage): soft grayscale motion gated by dilated morph ROI →
 # fixed FITLINE_SIZE → mild Gaussian blur → radial flight downweight →
 # intensity-weighted PCA (stage1) → multicam tip fuse → stage2 FitLine on
 # soft pixels inside a circle around that tip → fuse again → map back.
 # Morph is a soft pixel gate only (no CC / shaft / flight blob return).
 # Detection warp + FitLine ds space (preview stays at DEBUG_WARP_SIZE=200).
-FITLINE_SIZE = 300
+FITLINE_SIZE = 200
 FITLINE_DS_SIZE = FITLINE_SIZE
+MOTION_DEBUG_SAVE_SIZE = 200
 FITLINE_BLUR_KSIZE = 5
 FITLINE_BLUR_SIGMA = 2.0
 # Ignore near-black for numerical stability (weights stay continuous above this).
@@ -73,11 +83,11 @@ FITLINE_MIN_PX = 8
 FITLINE_GATE_DILATE = 5
 # Experimental joint Y detector (no FitLine seed). "fitline" keeps production path.
 # "hybrid" = FitLine seed + local Y-refine.
-DART_DETECTOR_MODE = os.environ.get("SMARTDARTS_DETECTOR", "hybrid").strip().lower()
-if DART_DETECTOR_MODE not in ("fitline", "yfit", "hybrid"):
-    DART_DETECTOR_MODE = "hybrid"
+DART_DETECTOR_MODE = os.environ.get("SMARTDARTS_DETECTOR", "fitline").strip().lower()
+if DART_DETECTOR_MODE not in ("fitline", "yfit", "hybrid", "ml", "single"):
+    DART_DETECTOR_MODE = "fitline"
 # Experimental warpPolar distance-Y (distance_yfit_warppolar_final_v2).
-# Default off: hybrid FitLine/Y-refine stays production.
+# Default off: FitLine-only is the production default.
 # SMARTDARTS_TIP_ESTIMATOR=distance_yfit  (alias: SMARTDARTS_TIP_MODE)
 _raw_tip = (
     os.environ.get("SMARTDARTS_TIP_ESTIMATOR")
@@ -281,9 +291,10 @@ FUSE_MIN_CAMS = 2
 FUSE_MIN_CROSS_2CAM = 0.18  # |sin θ| ≈ 10.4°
 FITLINE_PAIR_CROSS_MIN = 0.08  # 3-cam pairwise skip (unchanged)
 BULL_MOTION_MAX_BULL_OUTER = 2.2
-SAVE_MOTION_DEBUG = False
-# Hit debug: fused_motion_raw (blobs) + scoring-canvas FitLine / Y-refine overlays.
+SAVE_MOTION_DEBUG = True
+# Training debug: only clean, camera-colored fused motion blobs.
 SAVE_HIT_FUSION_DEBUG = True
+SAVE_PER_CAMERA_DEBUG = False
 MOTION_REFS_DIRNAME = "dart_motion_refs"
 # BGR boje po kameri za hit fusion debug overlay (jarke radi vidljivosti).
 _HIT_DEBUG_CAM_COLORS = {
@@ -307,36 +318,35 @@ def _safe_imwrite(path: str, img: Optional[np.ndarray]) -> bool:
         return False
 
 
+def _debug_imwrite(path: str, img: Optional[np.ndarray]) -> bool:
+    """Save debug output with neither dimension above 200 pixels."""
+    if img is None or img.size == 0:
+        return False
+    out = img
+    height, width = out.shape[:2]
+    scale = min(1.0, 200.0 / float(max(1, width)), 200.0 / float(max(1, height)))
+    if scale < 1.0:
+        out = cv2.resize(
+            out,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return _safe_imwrite(path, out)
+
+
 def motion_refs_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), MOTION_REFS_DIRNAME)
 
 
-# Lazy cache: False = unavailable; callable = apply_ml_tip_pipeline.
-_ML_TIP_FN: Optional[object] = None
-
-
-def _apply_ml_tip_cached(fused: FusedDartResult, per_cam, board_calibrator) -> FusedDartResult:
-    global _ML_TIP_FN
-    if _ML_TIP_FN is False:
-        return fused
-    if _ML_TIP_FN is None:
-        try:
-            from ml_tip.runtime import apply_ml_tip_pipeline
-
-            _ML_TIP_FN = apply_ml_tip_pipeline
-        except Exception:
-            _ML_TIP_FN = False
-            return fused
+def _submit_ml_shadow(fused, *, save_debug=False) -> bool:
+    if os.environ.get("SMARTDARTS_ML_SHADOW", "0") != "1":
+        return False
     try:
-        return _ML_TIP_FN(  # type: ignore[misc]
-            fused,
-            per_cam,
-            out_size=FITLINE_SIZE,
-            board_calibrator=board_calibrator,
-        )
+        from ml_tip.runtime import submit_shadow
+        return submit_shadow(fused, save_debug=save_debug)
     except Exception as exc:
-        print(f"[ml_tip] pipeline error (ignored): {exc}", flush=True)
-        return fused
+        print(f"[ml_tip] submit error (ignored): {exc}", flush=True)
+        return False
 
 
 @dataclass
@@ -403,6 +413,7 @@ class DartDetectResult:
 @dataclass
 class FusedDartResult:
     found: bool
+    tip_source: str = field(default="fitline", kw_only=True)
     tip_xy: Tuple[float, float] = (0.0, 0.0)
     confidence: float = 0.0
     segment_number: int = 0
@@ -1416,6 +1427,84 @@ def _motion_mask(ref_gray: np.ndarray, cur_gray: np.ndarray) -> np.ndarray:
     return cv2.bitwise_and(diff, diff, mask=binary)
 
 
+def _single_clean_motion(mask: np.ndarray, ellipse=None) -> Tuple[np.ndarray, int]:
+    """Small native-resolution cleanup and retained-pixel count for single mode."""
+    if mask is None or mask.size == 0:
+        return mask, 0
+    gray = mask if mask.ndim == 2 else cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    if ellipse is not None:
+        # Ignore cables, lamps and people outside the board. Keep a modest rim
+        # margin so a real double/miss-edge dart can still arm the detector.
+        roi = _board_ellipse_mask(gray.shape[:2], _scale_ellipse(ellipse, 1.12))
+        gray = cv2.bitwise_and(gray, gray, mask=roi)
+    binary = (gray > 0).astype(np.uint8) * 255
+    # A short close (dilation then erosion) reconnects a thin shaft without the
+    # initial erosion that removed legitimate 1–2 px shaft sections.
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)),
+        iterations=1,
+    )
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    keep = np.zeros_like(binary)
+    for label in range(1, int(n)):
+        if int(stats[label, cv2.CC_STAT_AREA]) >= SINGLE_MIN_COMPONENT_AREA:
+            keep[labels == label] = 255
+    # Preserve measured diff intensities and give morphology-created bridge
+    # pixels the threshold value so the connected shaft stays connected for
+    # geometry/scoring.
+    cleaned = np.where(
+        keep > 0,
+        np.maximum(gray, np.uint8(MOTION_DIFF_THRESH)),
+        0,
+    ).astype(np.uint8)
+    return cleaned, int(np.count_nonzero(keep))
+
+
+def _single_dart_component_chain(
+    labels: np.ndarray, stats: np.ndarray, anchor_label: int
+) -> np.ndarray:
+    """Keep components forming one shaft/flight chain; reject wire reflections."""
+    selected_labels = {int(anchor_label)}
+    candidates = {
+        label
+        for label in range(1, int(stats.shape[0]))
+        if int(stats[label, cv2.CC_STAT_AREA]) >= SINGLE_MIN_COMPONENT_AREA
+    }
+
+    def bounds(label: int) -> Tuple[float, float, float, float, float]:
+        x = float(stats[label, cv2.CC_STAT_LEFT])
+        y = float(stats[label, cv2.CC_STAT_TOP])
+        w = float(stats[label, cv2.CC_STAT_WIDTH])
+        h = float(stats[label, cv2.CC_STAT_HEIGHT])
+        return x, y, x + w - 1.0, y + h - 1.0, x + 0.5 * w
+
+    changed = True
+    while changed:
+        changed = False
+        for label in list(candidates - selected_labels):
+            lx0, ly0, lx1, ly1, lcx = bounds(label)
+            for chosen in selected_labels:
+                cx0, cy0, cx1, cy1, ccx = bounds(chosen)
+                vertical_gap = max(0.0, ly0 - cy1 - 1.0, cy0 - ly1 - 1.0)
+                if vertical_gap > 58.0:
+                    continue
+                horizontal_gap = max(0.0, lx0 - cx1 - 1.0, cx0 - lx1 - 1.0)
+                allowed_horizontal = 10.0 + 0.28 * vertical_gap
+                if horizontal_gap <= allowed_horizontal and abs(lcx - ccx) <= 52.0:
+                    selected_labels.add(label)
+                    changed = True
+                    break
+
+    selected = np.zeros(labels.shape, dtype=np.uint8)
+    for label in selected_labels:
+        selected[labels == label] = 255
+    return selected
+
+
 def _motion_binary(motion_gray: np.ndarray) -> np.ndarray:
     """0/255 maska iz grayscale motion diffa (za bitwise OR/XOR)."""
     return (motion_gray > 0).astype(np.uint8) * 255
@@ -1472,7 +1561,7 @@ def _save_motion_debug(
     diff_mean: float = 0.0,
     status: str = "",
 ) -> None:
-    if not SAVE_MOTION_DEBUG or cam_idx < 0:
+    if not SAVE_PER_CAMERA_DEBUG or cam_idx < 0:
         return
     _ensure_debug_dir_exists()
     base = os.path.join(_debug_dir_path(), f"cam_{cam_idx}")
@@ -1480,13 +1569,26 @@ def _save_motion_debug(
         diff_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     else:
         diff_vis = mask.copy()
+    if diff_vis.shape[:2] != (MOTION_DEBUG_SAVE_SIZE, MOTION_DEBUG_SAVE_SIZE):
+        diff_vis = cv2.resize(
+            diff_vis,
+            (MOTION_DEBUG_SAVE_SIZE, MOTION_DEBUG_SAVE_SIZE),
+            interpolation=cv2.INTER_AREA,
+        )
     txt = f"px={motion_pixels} mean={diff_mean:.1f}"
     if status:
         txt += f" {status}"
     cv2.putText(diff_vis, txt, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
-    cv2.imwrite(base + "_motion_diff.png", diff_vis)
+    _debug_imwrite(base + "_motion_diff.png", diff_vis)
     if fit_img is not None:
-        cv2.imwrite(base + "_motion_fit.png", fit_img)
+        fit_save = fit_img
+        if fit_save.shape[:2] != (MOTION_DEBUG_SAVE_SIZE, MOTION_DEBUG_SAVE_SIZE):
+            fit_save = cv2.resize(
+                fit_save,
+                (MOTION_DEBUG_SAVE_SIZE, MOTION_DEBUG_SAVE_SIZE),
+                interpolation=cv2.INTER_AREA,
+            )
+        _debug_imwrite(base + "_motion_fit.png", fit_save)
 
 
 def _hit_debug_cam_color(cam_idx: int) -> Tuple[int, int, int]:
@@ -1533,21 +1635,6 @@ def _compose_cam_colored_motion(
         col = np.array(_hit_debug_cam_color(cam), dtype=np.float32)
         acc += w[:, :, None] * col
     canvas = np.clip(acc, 0, 255).astype(np.uint8)
-    y = 10
-    for cam in sorted(seen):
-        col = _hit_debug_cam_color(cam)
-        cv2.rectangle(canvas, (8, y), (20, y + 12), col, -1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            f"cam{cam}",
-            (26, y + 11),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
-            col,
-            1,
-            cv2.LINE_AA,
-        )
-        y += 16
     return canvas
 
 
@@ -2042,7 +2129,7 @@ def _save_fitline_smooth_debug(
         )
     _draw_hud_lines(canvas, hud)
     cpath = os.path.join(motion_dir, f"{stem}_fitline_smooth_intersect.png")
-    cv2.imwrite(cpath, canvas)
+    _debug_imwrite(cpath, canvas)
     saved.append(cpath)
     return saved
 
@@ -2076,127 +2163,52 @@ def save_hit_fusion_debug(
     board_calibrator: Optional[BoardCalibrator] = None,
     warp_refs: Optional[Dict[int, np.ndarray]] = None,
     out_size: int = FITLINE_SIZE,
+    canvas: Optional[np.ndarray] = None,
+    prediction_xy: Optional[Tuple[float, float]] = None,
 ) -> Optional[str]:
-    """Save hit debug images during normal detection:
+    """Save one clean 200x200 fused motion PNG, without labels or geometry.
 
-    - ``{stem}_fused_motion_raw.png`` — fused motion blobs on black, color per camera
-    - ``motion/{stem}_fitline_smooth_intersect.png`` — scoring-coordinate canvas
-      (no board photo) + FitLine rays + pair intersections + FIT P
+    Compatibility parameters remain for existing callers. Camera colors and soft
+    blob processing are unchanged, so training samples keep the same channel map.
     """
     if not _hit_motion_debug_enabled() or not fused.found:
         return None
-
-    # All on-board FitLine cams (including consensus-rejected fleeers).
-    all_line_cams = [
-        r
-        for r in fused.per_cam
-        if r.found
-        and r.motion_pixels >= MOTION_MIN_PIXELS
-        and r.reject_reason != "off_board_raw"
-    ]
-    used_ids = {int(c) for c in fused.cam_indices}
-    line_cams = [r for r in all_line_cams if int(r.cam_idx) in used_ids]
-    if not line_cams:
-        line_cams = list(all_line_cams)
-    draw_cams = list(all_line_cams) if all_line_cams else list(line_cams)
-
-    # Optional fire-warps only as last-resort fallback (never preferred over empty).
-    fire_warps = dict(warp_refs) if warp_refs else {}
-    if not fire_warps:
-        fire_warps = _warp_grays_for_debug(board_calibrator, raw_frames)
-
+    if canvas is None:
+        canvas = _compose_cam_colored_motion(list(fused.per_cam), FITLINE_SIZE)
     _ensure_debug_dir_exists()
-    base_gray: Optional[np.ndarray] = None
-    # Stable empty board from calibration / board-clear — not post-hit motion ref.
-    for cam_idx in fused.cam_indices:
-        ref = empty_refs.get(int(cam_idx))
-        if ref is not None:
-            base_gray = ref
-            break
-    if base_gray is None:
-        for ref in empty_refs.values():
-            base_gray = ref
-            break
-    if base_gray is None:
-        for cam_idx in fused.cam_indices:
-            ref = fire_warps.get(int(cam_idx))
-            if ref is not None:
-                base_gray = ref
-                break
-    if base_gray is None:
-        for ref in fire_warps.values():
-            base_gray = ref
-            break
-    if base_gray is None:
-        for r in draw_cams:
-            if r.debug_bgr is not None:
-                base_gray = cv2.cvtColor(r.debug_bgr, cv2.COLOR_BGR2GRAY)
-                break
-    if base_gray is None:
-        base_gray = np.zeros((out_size, out_size), dtype=np.uint8)
-
-    if base_gray.shape[0] != out_size or base_gray.shape[1] != out_size:
-        base_gray = cv2.resize(base_gray, (out_size, out_size), interpolation=cv2.INTER_AREA)
-
-    # Fused soft motion blobs only — no FitLine strokes / tip overlays.
-    soft_acc: Optional[np.ndarray] = None
-    blob_cams: List[DartDetectResult] = []
-    seen_blob: set[int] = set()
-    for r in list(draw_cams) + list(fused.per_cam):
-        cam = int(r.cam_idx)
-        if cam in seen_blob:
-            continue
-        gray = _motion_blob_gray_u8(r, out_size)
-        if gray is None or int(np.count_nonzero(gray)) <= 0:
-            continue
-        seen_blob.add(cam)
-        blob_cams.append(r)
-        if soft_acc is None:
-            soft_acc = gray.astype(np.uint8, copy=True)
-        else:
-            np.maximum(soft_acc, gray, out=soft_acc)
-
-    # One frame, blobs colored by camera (cam0 red / cam2 green / cam4 cyan).
-    if blob_cams:
-        canvas = _compose_cam_colored_motion(blob_cams, out_size)
-    else:
-        canvas = np.zeros((out_size, out_size, 3), dtype=np.uint8)
-
+    motion_dir = os.path.join(_debug_dir_path(), "motion")
+    os.makedirs(motion_dir, exist_ok=True)
     stamp = time.strftime("%H%M%S")
-    ms = int((time.time() % 1) * 1000)
-    dbg = _debug_dir_path()
-    label = _zone_short_label(fused.zone_name, fused.segment_number)
-    stem = f"hit_{stamp}_{ms:03d}_{label}"
-    motion_dir = os.path.join(dbg, "motion")
-    try:
-        os.makedirs(motion_dir, exist_ok=True)
-    except OSError:
-        motion_dir = dbg
-
-    # 1) Fused soft-motion blobs only on black (no FitLine strokes).
-    fused_path = os.path.join(motion_dir, f"{stem}_fused_motion_raw.png")
-    if SAVE_HIT_FUSION_DEBUG or SAVE_MOTION_DEBUG:
-        cv2.imwrite(fused_path, canvas)
-        print(f"[dart] hit debug: {fused_path}", flush=True)
-
-    # 2) Scoring-coordinate canvas + FitLine rays + intersections + FIT P.
-    intersect_paths: List[str] = []
-    for p in _save_fitline_smooth_debug(
-        stem,
-        fused,
-        line_cams,
-        motion_dir,
-        base_gray=base_gray,
-        soft_acc=soft_acc,
-        draw_cams=draw_cams,
-        board_calibrator=board_calibrator,
-    ):
-        print(f"[dart] hit fitline smooth debug: {p}", flush=True)
-        intersect_paths.append(p)
-
-    return fused_path if (SAVE_HIT_FUSION_DEBUG or SAVE_MOTION_DEBUG) else (
-        intersect_paths[0] if intersect_paths else None
-    )
+    # Nanoseconds avoid overwriting samples from rapid consecutive hits.
+    stem = f"hit_{stamp}_{time.time_ns()}_{_zone_short_label(fused.zone_name, fused.segment_number)}"
+    path = os.path.join(motion_dir, f"{stem}_fused_motion_raw.png")
+    if not _debug_imwrite(path, canvas):
+        return None
+    if prediction_xy is not None:
+        marked = canvas.copy()
+        px = int(round(float(prediction_xy[0])))
+        py = int(round(float(prediction_xy[1])))
+        px = max(0, min(marked.shape[1] - 1, px))
+        py = max(0, min(marked.shape[0] - 1, py))
+        # White outline remains visible on all three camera colours; magenta
+        # centre identifies the exact model output without altering raw data.
+        cv2.circle(marked, (px, py), 8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.drawMarker(marked, (px, py), (255, 0, 255), cv2.MARKER_CROSS, 15, 2)
+        label_text = f"ML {px},{py} {_zone_short_label(fused.zone_name, fused.segment_number)}"
+        cv2.putText(marked, label_text, (5, 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        marked_path = os.path.join(motion_dir, f"{stem}_ml_prediction.png")
+        _debug_imwrite(marked_path, marked)
+        try:
+            import json
+            with open(os.path.join(motion_dir, f"{stem}_ml_prediction.json"), "w", encoding="utf-8") as meta:
+                json.dump({"x": float(prediction_xy[0]), "y": float(prediction_xy[1]),
+                           "label": _zone_short_label(fused.zone_name, fused.segment_number),
+                           "score": int(fused.score)}, meta, indent=2)
+        except OSError as exc:
+            print(f"[DEBUG] metadata nije spremljena: {exc}", flush=True)
+    print(f"[DEBUG] spremljen hit: {os.path.basename(path)}", flush=True)
+    return path
 
 
 def _board_center_and_r(out_size: int = FITLINE_SIZE) -> Tuple[Tuple[float, float], float]:
@@ -5063,7 +5075,7 @@ def save_yrefine_debug(
     except OSError:
         motion_dir = _debug_dir_path()
     path = os.path.join(motion_dir, f"{stem}_yrefine.png")
-    _safe_imwrite(path, canvas)
+    _debug_imwrite(path, canvas)
     print(f"[yrefine] debug {path}", flush=True)
     return path
 
@@ -5128,7 +5140,7 @@ def save_yfit_debug(
     except OSError:
         motion_dir = _debug_dir_path()
     path = os.path.join(motion_dir, f"{stem}_yfit.png")
-    cv2.imwrite(path, canvas)
+    _debug_imwrite(path, canvas)
     print(f"[yfit] debug {path}", flush=True)
     return path
 
@@ -5208,7 +5220,7 @@ def save_distance_yfit_debug(
     except OSError:
         motion_dir = _debug_dir_path()
     path = os.path.join(motion_dir, f"{stem}_distance_yfit.png")
-    cv2.imwrite(path, canvas)
+    _debug_imwrite(path, canvas)
     print(f"[dyfit] debug {path}", flush=True)
     return path
 
@@ -6006,6 +6018,7 @@ class DartMotionDetector:
         self._last_empty_td_px: int = 0
         self._last_empty_raw_px: int = 0
         self._last_empty_td_diff: float = 0.0
+        self._last_empty_limit: int = EMPTY_BOARD_MAX_PIXELS
         n = self.load_refs_persistent()
         nr = self.load_raw_refs_persistent()
         ne = self.load_empty_refs_persistent()
@@ -6180,15 +6193,17 @@ class DartMotionDetector:
         return bool(self._refs)
 
     def has_empty_references(self) -> bool:
+        if DART_DETECTOR_MODE == "single":
+            return bool(self._empty_raw_refs)
         return bool(self._empty_refs)
 
     def set_reference_topdown(self, cam_idx: int, topdown_bgr: np.ndarray) -> None:
         """Ažurira samo motion referencu (nikad praznu kalibracijsku)."""
         self._refs[cam_idx] = cv2.cvtColor(topdown_bgr, cv2.COLOR_BGR2GRAY).copy()
-        if SAVE_MOTION_DEBUG and cam_idx >= 0:
+        if SAVE_PER_CAMERA_DEBUG and cam_idx >= 0:
             _ensure_debug_dir_exists()
             path = os.path.join(_debug_dir_path(), f"cam_{cam_idx}_motion_ref.png")
-            cv2.imwrite(path, topdown_bgr)
+            _debug_imwrite(path, topdown_bgr)
 
     def set_raw_reference(self, cam_idx: int, frame_bgr: np.ndarray) -> None:
         self._raw_refs[cam_idx] = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).copy()
@@ -6363,6 +6378,97 @@ class DartMotionDetector:
 
     def _max_motion_pixels(self, per_cam: List[DartDetectResult]) -> int:
         return max((r.motion_pixels for r in per_cam), default=0)
+
+    def detect_ml(self, board_calibrator, frames):
+        from ml_tip.runtime import predict_ready
+        layers=[]
+        for cam_idx,frame in frames.items():
+            if frame is None:
+                continue
+            cal=board_calibrator.get(cam_idx)
+            ref=self._refs.get(int(cam_idx))
+            if cal is None or not cal.is_valid() or cal.double_ellipse is None or ref is None:
+                continue
+            warped=_warp_frame(board_calibrator,int(cam_idx),frame,cal)
+            if warped is not None:
+                layers.append(extract_yfit_motion_layer(warped,ref,cam_idx=int(cam_idx)))
+        # Raw surround participates only in the motion/wait state machine. It
+        # must never classify MISS by itself: for an edge double, shaft/flight
+        # are naturally outside the ellipse even though the tip scores.
+        # Keep weaker (8..19 px) top-down paths for ML so a confirmed surround
+        # throw can still obtain a tip near/outside the double wire.
+        usable=[r for r in layers
+                if r.fit_gray is not None
+                and r.motion_pixels>=FITLINE_MIN_PX
+                and r.reject_reason not in ('high_motion','no_blob')]
+        # Require calibrated motion in at least two cameras. A heatmap maximum
+        # alone does not establish that a dart was thrown.
+        if len(usable)<2:
+            return FusedDartResult(False,per_cam=layers,reject_reason='ml_no_motion',tip_source='ml'),None,{}
+        begin=time.perf_counter()
+        image=_compose_cam_colored_motion(usable,FITLINE_SIZE)
+        compose_ms=(time.perf_counter()-begin)*1000
+        if not np.any(image):
+            return FusedDartResult(False,per_cam=layers,reject_reason='ml_empty',tip_source='ml'),None,{}
+        xy,timing=predict_ready(image)
+        cals=[board_calibrator.get(r.cam_idx) for r in usable]
+        number,zone,score=score_topdown_point(float(xy[0]),float(xy[1]),cals=cals,log_geom=False)
+        result=FusedDartResult(True,tip_source='ml',tip_xy=tuple(map(float,xy)),
+            segment_number=number,zone_name=zone,score=score,
+            cam_indices=[r.cam_idx for r in usable],per_cam=usable)
+        timing['compose_ms']=compose_ms
+        return result,image,timing
+
+    def detect_single(self, board_calibrator, frames):
+        """Native single-camera blob endpoint; warp only the selected point."""
+        if not frames: return FusedDartResult(False,reject_reason='single_no_frame')
+        cam_idx=sorted(frames)[0]; frame=frames.get(cam_idx)
+        cal=board_calibrator.get(cam_idx); ref=self._raw_refs.get(cam_idx)
+        if frame is None or cal is None or ref is None or cal.double_ellipse is None:
+            return FusedDartResult(False,reject_reason='single_no_ref')
+        gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+        refg=ref if ref.shape==gray.shape else cv2.resize(ref,(gray.shape[1],gray.shape[0]))
+        mask,_kept_px=_single_clean_motion(
+            _motion_mask(refg,gray), cal.double_ellipse
+        )
+        n,labels,stats,_=cv2.connectedComponentsWithStats(mask,connectivity=8)
+        if n<=1: return FusedDartResult(False,reject_reason='single_no_blob')
+        j=1+int(np.argmax(stats[1:,cv2.CC_STAT_AREA])); area=int(stats[j,cv2.CC_STAT_AREA])
+        if area < SINGLE_MIN_COMPONENT_AREA or _kept_px < SINGLE_MOTION_ARM_PIXELS:
+            return FusedDartResult(False,reject_reason='single_blob_size')
+        # Board colours can split the dart into several components. Follow only
+        # a locally connected shaft/flight chain from the largest component;
+        # a nearby but detached wire reflection must not become the lowest tip.
+        selected = _single_dart_component_chain(labels, stats, j)
+        ys,xs=np.where(selected>0)
+        if not len(xs): return FusedDartResult(False,reject_reason='single_no_tip')
+        bottom_y=int(np.max(ys)); bottom_xs=xs[ys >= max(0,bottom_y-2)]
+        tip=(float(np.median(bottom_xs)),float(bottom_y))
+        marker=np.zeros_like(frame); cv2.circle(marker,(int(tip[0]),int(tip[1])),5,(255,255,255),-1)
+        warped=board_calibrator.warp_topdown(cam_idx,marker,out_size=FITLINE_SIZE)
+        if warped is None: return FusedDartResult(False,reject_reason='single_map_fail')
+        wy,wx=np.where(cv2.cvtColor(warped,cv2.COLOR_BGR2GRAY)>20)
+        if not len(wx): return FusedDartResult(False,reject_reason='single_map_empty')
+        xy=(float(np.mean(wx)),float(np.mean(wy)))
+        number,zone,score=score_topdown_point(*xy,out_size=FITLINE_SIZE,cals=[cal],log_geom=False)
+        if score<=0: number,zone,score=0,'miss',0
+        confidence = min(1.0, max(0.25, float(_kept_px) / 900.0))
+        layer=DartDetectResult(
+            cam_idx=cam_idx,
+            found=True,
+            motion_pixels=_kept_px,
+            tip_xy=xy,
+            confidence=confidence,
+            motion_gray=mask.copy(),
+        )
+        result=FusedDartResult(True,tip_source='single',tip_xy=xy,segment_number=number,
+            zone_name=zone,score=score,confidence=confidence,
+            cam_indices=[cam_idx],per_cam=[layer])
+        result._single_canvas=cv2.cvtColor(mask,cv2.COLOR_GRAY2BGR)
+        result._single_tip_native=tip
+        result._single_motion_native=mask.copy()
+        result._single_frame_native=frame.copy()
+        return result
 
     def detect_yfit(
         self,
@@ -6610,6 +6716,38 @@ class DartMotionDetector:
             cal = board_calibrator.get(cam_idx)
             if cal is None or not cal.is_valid() or cal.double_ellipse is None:
                 continue
+            if DART_DETECTOR_MODE == "single":
+                raw_ref = self._raw_refs.get(cam_idx)
+                if raw_ref is None:
+                    out.append(
+                        DartDetectResult(
+                            cam_idx=cam_idx,
+                            found=False,
+                            reject_reason="single_no_raw_ref",
+                        )
+                    )
+                    continue
+                cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                ref_gray = raw_ref
+                if ref_gray.shape != cur_gray.shape:
+                    ref_gray = cv2.resize(
+                        ref_gray,
+                        (cur_gray.shape[1], cur_gray.shape[0]),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                raw_motion, retained_px = _single_clean_motion(
+                    _motion_mask(ref_gray, cur_gray), cal.double_ellipse
+                )
+                out.append(
+                    DartDetectResult(
+                        cam_idx=cam_idx,
+                        found=False,
+                        motion_pixels=int(retained_px),
+                        diff_mean=float(np.mean(cv2.absdiff(cur_gray, ref_gray))),
+                        motion_gray=raw_motion,
+                    )
+                )
+                continue
             ref = self._refs.get(cam_idx)
             warped = _warp_frame(board_calibrator, cam_idx, frame, cal)
             if warped is None or ref is None:
@@ -6724,6 +6862,38 @@ class DartMotionDetector:
         frames: Dict[int, Optional[np.ndarray]],
     ) -> Tuple[int, float]:
         """Motion px i diff_mean vs prazna ref (top-down + raw surround)."""
+        if DART_DETECTOR_MODE == "single":
+            if not self._empty_raw_refs:
+                self._last_empty_td_px = 999999
+                self._last_empty_raw_px = 999999
+                self._last_empty_td_diff = 999999.0
+                return 999999, 999999.0
+            board_px = 0
+            board_diff = 0.0
+            for cam_idx, frame in frames.items():
+                if frame is None:
+                    continue
+                cal = board_calibrator.get(cam_idx)
+                empty_raw = self._empty_raw_refs.get(cam_idx)
+                if cal is None or cal.double_ellipse is None or empty_raw is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                ref_gray = empty_raw if empty_raw.shape == gray.shape else cv2.resize(
+                    empty_raw, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA
+                )
+                _motion, retained = _single_clean_motion(
+                    _motion_mask(ref_gray, gray), cal.double_ellipse
+                )
+                board_px = max(board_px, int(retained))
+                board_diff = max(board_diff, float(np.mean(cv2.absdiff(gray, ref_gray))))
+            surround_px, surround_diff = self._probe_empty_raw_surround(
+                board_calibrator, frames
+            )
+            self._last_empty_td_px = int(board_px)
+            self._last_empty_raw_px = int(surround_px)
+            self._last_empty_td_diff = float(board_diff)
+            return max(board_px, surround_px), max(board_diff, surround_diff)
+
         if not self._empty_refs:
             self._last_empty_td_px = 999999
             self._last_empty_raw_px = 999999
@@ -6749,7 +6919,13 @@ class DartMotionDetector:
         td_px = int(self._last_empty_td_px)
         raw_px = int(self._last_empty_raw_px)
         td_diff = float(self._last_empty_td_diff)
-        ok = td_px <= EMPTY_BOARD_MAX_PIXELS
+        empty_px_limit = (
+            SINGLE_EMPTY_BOARD_MAX_PIXELS
+            if DART_DETECTOR_MODE == "single"
+            else EMPTY_BOARD_MAX_PIXELS
+        )
+        self._last_empty_limit = int(empty_px_limit)
+        ok = td_px <= empty_px_limit
         if td_px >= EMPTY_BOARD_DIFF_APPLY_MIN_PX:
             ok = ok and td_diff <= EMPTY_BOARD_MAX_DIFF_MEAN
         # Ruka koja vadi strijelice: raw surround skoči na tisuće (LED šum je ~800).
@@ -6902,6 +7078,11 @@ class DartMotionDetector:
         """
         probe = self.probe_motion(board_calibrator, frames, save_debug=False)
         max_px = self._max_motion_pixels(probe)
+        arm_threshold = (
+            SINGLE_MOTION_ARM_PIXELS
+            if DART_DETECTOR_MODE == "single"
+            else MOTION_ARM_PIXELS
+        )
         state = self._motion_state
         if self._hand_cooldown_frames > 0:
             self._hand_cooldown_frames -= 1
@@ -6918,7 +7099,7 @@ class DartMotionDetector:
                 if self._clear_frames >= HAND_BLOCK_CLEAR_FRAMES:
                     # Ako strijela i dalje stoji (motion), odmah natrag u armed —
                     # inace idle+cooldown petlja propušta bacanja i gomila blobove.
-                    if max_px >= MOTION_ARM_PIXELS:
+                    if max_px >= arm_threshold:
                         self._motion_state = "armed"
                         self._armed_frames = 1
                         self._arm_t0 = time.perf_counter()
@@ -6944,14 +7125,14 @@ class DartMotionDetector:
             if self._post_hit_need_clear:
                 # Leftover dart/vibration after a scored hit: eat it, do not fuse
                 # (radial leftover on 1 cam projects onto bull).
-                if max_px >= MOTION_ARM_PIXELS:
+                if max_px >= arm_threshold:
                     self.commit_board_snapshot(board_calibrator, frames, persist=False)
                 self._post_hit_need_clear = False
                 self._cache_settle_frame(board_calibrator, frames, keep_bgr=False)
                 return probe, None, "idle"
             if (
                 not self.is_hand_cooldown_active()
-                and max_px >= MOTION_ARM_PIXELS
+                and max_px >= arm_threshold
             ):
                 self._motion_state = "armed"
                 self._armed_frames = 0
@@ -6963,7 +7144,11 @@ class DartMotionDetector:
                 return probe, None, "idle"
 
         # armed — settle + stabilnost (ignoriraj ruku)
-        if max_px < MOTION_ARM_PIXELS:
+        # A 15 FPS single camera often sees the dart in flight for one frame,
+        # then one quiet frame, then the dart settled in the board.  Do not
+        # cancel that latched throw on the quiet frame.  Multi-camera modes
+        # keep their existing continuous-motion requirement.
+        if max_px < arm_threshold and DART_DETECTOR_MODE != "single":
             self._motion_state = "idle"
             self._armed_frames = 0
             self._hand_stable_streak = 0
@@ -6978,7 +7163,13 @@ class DartMotionDetector:
             self._cache_settle_frame(board_calibrator, frames, keep_bgr=True)
             return probe, None, f"armed_{self._armed_frames}/{SETTLE_FRAME_DELAY}"
 
-        hand_now = self._any_hand_in_frames(board_calibrator, frames)
+        # The multi-camera hand vote is not meaningful with one camera and can
+        # classify the large native-resolution dart blob as a hand.
+        hand_now = (
+            False
+            if DART_DETECTOR_MODE == "single"
+            else self._any_hand_in_frames(board_calibrator, frames)
+        )
         if hand_now:
             self._enter_hand_block()
             self._cache_settle_frame(board_calibrator, frames, keep_bgr=False)
@@ -6990,7 +7181,7 @@ class DartMotionDetector:
             return probe, None, f"armed_stable_{self._hand_stable_streak}/{HAND_STABILITY_FRAMES}"
 
         if not accept_fire:
-            if max_px < MOTION_ARM_PIXELS:
+            if max_px < arm_threshold:
                 self._motion_state = "idle"
                 self._armed_frames = 0
                 return probe, None, "armed_abort"
@@ -7002,6 +7193,12 @@ class DartMotionDetector:
 
         # Detekcija na zadnjem stabilnom kadru (settle cache), ne na svjezem USB bufferu.
         fire_frames = self._fire_frames if len(self._fire_frames) >= 2 else frames
+        if DART_DETECTOR_MODE == "ml":
+            from ml_tip.runtime import model_ready
+            if not model_ready():
+                return probe, None, "ml_warmup"
+        ml_canvas = None
+        ml_timing = {}
         t_proc = time.perf_counter()
         wait_since_arm_ms = 0.0
         if self._arm_t0 > 0.0:
@@ -7009,9 +7206,8 @@ class DartMotionDetector:
         # Soft-threshold FitLine po kameri (downscaled) → tip = sjecište u ds, map natrag.
         t_detect = time.perf_counter()
         fuse_perf: Dict[str, float] = {}
-        fitline_debug_saved = False
         dyfit_used = False
-        if _distance_yfit_enabled():
+        if DART_DETECTOR_MODE not in ("ml", "single") and _distance_yfit_enabled():
             fused = self.detect_distance_yfit(board_calibrator, fire_frames)
             per_cam = list(fused.per_cam)
             detect_ms = (time.perf_counter() - t_detect) * 1000.0
@@ -7031,7 +7227,19 @@ class DartMotionDetector:
                 t_detect = time.perf_counter()
                 fuse_perf = {}
         if not dyfit_used:
-            if DART_DETECTOR_MODE == "yfit":
+            if DART_DETECTOR_MODE == "ml":
+                try:
+                    fused, ml_canvas, ml_timing = self.detect_ml(board_calibrator, fire_frames)
+                except Exception as exc:
+                    print(f"[ML] detekcija nije uspjela: {exc}", flush=True)
+                    fused = FusedDartResult(False, tip_source="ml", reject_reason="ml_error")
+                per_cam = list(fused.per_cam)
+                detect_ms = (time.perf_counter() - t_detect)*1000
+            elif DART_DETECTOR_MODE == "single":
+                fused=self.detect_single(board_calibrator,fire_frames)
+                ml_canvas=getattr(fused,'_single_canvas',None)
+                per_cam=list(fused.per_cam); detect_ms=(time.perf_counter()-t_detect)*1000
+            elif DART_DETECTOR_MODE == "yfit":
                 fused = self.detect_yfit(board_calibrator, fire_frames)
                 per_cam = list(fused.per_cam)
                 detect_ms = (time.perf_counter() - t_detect) * 1000.0
@@ -7047,20 +7255,11 @@ class DartMotionDetector:
                     per_cam, board_calibrator=board_calibrator, perf=fuse_perf
                 )
                 fused.per_cam = per_cam
-                fused = _apply_ml_tip_cached(fused, per_cam, board_calibrator)
                 skip_refine = (not fused.found) or fused.reject_reason in (
                     "miss_majority",
                     "off_board_raw",
                 )
                 if DART_DETECTOR_MODE == "hybrid" and fused.found and not skip_refine:
-                    if save_debug and _hit_motion_debug_enabled():
-                        save_hit_fusion_debug(
-                            fused,
-                            self._empty_refs,
-                            raw_frames=fire_frames,
-                            board_calibrator=board_calibrator,
-                        )
-                        fitline_debug_saved = True
                     t_yr = time.perf_counter()
                     try:
                         fused = run_yrefine_local(
@@ -7073,72 +7272,45 @@ class DartMotionDetector:
         total_arm_to_result_ms = (
             (time.perf_counter() - self._arm_t0) * 1000.0 if self._arm_t0 > 0.0 else total_processing_ms
         )
-        # Debug / raw-shaft shadow nakon UI-ja — ne smiju blokirati prikaz hita.
-        if save_debug and fused.found and _hit_motion_debug_enabled():
-            if dyfit_used:
-                save_distance_yfit_debug(
-                    fused,
-                    self._empty_refs,
-                    raw_frames=fire_frames,
-                    board_calibrator=board_calibrator,
-                )
-            elif DART_DETECTOR_MODE == "yfit":
-                save_yfit_debug(
-                    fused,
-                    self._empty_refs,
-                    raw_frames=fire_frames,
-                    board_calibrator=board_calibrator,
-                )
-            elif DART_DETECTOR_MODE == "hybrid":
-                save_yrefine_debug(
-                    fused,
-                    self._empty_refs,
-                    raw_frames=fire_frames,
-                    board_calibrator=board_calibrator,
-                )
-                if not fitline_debug_saved:
-                    save_hit_fusion_debug(
-                        fused,
-                        self._empty_refs,
-                        raw_frames=fire_frames,
-                        board_calibrator=board_calibrator,
-                    )
-            else:
-                save_hit_fusion_debug(
-                    fused,
-                    self._empty_refs,
-                    raw_frames=fire_frames,
-                    board_calibrator=board_calibrator,
-                )
+        # Disk I/O is scheduled by KioskSession only after the hit reaches UI state.
+        debug_needed = bool(
+            save_debug
+            and fused.found
+            and _hit_motion_debug_enabled()
+            and DART_DETECTOR_MODE != "single"
+        )
+        if DART_DETECTOR_MODE != "ml":
+            _submit_ml_shadow(fused, save_debug=False)
 
+        total_processing_ms = (time.perf_counter() - t_proc) * 1000.0
+        total_arm_to_result_ms = ((time.perf_counter() - self._arm_t0) * 1000.0
+                                  if self._arm_t0 > 0 else total_processing_ms)
         self._motion_state = "post_fire"
         self._armed_frames = 0
         self._clear_frames = 0
         if fused.found:
-            print(
-                "[PERF][HIT]\n"
-                f"wait_since_arm={wait_since_arm_ms:.1f}ms\n"
-                f"detect_all={detect_ms:.1f}ms\n"
-                f"stage1={float(fuse_perf.get('stage1', 0.0)):.1f}ms\n"
-                f"fuse1={float(fuse_perf.get('fuse1', 0.0)):.1f}ms\n"
-                f"stage2={float(fuse_perf.get('stage2', 0.0)):.1f}ms\n"
-                f"fuse2={float(fuse_perf.get('fuse2', 0.0)):.1f}ms\n"
-                f"score={float(fuse_perf.get('score', 0.0)):.1f}ms\n"
-                + (
-                    f"yrefine={float(fuse_perf.get('yrefine', 0.0)):.1f}ms\n"
-                    if "yrefine" in fuse_perf
-                    else ""
+            if DART_DETECTOR_MODE == "single" and save_debug:
+                from debug_io import enqueue_single_motion
+
+                enqueue_single_motion(
+                    fused.cam_indices[0] if fused.cam_indices else 0,
+                    getattr(fused, "_single_frame_native", None),
+                    getattr(fused, "_single_motion_native", None),
+                    tip_xy=getattr(fused, "_single_tip_native", None),
+                    label=_zone_short_label(fused.zone_name, fused.segment_number),
                 )
-                + (
-                    f"dyfit={float(fused.yfit_ms):.1f}ms\n"
-                    if dyfit_used
-                    else ""
-                )
-                + f"total_processing={total_processing_ms:.1f}ms\n"
-                f"total_arm_to_result={total_arm_to_result_ms:.1f}ms",
-                flush=True,
-            )
+            print(f"[HIT {DART_DETECTOR_MODE.upper()}] {_zone_short_label(fused.zone_name, fused.segment_number)} "
+                  f"xy={fused.tip_xy[0]:.1f},{fused.tip_xy[1]:.1f} | "
+                  f"cekanje={wait_since_arm_ms:.0f}ms | obrada={total_processing_ms:.0f}ms | "
+                  f"do_rezultata={total_arm_to_result_ms:.0f}ms"
+                  + ((f" | ML={ml_timing['inference_ms']:.0f}ms | decode={ml_timing['decode_ms']:.0f}ms "
+                      f"| guard={int(bool(ml_timing.get('endpoint_guard', False)))} "
+                      f"| slika={ml_timing['compose_ms']:.0f}ms" if ml_timing else "")), flush=True)
             tag = "fired_miss" if fused.zone_name == "miss" or fused.score <= 0 else "fired"
+            # Transient attributes are consumed by KioskSession and never enter
+            # scoring/game state.
+            fused._debug_canvas = ml_canvas
+            fused._debug_needed = debug_needed
             return probe, fused, tag
         if fused.reject_reason:
             print(f"[dart] fusion reject: {fused.reject_reason}", flush=True)

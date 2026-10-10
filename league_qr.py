@@ -13,8 +13,10 @@ from typing import Any, Dict, List, Optional
 LEAGUE_GAME_CODES = frozenset({"X01", "AROUND", "CRICKET", "KILLER", "HALVE_IT"})
 
 _MODE_TO_GAME = {
+    "101": "X01",
     "301": "X01",
     "501": "X01",
+    "701": "X01",
     "x01": "X01",
     "around": "AROUND",
     "around_the_world": "AROUND",

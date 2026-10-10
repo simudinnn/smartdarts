@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from compact_log import print
+
 import copy
 import os
 import threading
@@ -33,6 +35,7 @@ from dart_detection import (
 import main_manual as mm
 from kiosk_settings import get_settings, load_settings, start_qr_image_path, update_settings
 from kiosk_stats import record_auto_hit, record_correction, record_game, record_manual_hit
+from led_ring import led_ring_off, led_ring_on
 from league_qr import ensure_game_qr
 
 
@@ -51,7 +54,7 @@ class KioskSession:
         self.all_hits: List[mm.DetectedHit] = []
         self.settings = load_settings()
         self.state: Dict[str, Any] = {
-            "screen": "select_game" if self.settings.start_mode == "always_on" else "standby",
+            "screen": "standby",
             "selected_game_mode": None,
             "num_players": 0,
             "current_player_idx": 0,
@@ -69,6 +72,8 @@ class KioskSession:
                 "around_order": "standard",
                 "around_backstep": 0,
                 "halve_mode": "standard",
+                "count_up_rounds": 8,
+                "count_up_mode": "normal",
             },
         }
         self.ctx: Dict[str, Any] = {
@@ -152,7 +157,15 @@ class KioskSession:
         self.ctx["editing_hit_slot"] = None
         self.ctx["input_multiplier"] = 1
 
+    def is_manual_only(self) -> bool:
+        game = self.ctx.get("game")
+        if game is not None and "manual_only" in game:
+            return bool(game["manual_only"])
+        return get_settings().input_mode == "manual"
+
     def is_manual_mode(self) -> bool:
+        if self.is_manual_only():
+            return True
         try:
             return bool(get_settings().manual_mode)
         except Exception:
@@ -160,6 +173,9 @@ class KioskSession:
 
     def toggle_manual_mode(self) -> None:
         """Prebaci AUTO ↔ MANUAL tijekom igre (sprema u postavke)."""
+        if self.is_manual_only():
+            self.ensure_manual_hit_editor()
+            return
         want = not self.is_manual_mode()
         update_settings(manual_mode=want)
         if want:
@@ -192,17 +208,11 @@ class KioskSession:
         cam_mgr = self.ctx.get("camera_mgr")
         dart_det = self.ctx.get("dart_detector")
         board_cal = self.ctx.get("board_calibrator")
-        if (
-            cam_mgr is not None
-            and dart_det is not None
-            and board_cal is not None
-            and cam_mgr.active
-        ):
-            with self._vision_lock:
-                frames = cam_mgr.grab_frames(flush=1)
-                dart_det.absorb_live_board_and_idle(board_cal, frames)
-            self.ctx["_dart_absorb_pending"] = False
-            print("[dart] povratak u igru — motion/diff ociscen", flush=True)
+        if cam_mgr is not None and dart_det is not None and board_cal is not None:
+            # Vision thread performs the snapshot; screen navigation must never
+            # wait on OpenCV warps or a USB buffer flush.
+            self.ctx["_dart_absorb_pending"] = True
+            dart_det.reset_motion_state()
             return
         self.ctx["_dart_absorb_pending"] = True
         if dart_det is not None:
@@ -426,6 +436,13 @@ class KioskSession:
         )
 
     def start_playing_after_clear_board(self) -> None:
+        # Safety net for direct/manual transitions. start_model() is idempotent;
+        # the session is created and warmed only once, then remains resident.
+        from dart_detection import DART_DETECTOR_MODE
+        if DART_DETECTOR_MODE == "ml" and not self.is_manual_only():
+            from ml_tip.runtime import start_model
+            start_model()
+        led_ring_on()
         self.state["screen"] = "playing"
         self.ctx["_dart_turn_start_pending"] = True
         self.ctx["_dart_no_ref_warned"] = False
@@ -476,6 +493,9 @@ class KioskSession:
             self.ctx["_clear_board_busy"] = False
 
     def _confirm_clear_board_and_start_impl(self) -> None:
+        if self.is_manual_only():
+            self.start_playing_after_clear_board()
+            return
         cam_mgr = self.ctx.get("camera_mgr")
         dart_det = self.ctx.get("dart_detector")
         board_cal = self.ctx.get("board_calibrator")
@@ -882,7 +902,8 @@ class KioskSession:
             print(
                 f"[dart] empty probe px={max_px} td={int(getattr(dart_det, '_last_empty_td_px', 0))} "
                 f"raw={int(getattr(dart_det, '_last_empty_raw_px', 0))} diff={max_diff:.2f} "
-                f"(prag td<={EMPTY_BOARD_MAX_PIXELS} raw_hand>={EMPTY_BOARD_RAW_HAND_PIXELS} "
+                f"(prag td<={int(getattr(dart_det, '_last_empty_limit', EMPTY_BOARD_MAX_PIXELS))} "
+                f"raw_hand>={EMPTY_BOARD_RAW_HAND_PIXELS} "
                 f"diff<={EMPTY_BOARD_MAX_DIFF_MEAN})",
                 flush=True,
             )
@@ -946,6 +967,8 @@ class KioskSession:
     def _auto_detect_vision(
         self, *, force_log: bool = False, undo_mode: bool = False
     ) -> Optional[Dict[str, Any]]:
+        if self.is_manual_only():
+            return None
         g = self.ctx.get("game")
         if not g or g.get("winner_player_idx") is not None:
             return None
@@ -1018,7 +1041,7 @@ class KioskSession:
             return None
 
         is_miss = str(fused.zone_name).lower() == "miss" or int(fused.score) <= 0
-        low_conf = not is_miss and float(fused.confidence) < mm.DART_MIN_CONFIDENCE
+        low_conf = getattr(fused, "tip_source", "fitline") != "ml" and not is_miss and float(fused.confidence) < mm.DART_MIN_CONFIDENCE
         if low_conf:
             fire_frames = dart_det.last_fire_frames()
             commit_frames = fire_frames if len(fire_frames) >= 2 else cam_mgr.grab_frames()
@@ -1069,6 +1092,11 @@ class KioskSession:
         )
         dart_det.finalize_shot(enter_rearm=False)
         dart_det.mark_commit_after_ui()
+        # This runs after apply_detected_hit updated the UI snapshot. The writer
+        # waits another 150 ms, then encodes/writes without blocking detection.
+        if bool(getattr(fused, "_debug_needed", False)):
+            from debug_io import enqueue_hit_debug
+            enqueue_hit_debug(fused, canvas=getattr(fused, "_debug_canvas", None))
         return True
 
     def cycle_fake_dart_hit(self) -> bool:
@@ -1219,13 +1247,20 @@ class KioskSession:
     def enter_calibration(self) -> None:
         if self.state.get("screen") == "calibration":
             return
-        self.state["_prev_screen"] = self.state.get("screen", "standby")
+        origin = self.state.get("screen", "standby")
+        settings_origin = self.state.get("_settings_return_screen")
+        standalone_calibration = origin == "standby" or (
+            origin == "settings" and settings_origin == "standby"
+        )
+        self.ctx["_led_calibration_from_standby"] = standalone_calibration
+        # Calibration always needs the board illuminated through Raspberry GPIO.
+        # MQTT is input-only and is reserved for starting a game by QR scan.
+        led_ring_on()
+        self.state["_prev_screen"] = origin
+        self.state["screen"] = "calibration"
         cam_mgr = self.ctx.get("camera_mgr")
         if cam_mgr is not None:
             cam_mgr.start()
-            # Pričekaj feedove pa tek onda prikaži ekran (bez NEMA SIGNALA flasha).
-            cam_mgr.wait_for_frames(timeout_sec=8.0, min_cams=len(CAMERA_INDICES))
-        self.state["screen"] = "calibration"
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_click_ellipse_mode"] = False
         self._load_cal_hints()
@@ -1236,9 +1271,6 @@ class KioskSession:
     def exit_calibration(self) -> None:
         if self.state.get("screen") != "calibration":
             return
-        cam_mgr = self.ctx.get("camera_mgr")
-        if cam_mgr is not None:
-            cam_mgr.stop()
         self.ctx["_last_cal_frames"] = {}
         self.ctx["_cal_click_bull_mode"] = False
         self.ctx["_cal_click_ellipse_mode"] = False
@@ -1248,6 +1280,8 @@ class KioskSession:
         prev = self.state.get("_prev_screen") or "standby"
         self.state["screen"] = prev
         self.state["_prev_screen"] = None
+        if self.ctx.pop("_led_calibration_from_standby", False):
+            led_ring_off()
         if prev == "playing":
             self.resume_live_motion_after_pause()
 
@@ -1315,9 +1349,6 @@ class KioskSession:
             self.resume_live_motion_after_pause()
 
     def _home_screen(self) -> str:
-        mode = get_settings().start_mode
-        if mode == "always_on":
-            return "select_game"
         return "standby"
 
     def _apply_start_mode_home(self) -> None:
@@ -1333,9 +1364,7 @@ class KioskSession:
             return
         if screen == "select_game":
             self.state["screen"] = self._home_screen()
-            if self.state["screen"] == "select_game":
-                # always_on: nazad s select_game ostaje tu (nema standby).
-                pass
+            led_ring_off()
         elif screen == "rules_x01":
             self.state["screen"] = "select_game"
         elif screen == "rules_cricket":
@@ -1345,6 +1374,8 @@ class KioskSession:
         elif screen == "rules_around":
             self.state["screen"] = "select_game"
         elif screen == "rules_halve":
+            self.state["screen"] = "select_game"
+        elif screen == "rules_count_up":
             self.state["screen"] = "select_game"
         elif screen == "tutorial_x01":
             self.state["screen"] = "rules_x01"
@@ -1356,8 +1387,10 @@ class KioskSession:
             self.state["screen"] = "rules_around"
         elif screen == "tutorial_halve":
             self.state["screen"] = "rules_halve"
+        elif screen == "tutorial_count_up":
+            self.state["screen"] = "rules_count_up"
         elif screen == "select_players":
-            if mode in ("301", "501"):
+            if mode in ("101", "301", "501", "701"):
                 self.state["screen"] = "rules_x01"
             elif mode == "cricket":
                 self.state["screen"] = "rules_cricket"
@@ -1367,6 +1400,8 @@ class KioskSession:
                 self.state["screen"] = "rules_around"
             elif mode in ("halve", "halve_it"):
                 self.state["screen"] = "rules_halve"
+            elif mode == "count_up":
+                self.state["screen"] = "rules_count_up"
             else:
                 self.state["screen"] = "select_game"
         elif screen == "clear_board":
@@ -1377,6 +1412,7 @@ class KioskSession:
 
     def clear_to_standby(self, *, mqtt_off: bool = False) -> None:
         self.state["screen"] = self._home_screen()
+        led_ring_off()
         self.state["selected_game_mode"] = None
         self.state["num_players"] = 0
         self.state["current_player_idx"] = 0
@@ -1385,14 +1421,18 @@ class KioskSession:
         self.close_hit_editor()
         self.close_in_game_calibrate()
         self.state["player_slots"] = [None, None, None, None]
-        # always_on: nikad ne šalji MQTT (ni off pri izlazu).
-        if mqtt_off and get_settings().start_mode != "always_on":
-            try:
-                mm.send_mqtt_off()
-            except Exception:
-                pass
 
     def mqtt_wake(self) -> None:
+        from dart_detection import DART_DETECTOR_MODE
+        if DART_DETECTOR_MODE == "ml" or os.environ.get("SMARTDARTS_ML_SHADOW") == "1":
+            from ml_tip.runtime import start_model
+            start_model()
+        ring_ok = led_ring_on()
+        print(
+            f"[MQTT] QR on -> game selection; GPIO17 HIGH "
+            f"{'OK' if ring_ok else 'NIJE USPIO'}",
+            flush=True,
+        )
         self.state["screen"] = "select_game"
         self.state["selected_game_mode"] = None
         self.state["num_players"] = 0
@@ -1402,12 +1442,7 @@ class KioskSession:
         self.state["player_slots"] = [None, None, None, None]
 
     def start_from_button(self) -> None:
-        """Gumb POKRENI na standby ekranu — lokalni start + MQTT 'on' za LED ring."""
-        if get_settings().start_mode != "always_on":
-            try:
-                mm.send_mqtt_on()
-            except Exception:
-                pass
+        """Gumb POKRENI na standby ekranu — lokalni start i GPIO LED ring."""
         self.mqtt_wake()
 
     @staticmethod
@@ -1454,6 +1489,12 @@ class KioskSession:
             return
         if str(mode).lower() == "killer" and n < 2:
             return
+        led_ring_on()
+        # Warm ML while the clear-board screen is shown, before detection starts.
+        from dart_detection import DART_DETECTOR_MODE
+        if DART_DETECTOR_MODE == "ml" and not self.is_manual_only():
+            from ml_tip.runtime import start_model
+            start_model()
         names = [str(s.get("name") or "") for s in selected]
         self.state["num_players"] = n
         self.state["current_player_idx"] = 0
@@ -1461,11 +1502,15 @@ class KioskSession:
         self.ctx["game"] = mm._create_game(
             mode, n, rules_pending, player_names=names, color_slots=color_slots
         )
+        self.ctx["game"]["manual_only"] = get_settings().input_mode == "manual"
         self.ctx["input_multiplier"] = 1
         self.all_hits.clear()
         self.ctx["editing_hit_slot"] = None
         self.ctx["_clear_board_status"] = ""
         self.state["screen"] = "clear_board"
+
+        if self.is_manual_only():
+            self.start_playing_after_clear_board()
 
     def open_hit_editor(self, slot: int) -> None:
         g = self.ctx.get("game")
@@ -1487,7 +1532,19 @@ class KioskSession:
     def handle_keypad(self, kid: str) -> None:
         g = self.ctx.get("game")
         editing_slot = self.ctx.get("editing_hit_slot")
-        if not g or editing_slot is None:
+        if not g:
+            return
+        # Manual CLR is global: closing the keypad or pressing Back must not
+        # require selecting a hit before the newest entered dart can be removed.
+        if kid == "clear_one" and self.is_manual_mode():
+            turn_hits = g.get("turn_hits", [None, None, None])
+            occupied = [i for i, hit in enumerate(turn_hits) if hit is not None]
+            if not occupied:
+                self.ensure_manual_hit_editor()
+                return
+            editing_slot = occupied[-1]
+            self.ctx["editing_hit_slot"] = editing_slot
+        if editing_slot is None:
             return
         if kid.startswith("mult:"):
             m = int(kid.split(":", 1)[1])
@@ -1497,12 +1554,22 @@ class KioskSession:
             return
         if kid == "clear_one":
             turn_hits = g.get("turn_hits", [None, None, None])
-            if 0 <= int(editing_slot) < 3:
-                turn_hits[int(editing_slot)] = None
+            target_slot = int(editing_slot)
+            if self.is_manual_mode() and 0 <= target_slot < 3:
+                # Always remove the newest entered dart, independent of the
+                # editor cursor left behind by Back or a previously selected hit.
+                target_slot = next(
+                    (i for i in range(2, -1, -1) if turn_hits[i] is not None),
+                    target_slot,
+                )
+                turn_hits[target_slot] = None
+            elif 0 <= target_slot < 3:
+                turn_hits[target_slot] = None
+            if 0 <= target_slot < 3:
                 sources = list(self.ctx.get("_hit_sources") or [None, None, None])
                 while len(sources) < 3:
                     sources.append(None)
-                sources[int(editing_slot)] = None
+                sources[target_slot] = None
                 self.ctx["_hit_sources"] = sources
             else:
                 mm._clear_one_slot(turn_hits)
@@ -1521,7 +1588,7 @@ class KioskSession:
                 dart_det.reset_motion_state()
                 dart_det.commit_board_snapshot(board_cal, cam_mgr.grab_frames())
             if self.is_manual_mode():
-                self.ctx["editing_hit_slot"] = int(editing_slot)
+                self.ctx["editing_hit_slot"] = target_slot
                 self.ctx["input_multiplier"] = 1
             else:
                 self.close_hit_editor()
@@ -1689,6 +1756,8 @@ class KioskSession:
         if bid.startswith("game:"):
             mm._click_sound()
             mode = bid.split(":", 1)[1]
+            if mode == "x01":
+                mode = "301"
             self.state["selected_game_mode"] = mode
             self.state["rules_pending"] = {
                 "double_in": False,
@@ -1702,8 +1771,10 @@ class KioskSession:
                 "around_order": "standard",
                 "around_backstep": 0,
                 "halve_mode": "standard",
+                "count_up_rounds": 8,
+                "count_up_mode": "normal",
             }
-            if mode in ("301", "501"):
+            if mode in ("101", "301", "501", "701"):
                 self.state["screen"] = "rules_x01"
             elif mode == "cricket":
                 self.state["screen"] = "rules_cricket"
@@ -1713,13 +1784,21 @@ class KioskSession:
                 self.state["screen"] = "rules_around"
             elif mode in ("halve", "halve_it"):
                 self.state["screen"] = "rules_halve"
+            elif mode == "count_up":
+                self.state["screen"] = "rules_count_up"
             else:
                 self.state["screen"] = "select_players"
+            return
+        if bid.startswith("x01_mode:"):
+            mm._click_sound()
+            score = bid.split(":", 1)[1]
+            if score in ("101", "301", "501", "701"):
+                self.state["selected_game_mode"] = score
             return
         if bid == "tutorial_open":
             mm._click_sound()
             mode = str(self.state.get("selected_game_mode") or "")
-            if mode in ("301", "501"):
+            if mode in ("101", "301", "501", "701"):
                 self.state["screen"] = "tutorial_x01"
             elif mode == "cricket":
                 self.state["screen"] = "tutorial_cricket"
@@ -1729,6 +1808,23 @@ class KioskSession:
                 self.state["screen"] = "tutorial_around"
             elif mode in ("halve", "halve_it"):
                 self.state["screen"] = "tutorial_halve"
+            elif mode == "count_up":
+                self.state["screen"] = "tutorial_count_up"
+            return
+        if bid.startswith("rule:count_up_rounds:"):
+            mm._click_sound()
+            try:
+                rounds = int(bid.rsplit(":", 1)[-1])
+            except ValueError:
+                return
+            if rounds in (8, 12, 20):
+                self.state.setdefault("rules_pending", {})["count_up_rounds"] = rounds
+            return
+        if bid.startswith("rule:count_up_mode:"):
+            mm._click_sound()
+            value = bid.rsplit(":", 1)[-1]
+            if value in ("normal", "reverse"):
+                self.state.setdefault("rules_pending", {})["count_up_mode"] = value
             return
         if bid == "rule:double_in":
             mm._click_sound()
@@ -1849,11 +1945,14 @@ class KioskSession:
             self.state["current_player_idx"] = 0
             rules_pending = dict(self.state.get("rules_pending") or {})
             self.ctx["game"] = mm._create_game(mode, n, rules_pending)
+            self.ctx["game"]["manual_only"] = get_settings().input_mode == "manual"
             self.ctx["input_multiplier"] = 1
             self.all_hits.clear()
             self.ctx["editing_hit_slot"] = None
             self.ctx["_clear_board_status"] = ""
             self.state["screen"] = "clear_board"
+            if self.is_manual_only():
+                self.start_playing_after_clear_board()
             return
         if bid == "players_start":
             mm._click_sound()
@@ -1863,7 +1962,12 @@ class KioskSession:
             mm._click_sound()
             g = self.ctx.get("game")
             if self.state.get("screen") == "playing" and g and mm._winner_screen_ready(g):
-                self.clear_to_standby(mqtt_off=True)
+                if self.state.get("_tournament_active"):
+                    self.clear_to_standby(mqtt_off=False)
+                    self.state["_tournament_active"] = True
+                    self.state["screen"] = "tournament"
+                else:
+                    self.clear_to_standby(mqtt_off=True)
             else:
                 self.state["screen"] = "exit_confirm"
             return
@@ -1964,6 +2068,13 @@ class KioskSession:
         if cam_mgr is None:
             return
         need = self.screen in ("calibration", "clear_board", "playing")
+        # Keep an already-open capture alive while settings temporarily cover
+        # calibration/game. This avoids USB close/reopen cycles and makes Back
+        # to the game immediate. Settings opened from standby still use 0 cams.
+        if self.screen == "settings" and cam_mgr.active:
+            need = True
+        if self.screen != "calibration" and self.is_manual_only():
+            need = False
         if need and not cam_mgr.active:
             cam_mgr.start()
         elif not need and cam_mgr.active:
@@ -2151,7 +2262,12 @@ class KioskSession:
 
     def _vision_loop(self) -> None:
         print("[vision] background thread on", flush=True)
-        while not self._bg_stop.wait(0.02):
+        while True:
+            # Outside play/calibration there is no frame work to do. A long
+            # wait keeps the idle tournament/standby screens genuinely idle.
+            interval = 0.02 if self.screen in ("playing", "calibration") else 0.5
+            if self._bg_stop.wait(interval):
+                break
             try:
                 self._vision_loop_once()
             except Exception as exc:
@@ -2198,6 +2314,17 @@ class KioskSession:
         dart_det = self.ctx.get("dart_detector")
         cam_mgr = self.ctx.get("camera_mgr")
         if dart_det is None or cam_mgr is None or not cam_mgr.active:
+            return
+        if self.ctx.get("_dart_absorb_pending"):
+            board_cal = self.ctx.get("board_calibrator")
+            if board_cal is None:
+                return
+            frames = cam_mgr.grab_frames(flush=1)
+            if not any(frame is not None for frame in frames.values()):
+                return
+            dart_det.absorb_live_board_and_idle(board_cal, frames)
+            self.ctx["_dart_absorb_pending"] = False
+            print("[dart] povratak u igru — motion/diff ociscen", flush=True)
             return
         if self.ctx.get("_dart_turn_start_pending"):
             if dart_det.has_references():
@@ -2247,6 +2374,24 @@ class KioskSession:
             self._bg_set_pending(result)
 
     def tick(self) -> None:
+        # Izvan turnira ring ostaje stabilno upaljen kroz cijeli tijek odabira
+        # i pripreme igre. U turniru se pali tek za konkretan pokrenuti meč.
+        screen = self.screen
+        tournament_active = bool(self.state.get("_tournament_active"))
+        selection_screens = {
+            "select_game", "rules_x01", "rules_cricket", "rules_killer",
+            "rules_around", "rules_halve", "rules_count_up",
+            "tutorial_x01", "tutorial_cricket", "tutorial_killer",
+            "tutorial_around", "tutorial_halve", "tutorial_count_up",
+            "select_players", "clear_board",
+        }
+        if (not tournament_active and screen in selection_screens) or screen in (
+            "playing", "calibration"
+        ):
+            led_ring_on()
+        elif tournament_active and screen == "tournament":
+            led_ring_off()
+
         if self.ctx.get("_ingame_cal_open"):
             if self.screen != "playing":
                 self.close_in_game_calibrate()
@@ -2254,19 +2399,7 @@ class KioskSession:
                 self.ensure_cameras()
             self._drain_vision_results()
             return
-        g_auto = self.ctx.get("game")
-        if self.screen == "playing" and g_auto and mm._winner_screen_ready(g_auto):
-            t0 = g_auto.get("winner_shown_at")
-            if t0 is None:
-                g_auto["winner_shown_at"] = time.time()
-            elif time.time() - float(t0) >= mm.WINNER_AUTO_EXIT_SEC:
-                self.clear_to_standby(mqtt_off=True)
-        elif isinstance(g_auto, dict):
-            g_auto.pop("winner_shown_at", None)
-
         self.ensure_cameras()
-        if self.ctx.get("_dart_absorb_pending"):
-            self.resume_live_motion_after_pause()
         self._drain_vision_results()
         if self.screen == "playing":
             self.ensure_manual_hit_editor()
@@ -2397,6 +2530,7 @@ class KioskSession:
             "editing_hit_slot": self.ctx.get("editing_hit_slot"),
             "input_multiplier": int(self.ctx.get("input_multiplier", 1)),
             "manual_mode": self.is_manual_mode(),
+            "manual_only": self.is_manual_only(),
             "can_submit": can_submit,
             "is_early_finish": early,
             "is_bust": bust,
@@ -2411,7 +2545,7 @@ class KioskSession:
             "league_qr_payload": league_qr_payload,
             "live_score_line": (
                 None
-                if g and str(g.get("mode", "")).lower() == "killer"
+                if g and str(g.get("mode", "")).lower() in ("killer", "count_up")
                 else (
                     mm._halve_live_score_line(g)
                     if g and str(g.get("mode", "")).lower() in ("halve", "halve_it")
@@ -2499,6 +2633,7 @@ class KioskSession:
         }
 
     def shutdown(self) -> None:
+        led_ring_off()
         self._bg_stop.set()
         t = getattr(self, "_bg_thread", None)
         if t is not None and t.is_alive() and t is not threading.current_thread():
@@ -2506,9 +2641,3 @@ class KioskSession:
         cam_mgr = self.ctx.get("camera_mgr")
         if cam_mgr is not None:
             cam_mgr.stop()
-        if get_settings().start_mode == "always_on":
-            return
-        try:
-            mm.send_mqtt_off()
-        except Exception:
-            pass

@@ -6,6 +6,7 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +23,8 @@ from PySide6.QtCore import (
     QPoint,
     QSequentialAnimationGroup,
     QParallelAnimationGroup,
+    QProcess,
+    QSize,
 )
 from PySide6.QtGui import (
     QImage,
@@ -56,7 +59,19 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QGraphicsColorizeEffect,
     QScrollArea,
+    QListWidget,
+    QListWidgetItem,
+    QListView,
+    QAbstractItemView,
+    QScroller,
+    QInputDialog,
+    QMessageBox,
+    QDialog,
+    QDialogButtonBox,
 )
+
+from led_ring import led_ring_off, led_ring_on, led_ring_retry, led_ring_setup_low, led_ring_shutdown
+from performance_monitor import PerformanceCollector
 
 
 def _detect_weak_hw() -> bool:
@@ -86,6 +101,11 @@ _UI_TICK_MS = 40 if _WEAK_HW else 33
 _SCORE_ANIM_MS = 32
 _PIXMAP_TRANSFORM = Qt.FastTransformation if _WEAK_HW else Qt.SmoothTransformation
 _TURN_ANIM_MS = 320 if _WEAK_HW else 420
+# Reparenting live score widgets through deferred geometry animations can leave
+# the scoreboard in its compact state if another snapshot/undo arrives first,
+# and Qt may dereference a widget already queued for deletion. Keep score/hit
+# effects, but make player-card turn changes atomic and crash-safe.
+_TURN_CARD_ANIMATIONS = False
 _PAGE_ANIM_MS = 90 if _WEAK_HW else 260
 _LOADING_FADE_MS = 90 if _WEAK_HW else 200
 _SCREEN_DEPTH = {
@@ -96,11 +116,14 @@ _SCREEN_DEPTH = {
     "rules_killer": 2,
     "rules_around": 2,
     "rules_halve": 2,
+    "rules_count_up": 2,
     "tutorial_x01": 3,
     "tutorial_cricket": 3,
     "tutorial_killer": 3,
     "tutorial_around": 3,
     "tutorial_halve": 3,
+    "tutorial_count_up": 3,
+    "tournament": 4,
     "select_players": 4,
     "clear_board": 5,
     "playing": 6,
@@ -121,11 +144,14 @@ _IDLE_SCREENS = (
     "rules_killer",
     "rules_around",
     "rules_halve",
+    "rules_count_up",
     "tutorial_x01",
     "tutorial_cricket",
     "tutorial_killer",
     "tutorial_around",
     "tutorial_halve",
+    "tutorial_count_up",
+    "tournament",
 )
 
 
@@ -1388,6 +1414,8 @@ def _apply_player_avatar(
         lab.setFixedSize(side, side)
         fg = _player_fg(color_hex)
         fs = _initials_font_px(ini, side)
+        if bool(lab.property("spectatorInitials")):
+            fs = min(side, int(round(fs * 1.22)))
         lab.setContentsMargins(0, 0, 0, 0)
         lab.setStyleSheet(
             f"border: none; background: transparent; color: {fg}; "
@@ -1974,7 +2002,7 @@ class CricketRow(QFrame):
             self._border_alpha = float(border_alpha)
         icon_radius = max(10, int(round(14 * self.ICON_H / 100.0)))
         self.setStyleSheet(
-            f"QFrame {{ background-color: transparent; border: 3px solid {border};"
+            f"QFrame {{ background-color: {'#000000' if self.property('spectatorCard') else 'transparent'}; border: 3px solid {border};"
             f" border-radius: 10px; }}"
             f" QFrame#CricketIconFrame {{"
             f" background: transparent; border: {icon_bw}px solid {icon_border};"
@@ -2096,7 +2124,11 @@ class CricketRow(QFrame):
                 f"background: transparent; padding-right: 4px;"
             )
         else:
-            self.pts_lab.hide()
+            # No Score nema bodove, ali stupac mora zadržati jednaku širinu kao
+            # zaglavlje. Skrivanjem QLabel-a layout bi raširio markere za jedno
+            # mjesto udesno pa oznake 15–20/B više ne bi bile iznad njih.
+            self.pts_lab.setText("")
+            self.pts_lab.show()
 
         if finished:
             self._stop_border_anim()
@@ -2686,7 +2718,10 @@ class KillerRow(QFrame):
             is_killer = bool(getattr(self, "_style_is_killer", False))
         is_killer_eff = bool(is_killer) and not finished
         waiting = getattr(self, "_stack_mode", "active") == "waiting"
-        lives_px = max(22, int(round(self._icon_h * (0.48 if waiting else 0.54))))
+        if self.property("spectatorCard"):
+            lives_px = max(22, int(round(self._icon_h * 0.44)))
+        else:
+            lives_px = max(22, int(round(self._icon_h * (0.48 if waiting else 0.54))))
         self._lives_px = lives_px
         if hasattr(self, "lives_count"):
             lf = QFont()
@@ -2718,10 +2753,12 @@ class KillerRow(QFrame):
             icon_bw = self.ICON_BORDER
         else:
             border = "transparent"
-            bg = "transparent"
+            bg = "#000000" if self.property("spectatorCard") else "transparent"
             border_w = 4
             icon_border = "transparent"
             icon_bw = 0
+        if self.property("spectatorCard"):
+            bg = "#000000"
         if self._style_is_killer and not waiting:
             icon_border = fg
             icon_bw = self.ICON_BORDER
@@ -3008,14 +3045,15 @@ class KillerRow(QFrame):
             color, active and not finished, finished, is_killer=is_killer
         )
 
-        became_killer = (
+        animate = not bool(self.property("spectatorCard"))
+        became_killer = animate and (
             is_killer
             and not finished
             and self._last_is_killer is False
             and self._last_is_killer is not None
         )
-        became_dead = finished and self._last_dead is False
-        animate_loss = (
+        became_dead = animate and finished and self._last_dead is False
+        animate_loss = animate and (
             self._last_lives is not None and int(lives) < int(self._last_lives)
         )
 
@@ -3059,7 +3097,7 @@ class KillerRow(QFrame):
             self._drawn_icon_h = self._icon_h
             self._last_name = name_s
 
-        self._sync_killer_badge(show_killer, animate=became_killer)
+        self._sync_killer_badge(show_killer, animate=bool(became_killer))
         self._last_is_killer = bool(is_killer)
 
         if finished:
@@ -3175,8 +3213,8 @@ class PlayerCard(QFrame):
     MIN_H = 118
     MAX_H = 140
     ICON_BORDER = 4
-    # Count up/down: ±1 po ticku; sporije radi čitljivosti (≈32ms → 20 bodova ≈ 640ms).
-    # On Pi use fewer timer fires (same ±1 step, slightly longer total).
+    # Count up/down finishes in at most ~20 ticks; large Count Up turns no
+    # longer leave the card counting for several seconds.
     SCORE_ANIM_MS = _SCORE_ANIM_MS
     # Distinct Halve It "cut in half" (scale-X), not countdown.
     HALVE_ANIM_MS = 420 if _WEAK_HW else 560
@@ -3383,6 +3421,7 @@ class PlayerCard(QFrame):
     def _stop_score_anim(self) -> None:
         self._anim_timer.stop()
         self._anim_target = None
+        self._anim_step = 1
 
     def reset_score_display(self) -> None:
         """Cancel in-flight score anims and drop cached display so a new match cannot tween from leftovers."""
@@ -3429,7 +3468,11 @@ class PlayerCard(QFrame):
             self._set_line_text(str(self._anim_target))
             self._stop_score_anim()
             return
-        nxt = cur + 1 if cur < self._anim_target else cur - 1
+        diff = self._anim_target - cur
+        # Keep large Count Up turns (up to 180) and X01 corrections smooth,
+        # but finish the card animation in roughly the same short duration.
+        step = max(1, int(getattr(self, "_anim_step", 1)))
+        nxt = cur + min(step, diff) if diff > 0 else cur - min(step, -diff)
         self._set_line_text(str(nxt))
 
     def _start_halve_anim(self, target: int) -> None:
@@ -3612,10 +3655,14 @@ class PlayerCard(QFrame):
                 icon_bw = self.ICON_BORDER
             else:
                 border = "transparent"
-                bg = "#141418" if self._around_mode else "transparent"
+                bg = "#000000" if self.property("spectatorCard") else (
+                    "#141418" if self._around_mode else "transparent"
+                )
                 border_w = 4 if self._icon_h <= 130 else 5
                 icon_border = "transparent"
                 icon_bw = 0
+            if self.property("spectatorCard"):
+                bg = "#000000"
             radius = max(12, int(round(16 * self._icon_h / float(self.ICON_H))))
             icon_radius = max(12, int(round(16 * self._icon_h / float(self.ICON_H))))
             self.setStyleSheet(
@@ -3672,6 +3719,7 @@ class PlayerCard(QFrame):
         if target != current:
             self._stop_halve_anim(commit=False)
             self._anim_target = target
+            self._anim_step = max(1, (abs(target - current) + 19) // 20)
             if not self._anim_timer.isActive():
                 self._anim_timer.start()
             return
@@ -3683,9 +3731,204 @@ class MqttBridge(QObject):
     command = Signal(str)
 
 
+class PerformanceBridge(QObject):
+    ready = Signal(dict)
+
+
+class TournamentMatchButton(QPushButton):
+    def __init__(self, player_a: str, player_b: str, parent=None) -> None:
+        super().__init__(parent)
+        self.player_a, self.player_b = str(player_a), str(player_b)
+        self.setFixedHeight(112)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect().adjusted(2, 2, -2, -2)
+        mid=r.center().x(); p.setPen(Qt.NoPen)
+        p.save(); p.setClipRect(QRect(r.x(),r.y(),mid-r.x(),r.height())); p.setBrush(QColor("#b73535")); p.drawRoundedRect(r,15,15); p.restore()
+        p.save(); p.setClipRect(QRect(mid,r.y(),r.right()-mid+1,r.height())); p.setBrush(QColor("#285bb8")); p.drawRoundedRect(r,15,15); p.restore()
+        p.setPen(QPen(QColor("#777984"),2)); p.drawRoundedRect(r,15,15)
+        p.setFont(QFont("Sans", 30, QFont.Bold)); p.setPen(QColor("white"))
+        p.drawText(QRect(r.x()+14,r.y(),max(1,mid-r.x()-42),r.height()),Qt.AlignCenter,self.player_a)
+        p.drawText(QRect(mid+28,r.y(),max(1,r.right()-mid-42),r.height()),Qt.AlignCenter,self.player_b)
+        p.setFont(QFont("Sans",22,QFont.Black)); p.drawText(QRect(mid-32,r.y(),64,r.height()),Qt.AlignCenter,"VS")
+
+
+class TournamentBracketWidget(QWidget):
+    """Compact, touch-friendly single-elimination bracket."""
+
+    matchClicked = Signal(str)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._state: Dict = {}
+        self._match_rects: Dict[str, QRect] = {}
+        self.setMinimumHeight(260)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_state(self, state: Optional[Dict]) -> None:
+        self._state = dict(state or {})
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            point = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            for match_id, rect in self._match_rects.items():
+                if rect.contains(point):
+                    self.matchClicked.emit(match_id)
+                    event.accept()
+                    return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(9, 9, 13, 215))
+        state = self._state
+        matches = list(state.get("matches") or [])
+        self._match_rects = {}
+        if not matches:
+            painter.setPen(QColor("#ffe14a"))
+            painter.setFont(QFont("Sans", 22, QFont.Bold))
+            painter.drawText(self.rect(), Qt.AlignCenter, "DODAJTE IGRAČE I POSTAVITE BRACKET")
+            return
+
+        total_rounds = max(1, max((int(m.get("round") or 1) for m in matches), default=1))
+        by_key = {(int(m.get("round") or 1), int(m.get("slot") or 0)): m for m in matches}
+        margin, vertical_margin, box_h, branch_gap = 8, 38, 98, 8
+        columns = max(1, total_rounds * 2 - 1)
+        box_w = max(138, min(280, (self.width() - margin * 2 - branch_gap * max(0, columns - 1)) // columns))
+        center_x = self.width() // 2
+        usable_h = max(1, self.height() - vertical_margin * 2)
+        rects: Dict[Tuple[int, int], QRect] = {}
+
+        # Finale / pobjednik uvijek je u sredini. Ranije runde simetrično ulaze
+        # s lijeve i desne strane, pa 8 igrača daje 2+2 prve grane.
+        final_key = (total_rounds, 0)
+        rects[final_key] = QRect(center_x - box_w // 2, self.height() // 2 - box_h // 2, box_w, box_h)
+        for rnd in range(1, total_rounds):
+            round_matches=sorted((m for m in matches if int(m.get("round") or 0)==rnd),key=lambda m:int(m.get("slot") or 0))
+            count=len(round_matches); left_count=(count+1)//2; right_count=count-left_count
+            left_x = margin + (rnd - 1) * (box_w + branch_gap)
+            right_x = self.width() - margin - box_w - (rnd - 1) * (box_w + branch_gap)
+            for local in range(left_count):
+                y = vertical_margin + int((local + 0.5) * usable_h / max(1,left_count)) - box_h // 2
+                rects[(rnd, local)] = QRect(left_x, y, box_w, box_h)
+            for local in range(right_count):
+                y = vertical_margin + int((local + 0.5) * usable_h / max(1,right_count)) - box_h // 2
+                rects[(rnd, left_count+local)] = QRect(right_x, y, box_w, box_h)
+
+        # A BYE is shown while it is waiting for the neighbouring result. As
+        # soon as the following match contains both players, its old one-name
+        # card is redundant and must disappear. The completed played branch
+        # stays visible so its loser can remain crossed out.
+        hidden_keys=set()
+        for key, match in by_key.items():
+            if int(match.get("expected") or 2) != 1:
+                continue
+            nxt=next((m for m in matches if m.get("id")==match.get("next_id")),None)
+            if nxt and len([p for p in nxt.get("players",[]) if p])==2:
+                hidden_keys.add(key)
+
+        for key, rect in rects.items():
+            match = by_key.get(key)
+            if key not in hidden_keys and match and match.get("id") and int(match.get("round") or 0)==1 and match.get("status")=="ready" and len([p for p in match.get("players",[]) if p])==2:
+                self._match_rects[str(match["id"])] = rect
+
+        painter.setPen(QPen(QColor("#8f919d"), 3))
+        for (rnd, slot), rect in rects.items():
+            if rnd >= total_rounds:
+                continue
+            if (rnd,slot) in hidden_keys:
+                continue
+            match=by_key.get((rnd,slot)) or {}
+            nxt=next((m for m in matches if m.get("id")==match.get("next_id")),None)
+            parent=rects.get((int(nxt.get("round")),int(nxt.get("slot")))) if nxt else rects.get(final_key)
+            if parent is None or not nxt:
+                continue
+            on_left=rect.center().x()<center_x
+            start = QPoint(rect.right(), rect.center().y()) if on_left else QPoint(rect.left(), rect.center().y())
+            end = QPoint(parent.left(), parent.center().y()) if on_left else QPoint(parent.right(), parent.center().y())
+            mid_x = (start.x() + end.x()) // 2
+            path = QPainterPath(start); path.lineTo(mid_x, start.y()); path.lineTo(mid_x, end.y()); path.lineTo(end)
+            painter.drawPath(path)
+
+        painter.setFont(QFont("Sans", 20, QFont.Bold))
+        for key, rect in rects.items():
+            if key in hidden_keys:
+                continue
+            match = by_key.get(key) or {"players": [None, None], "status": "waiting"}
+            if match.get("status")=="playing":
+                painter.setPen(QColor("#ffe14a"))
+                painter.setFont(QFont("Sans",15,QFont.Bold))
+                painter.drawText(QRect(rect.x(),rect.y()-28,rect.width(),24),Qt.AlignCenter,"IGRA U TIJEKU")
+                painter.setFont(QFont("Sans",20,QFont.Bold))
+            players = list(match.get("players") or [None, None])
+            while len(players) < 2: players.append(None)
+            a, b = str(players[0] or ""), str(players[1] or "")
+            names=[name for name in (a,b) if name]
+            if not names:
+                visual=QRect(rect.x()+rect.width()//6,rect.center().y()-18,rect.width()*2//3,36)
+                painter.setPen(QPen(QColor("#666976"),2)); painter.setBrush(QColor("#343640"))
+                painter.drawRoundedRect(visual,8,8)
+                continue
+            if len(names)==1:
+                visual=QRect(rect.x(),rect.center().y()-28,rect.width(),56)
+                painter.setPen(QPen(QColor("#bf8cff"),2))
+                painter.setBrush(QColor("#6f3fa0"))
+                painter.drawRoundedRect(visual,10,10)
+                painter.setPen(QColor("white")); painter.drawText(visual.adjusted(7,0,-7,0),Qt.AlignCenter,names[0])
+                continue
+            mid=rect.center().y(); painter.setPen(Qt.NoPen)
+            winner=str(match.get("winner") or "")
+            top_color=QColor("#a9323b") if not winner or winner==a else QColor("#4a4d58")
+            bottom_color=QColor("#2859a8") if not winner or winner==b else QColor("#4a4d58")
+            painter.save(); painter.setClipRect(QRect(rect.x(),rect.y(),rect.width(),mid-rect.y())); painter.setBrush(top_color); painter.drawRoundedRect(rect,10,10); painter.restore()
+            painter.save(); painter.setClipRect(QRect(rect.x(),mid,rect.width(),rect.bottom()-mid+1)); painter.setBrush(bottom_color); painter.drawRoundedRect(rect,10,10); painter.restore()
+            # The border must never repaint the two coloured halves. Without
+            # NoBrush it reused the previous card's grey/purple brush and
+            # covered the red and blue fills completely.
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#777984"),2)); painter.drawRoundedRect(rect,10,10); painter.drawLine(rect.x()+8,mid,rect.right()-8,mid)
+            painter.setPen(QColor("white"))
+            painter.drawText(QRect(rect.x()+7,rect.y(),rect.width()-14,rect.height()//2),Qt.AlignCenter,a)
+            painter.drawText(QRect(rect.x()+7,mid,rect.width()-14,rect.height()//2),Qt.AlignCenter,b)
+            if winner:
+                loser_rect=QRect(rect.x()+12, rect.y()+rect.height()//4-1, rect.width()-24, 2) if winner==b else QRect(rect.x()+12, mid+rect.height()//4-1, rect.width()-24, 2)
+                painter.fillRect(loser_rect,QColor("#d7d7dc"))
+
+
+class TournamentPlayerList(QListWidget):
+    """Four fixed-height rows with columns spanning the full list width."""
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        viewport=self.viewport()
+        cell_w=max(1,viewport.width()//4)
+        cell_h=64
+        if self.gridSize()!=QSize(cell_w,cell_h):
+            self.setGridSize(QSize(cell_w,cell_h))
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self.count():
+            return
+        painter=QPainter(self.viewport())
+        painter.setRenderHint(QPainter.TextAntialiasing,True)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Sans",36,QFont.Bold))
+        painter.drawText(self.viewport().rect(),Qt.AlignCenter,"NEMA IGRAČA")
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, session: KioskSession) -> None:
+    tournament_join_result = Signal(object)
+    tournament_state_result = Signal(object)
+    clear_board_calibration_result = Signal(object)
+    ingame_calibration_result = Signal(object)
+    def __init__(self, session: KioskSession, *, spectator: bool = False) -> None:
         super().__init__()
+        self._spectator = spectator
         self.session = session
         self.setWindowTitle("Pikado")
         self.setObjectName("Root")
@@ -3703,6 +3946,7 @@ class MainWindow(QMainWindow):
         self._cricket_rows_by_pi: Dict[int, CricketRow] = {}
         self._cricket_hdr: Optional[QWidget] = None
         self._cricket_round_lab: Optional[QLabel] = None
+        self._count_up_round_lab: Optional[QLabel] = None
         self._cricket_last_active_pi: Optional[int] = None
         self._cricket_turn_anim: Optional[QParallelAnimationGroup] = None
         self._cricket_turn_ghosts: List[QWidget] = []
@@ -3764,17 +4008,20 @@ class MainWindow(QMainWindow):
             "rules_killer": self._build_rules_killer(),
             "rules_around": self._build_rules_around(),
             "rules_halve": self._build_rules_halve(),
+            "rules_count_up": self._build_rules_count_up(),
             "tutorial_x01": self._build_tutorial("x01"),
             "tutorial_cricket": self._build_tutorial("cricket"),
             "tutorial_killer": self._build_tutorial("killer"),
             "tutorial_around": self._build_tutorial("around"),
             "tutorial_halve": self._build_tutorial("halve"),
+            "tutorial_count_up": self._build_tutorial("count_up"),
             "select_players": self._build_select_players(),
             "clear_board": self._build_clear_board(),
             "playing": self._build_playing(),
             "exit_confirm": self._build_exit_confirm(),
             "calibration": self._build_calibration(),
             "settings": self._build_settings(),
+            "tournament": self._build_tournament(),
         }
         for _name, w in self.pages.items():
             w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
@@ -3820,6 +4067,9 @@ class MainWindow(QMainWindow):
         self._build_pin_overlay(root)
         self._build_quit_overlay(root)
         self._build_stats_overlay(root)
+        self._build_performance_overlay(root)
+        self._build_wifi_overlay(root)
+        self._build_wifi_keyboard_overlay(root)
         self._build_idle_overlay(root)
         self._build_killer_bull_overlay(root)
         self._build_ingame_cal_overlay(root)
@@ -3831,12 +4081,36 @@ class MainWindow(QMainWindow):
         self._loading_anim: Optional[QPropertyAnimation] = None
         self._standby_pulse: Optional[QVariantAnimation] = None
 
-        self._wire_actions(root)
+        if not spectator:
+            self._wire_actions(root)
+            self.tournament_join_result.connect(self._on_tournament_join_result)
+            self.tournament_state_result.connect(self._on_tournament_state_result)
+            self.clear_board_calibration_result.connect(self._on_clear_board_calibration_result)
+            self.ingame_calibration_result.connect(self._on_ingame_calibration_result)
         self._last_ui_sig: Optional[str] = None
         self._apply_theme()
         self._refresh_player_count_icons()
 
         self.timer = QTimer(self)
+        if spectator:
+            self.play_body.setDirection(QVBoxLayout.TopToBottom)
+            self.play_body.setSpacing(16)
+            self.hits_wrap.layout().setDirection(QHBoxLayout.LeftToRight)
+            self.hits_wrap.layout().setSpacing(20)
+            self._tv_status = QLabel("")
+            self._tv_status.setAlignment(Qt.AlignCenter)
+            self._tv_status.setFixedHeight(86)
+            self._tv_status.setStyleSheet("font-size: 58px; font-weight: 900; color: #00ff78;")
+            self.left_w.layout().addWidget(self._tv_status)
+            self.setWindowTitle("SmartDarts — TV")
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint
+                                | Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput)
+            self.setAttribute(Qt.WA_ShowWithoutActivating)
+            self.setAttribute(Qt.WA_QuitOnClose, False)
+            self.setCursor(Qt.BlankCursor)
+            self.setFocusPolicy(Qt.NoFocus)
+            self.render_spectator({"screen": "standby"})
+            return
         self.timer.timeout.connect(self._on_tick)
         self.timer.start(_UI_TICK_MS)
         if _WEAK_HW:
@@ -3880,7 +4154,10 @@ class MainWindow(QMainWindow):
         self._refresh_player_count_icons()
 
     def _kiosk_screen_geometry(self):
-        screen = self.screen()
+        screen = getattr(self, "_control_screen", None)
+        app = QApplication.instance()
+        if app is None or screen not in app.screens():
+            screen = self.screen()
         if screen is None:
             app = QApplication.instance()
             if app is not None:
@@ -3891,6 +4168,8 @@ class MainWindow(QMainWindow):
 
     def _lock_kiosk_display(self, *, force: bool = False) -> None:
         """Keep the kiosk window glued to the native screen — no pinch/drag/resize."""
+        if self._spectator:
+            return
         if not bool(getattr(self.session, "kiosk", False)):
             return
         if getattr(self, "_locking_geo", False):
@@ -4035,6 +4314,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, "stats_overlay") and self.stats_overlay.isVisible():
             self.stats_overlay.setGeometry(0, 0, root.width(), root.height())
             self.stats_overlay.raise_()
+        if hasattr(self, "performance_overlay") and self.performance_overlay.isVisible():
+            self.performance_overlay.setGeometry(0, 0, root.width(), root.height())
+            self.performance_overlay.raise_()
+        if hasattr(self, "wifi_overlay") and self.wifi_overlay.isVisible():
+            self.wifi_overlay.setGeometry(0, 0, root.width(), root.height())
+            self.wifi_overlay.raise_()
+        if hasattr(self, "wifi_keyboard_overlay") and self.wifi_keyboard_overlay.isVisible():
+            self.wifi_keyboard_overlay.setGeometry(0, 0, root.width(), root.height())
+            self.wifi_keyboard_overlay.raise_()
         if hasattr(self, "name_overlay") and self.name_overlay.isVisible():
             self.name_overlay.setGeometry(0, 0, root.width(), root.height())
             self.name_overlay.raise_()
@@ -4054,6 +4342,12 @@ class MainWindow(QMainWindow):
             self.idle_overlay.raise_()
         if hasattr(self, "stats_overlay") and self.stats_overlay.isVisible():
             self.stats_overlay.raise_()
+        if hasattr(self, "performance_overlay") and self.performance_overlay.isVisible():
+            self.performance_overlay.raise_()
+        if hasattr(self, "wifi_overlay") and self.wifi_overlay.isVisible():
+            self.wifi_overlay.raise_()
+        if hasattr(self, "wifi_keyboard_overlay") and self.wifi_keyboard_overlay.isVisible():
+            self.wifi_keyboard_overlay.raise_()
         if hasattr(self, "loading_overlay") and self.loading_overlay.isVisible():
             self.loading_overlay.setGeometry(0, 0, root.width(), root.height())
             self.loading_overlay.raise_()
@@ -4065,6 +4359,10 @@ class MainWindow(QMainWindow):
         pin_up = hasattr(self, "pin_overlay") and self.pin_overlay.isVisible()
         quit_up = hasattr(self, "quit_overlay") and self.quit_overlay.isVisible()
         idle_up = hasattr(self, "idle_overlay") and self.idle_overlay.isVisible()
+        wifi_up = hasattr(self, "wifi_overlay") and self.wifi_overlay.isVisible()
+        performance_up = (
+            hasattr(self, "performance_overlay") and self.performance_overlay.isVisible()
+        )
         name_up = hasattr(self, "name_overlay") and self.name_overlay.isVisible()
         cal_up = bool(self.session.is_in_game_calibrating())
         loading_up = self._is_loading()
@@ -4073,6 +4371,8 @@ class MainWindow(QMainWindow):
             and not pin_up
             and not quit_up
             and not idle_up
+            and not wifi_up
+            and not performance_up
             and not cal_up
             and not name_up
             and not loading_up
@@ -4279,27 +4579,10 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "standby_sub"):
             return
         anim = getattr(self, "_standby_pulse", None)
-        if _WEAK_HW or not on:
-            if anim is not None:
-                anim.stop()
-            self.standby_sub.setGraphicsEffect(None)
-            return
-        eff = self.standby_sub.graphicsEffect()
-        if not isinstance(eff, QGraphicsOpacityEffect):
-            eff = QGraphicsOpacityEffect(self.standby_sub)
-            self.standby_sub.setGraphicsEffect(eff)
-        if anim is None:
-            anim = QVariantAnimation(self)
-            anim.setDuration(2200)
-            anim.setStartValue(0.52)
-            anim.setKeyValueAt(0.5, 1.0)
-            anim.setEndValue(0.52)
-            anim.setLoopCount(-1)
-            anim.setEasingCurve(QEasingCurve.InOutSine)
-            anim.valueChanged.connect(self._on_standby_pulse)
-            self._standby_pulse = anim
-        if anim.state() == QVariantAnimation.Stopped:
-            anim.start()
+        # Statični početni ekran nema pozadinsku animaciju.
+        if anim is not None:
+            anim.stop()
+        self.standby_sub.setGraphicsEffect(None)
 
     def _wire_actions(self, root: QWidget) -> None:
         for btn in root.findChildren(QPushButton):
@@ -4308,11 +4591,23 @@ class MainWindow(QMainWindow):
                 btn.clicked.connect(lambda _=False, a=action: self._act(a))
 
     def _act(self, action: str) -> None:
+        if self._spectator:
+            return
         idle_up = hasattr(self, "idle_overlay") and self.idle_overlay.isVisible()
         if action in ("idle_quit", "idle_continue", "confirm_quit_yes", "confirm_quit_no"):
             return
         if self._is_loading():
             return
+        if action == "confirm_exit_yes" and getattr(self,"_tournament_match",None) and not getattr(self,"_tournament_close_pending",False) and not getattr(self,"_tournament_leave_pending",False):
+            self._tournament_cancel_match_and_return()
+            return
+        if action == "nav_back" and getattr(self, "_tournament_match", None) and self.session.state.get("screen") == "clear_board":
+            self._tournament_cancel_match_and_return()
+            return
+        if action == "request_exit_game":
+            # The user can leave the winner screen before the next timer tick.
+            # Commit the tournament result synchronously so it cannot be lost.
+            self._tournament_report_winner()
         if self._idle_active() and not idle_up:
             self._idle_note_activity()
         if action == "settings_open":
@@ -4324,11 +4619,116 @@ class MainWindow(QMainWindow):
         if action == "settings_report":
             self._show_stats_report()
             return
+        if action == "settings_wifi":
+            self._show_wifi_overlay()
+            return
+        if action == "settings_performance":
+            self._show_performance_overlay()
+            return
+        if action == "settings_tournament":
+            self.session.state["screen"] = "tournament"
+            # Paint the tournament page before touching saved state.  On older
+            # installations a missing/corrupt tournament file used to be
+            # swallowed silently, making this button look dead.
+            self.tournament_view.setCurrentWidget(self.tournament_home)
+            self._last_ui_sig = None
+            self.refresh()
+            self._show_tournament_home()
+            self._refresh_tournament_page()
+            return
+        if action == "tournament_new":
+            self._tournament_new_local()
+            return
+        if action == "tournament_continue":
+            self._tournament_continue()
+            return
+        if action == "tournament_join":
+            self._tournament_join_existing()
+            return
+        if action.startswith("tournament_tab:"):
+            if action == "tournament_tab:settings" and getattr(self, "_tournament_is_client", False):
+                self._tournament_confirm_leave_client()
+                return
+            self._tournament_show_tab(action.split(":", 1)[1])
+            return
+        if action == "tournament_add_player":
+            self._tournament_add_player()
+            return
+        if action == "tournament_game_next":
+            self._tournament_choose_game()
+            return
+        if action == "tournament_undo":
+            self._tournament_undo()
+            return
+        if action == "tournament_seed_random":
+            self._tournament_randomize()
+            return
+        if action == "tournament_add_board":
+            self._tournament_enable_host()
+            return
+        if action == "tournament_close":
+            self._tournament_confirm_close()
+            return
+        if action == "confirm_exit_yes" and getattr(self, "_tournament_close_pending", False):
+            self._tournament_close_pending = False
+            self.session.state["screen"] = "tournament"
+            self._tournament_close()
+            self._last_ui_sig = None; self.refresh()
+            return
+        if action == "confirm_exit_yes" and getattr(self, "_tournament_leave_pending", False):
+            self._tournament_leave_pending = False
+            self._tournament_leave_client()
+            return
+        if action == "confirm_exit_no" and getattr(self, "_tournament_close_pending", False):
+            self._tournament_close_pending = False
+            self.session.state["screen"] = "tournament"
+            self._last_ui_sig = None; self.refresh()
+            return
+        if action == "confirm_exit_no" and getattr(self, "_tournament_leave_pending", False):
+            self._tournament_leave_pending = False
+            self.session.state["screen"] = "tournament"
+            self.tournament_view.setCurrentWidget(self.tournament_active)
+            self._tournament_show_tab("bracket")
+            self._last_ui_sig = None; self.refresh()
+            return
+        if action == "tournament_back":
+            self._restore_tournament_internet(background=True)
+            self.session.clear_to_standby(mqtt_off=False)
+            self._last_ui_sig = None; self.refresh()
+            return
+        if action == "settings_back" and getattr(self,"_settings_return_tournament",False):
+            self._settings_return_tournament=False
+            self.session.state["screen"]="tournament"
+            self.session.state["_tournament_active"]=True
+            self.tournament_view.setCurrentWidget(self.tournament_active)
+            self._tournament_show_tab("settings")
+            self._last_ui_sig=None; self.refresh()
+            return
+        if getattr(self, "_tournament_rules_selecting", False):
+            if action == "nav_back" and self.session.state.get("screen") == "select_game":
+                self._tournament_rules_selecting = False
+                self.session.state["screen"] = "tournament"
+                self.tournament_view.setCurrentWidget(self.tournament_active)
+                self._tournament_show_tab("settings")
+                self._last_ui_sig = None; self.refresh()
+                return
+            if action == "rules_continue":
+                self._tournament_game = str(self.session.state.get("selected_game_mode") or "501")
+                self._tournament_rules = dict(self.session.state.get("rules_pending") or {})
+                self._tournament_sync_bracket_to_players()
+                self._tournament_rules_selecting = False
+                self.session.state["screen"] = "tournament"
+                self.tournament_view.setCurrentWidget(self.tournament_active)
+                self._tournament_show_tab("settings")
+                self._last_ui_sig = None; self.refresh()
+                return
         if action == "settings_report_close":
             self._hide_stats_report()
             return
         if action in ("settings_back", "settings_calibration"):
             self._hide_stats_report()
+            self._hide_wifi_overlay()
+            self._hide_performance_overlay()
         if action == "settings_quit":
             self._show_quit_confirm("exit")
             return
@@ -4354,8 +4754,6 @@ class MainWindow(QMainWindow):
             return
         self.session.handle_action(action)
         self._last_ui_sig = None
-        if str(action).startswith("settings_"):
-            self._apply_theme()
         self.refresh()
         if action == "clear_board_confirm":
             t = get_settings().t
@@ -4400,6 +4798,10 @@ class MainWindow(QMainWindow):
             want = str(mode) != "off"
             if want != bool(s.league_qr_enabled):
                 update_settings(league_qr_enabled=want)
+        elif kind == "input_mode":
+            mode = str(self.settings_input_mode.currentData())
+            if mode in ("auto", "manual"):
+                update_settings(input_mode=mode)
         elif kind == "auto_calibrate":
             mode = self.settings_auto_cal.currentData()
             want = str(mode) != "off"
@@ -4413,11 +4815,968 @@ class MainWindow(QMainWindow):
             self._i18n_lang = None
             self._apply_i18n()
         self._sync_settings_combos()
-        self.refresh()
-        if pending_power in ("shutdown", "reboot", "exit"):
+        if pending_power:
             self._show_quit_confirm(pending_power)
 
+    _TOURNAMENT_GAMES = ("X01", "CRICKET", "KILLER", "AROUND", "HALVE", "COUNT UP")
+
+    def _build_tournament(self) -> QWidget:
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(38, 18, 38, 22)
+        outer.setSpacing(10)
+        self.tournament_view = QStackedWidget()
+        outer.addWidget(self.tournament_view, 1)
+
+        home = QWidget()
+        hl = QVBoxLayout(home); hl.setContentsMargins(170, 42, 170, 42); hl.setSpacing(30)
+        hl.addStretch(1)
+        self.tournament_new_btn = _btn("POKRENI NOVI TURNIR", "tournament_new", role="Accent", tall=False)
+        self.tournament_continue_btn = _btn("NASTAVI TURNIR", "tournament_continue", role="Accent", tall=False)
+        self.tournament_join_btn = _btn("PRIDRUŽI SE", "tournament_join", role="Primary", tall=False)
+        self.tournament_exit_btn = _btn("IZLAZ", "tournament_back", role="Footer", tall=False)
+        for button in (self.tournament_new_btn, self.tournament_continue_btn, self.tournament_join_btn, self.tournament_exit_btn):
+            button.setFixedHeight(118)
+            button.setStyleSheet(
+                "QPushButton{min-height:118px;max-height:118px;font-size:48px;font-weight:900;padding:2px 14px;}"
+            )
+            hl.addWidget(button)
+        hl.addStretch(1)
+        self.tournament_view.addWidget(home)
+        self.tournament_home = home
+
+        active = QWidget()
+        al = QVBoxLayout(active); al.setContentsMargins(0, 0, 0, 0); al.setSpacing(10)
+        tabs = QHBoxLayout(); tabs.setSpacing(10)
+        self.tournament_tab_buttons = {}
+        for text, name in (("POSTAVKE", "settings"), ("BRACKET", "bracket"), ("IGRAJ", "play")):
+            button = _btn(text, f"tournament_tab:{name}", role="Primary", tall=False)
+            button.setFixedHeight(82)
+            button.setStyleSheet(
+                "QPushButton{min-height:82px;max-height:82px;font-size:38px;font-weight:900;padding:2px 10px;}"
+            )
+            self.tournament_tab_buttons[name] = button
+            tabs.addWidget(button, 1)
+        al.addLayout(tabs)
+        self.tournament_tabs = QStackedWidget(); al.addWidget(self.tournament_tabs, 1)
+
+        settings = QWidget(); sl = QVBoxLayout(settings); sl.setSpacing(14)
+        self.tournament_players_list = TournamentPlayerList()
+        self.tournament_players_list.setStyleSheet(
+            "QListWidget{font-size:36px;font-weight:800;color:#ffffff;background:#101014;"
+            "border:2px solid #666a76;border-radius:14px;padding:10px;}"
+            "QListWidget::item{min-height:40px;padding:0px 10px;color:#ffffff;}"
+            "QListWidget::item:selected{background:#34343e;color:#ffe14a;}"
+        )
+        self.tournament_players_list.itemClicked.connect(self._tournament_edit_player)
+        self.tournament_players_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.tournament_players_list.setFlow(QListView.TopToBottom)
+        self.tournament_players_list.setWrapping(True)
+        self.tournament_players_list.setResizeMode(QListView.Adjust)
+        self.tournament_players_list.setMovement(QListView.Static)
+        self.tournament_players_list.setSpacing(0)
+        self.tournament_players_list.setUniformItemSizes(True)
+        self.tournament_players_list.setFixedHeight(300)
+        QScroller.grabGesture(self.tournament_players_list.viewport(), QScroller.LeftMouseButtonGesture)
+        sl.addWidget(self.tournament_players_list, 1)
+        self.tournament_game_btn = _btn("IGRA: X01 (501)", "tournament_game_next", role="Primary", tall=False)
+        self.tournament_game_btn.setFixedHeight(82)
+        self.tournament_game_btn.setStyleSheet(
+            "QPushButton{min-height:82px;max-height:82px;font-size:36px;font-weight:900;padding:2px 8px;}"
+        )
+        sl.addWidget(self.tournament_game_btn)
+        sr = QHBoxLayout(); sr.setSpacing(12)
+        self.tournament_add_player_btn = _btn("DODAJ\nIGRAČA", "tournament_add_player", role="Accent", tall=False)
+        self.tournament_add_board_btn = _btn("DODAJ\nPLOČU", "tournament_add_board", role="Primary", tall=False)
+        self.tournament_close_btn = _btn("UGASI\nTURNIR", "tournament_close", role="Footer", tall=False)
+        tournament_bottom = (
+            (self.tournament_add_player_btn, "TournamentAccent", "#36d700", "#289f00", "#111111"),
+            (self.tournament_add_board_btn, "TournamentPrimary", "#ffe000", "#c9b000", "#111111"),
+            (self.tournament_close_btn, "TournamentFooter", "#2a2a32", "#5a5a66", "#ffffff"),
+        )
+        for button, object_name, background, border, color in tournament_bottom:
+            # Dedicated object names prevent the global Accent/Primary/Footer
+            # minimum sizes and padding from changing individual row heights.
+            button.setObjectName(object_name)
+            button.setFixedHeight(96)
+            button.setStyleSheet(
+                f"QPushButton#{object_name}{{min-height:96px;max-height:96px;font-size:36px;"
+                f"font-weight:900;padding:0 6px;background:{background};border-color:{border};color:{color};}}"
+                f"QPushButton#{object_name}:disabled{{background:#222228;border-color:#3a3a40;color:#666670;}}"
+            )
+        sr.addWidget(self.tournament_add_player_btn, 1)
+        sr.addWidget(self.tournament_add_board_btn, 1)
+        sr.addWidget(self.tournament_close_btn, 1)
+        sl.addLayout(sr)
+        self.tournament_tabs.addWidget(settings); self.tournament_settings_page = settings
+
+        bracket = QWidget(); bl = QVBoxLayout(bracket); bl.setSpacing(14)
+        self.tournament_bracket = TournamentBracketWidget()
+        self.tournament_bracket.setStyleSheet(
+            "background:#09090d;border:3px solid #ffe000;border-radius:18px;")
+        self.tournament_bracket.matchClicked.connect(self._tournament_edit_match)
+        bl.addWidget(self.tournament_bracket, 1)
+        seed = QHBoxLayout(); seed.setSpacing(14)
+        self.tournament_seed_ordered_btn = _btn("VRATI", "tournament_undo", role="Primary", tall=False)
+        self.tournament_seed_random_btn = _btn("NASUMIČNO POSTAVI", "tournament_seed_random", role="Accent", tall=False)
+        for button in (self.tournament_seed_ordered_btn, self.tournament_seed_random_btn):
+            button.setFixedHeight(82)
+            button.setStyleSheet(
+                "QPushButton{min-height:82px;max-height:82px;font-size:36px;font-weight:900;padding:2px 8px;}"
+            )
+        seed.addWidget(self.tournament_seed_ordered_btn, 1)
+        seed.addWidget(self.tournament_seed_random_btn, 1)
+        bl.addLayout(seed)
+        self.tournament_tabs.addWidget(bracket); self.tournament_bracket_page = bracket
+
+        play = QWidget(); self.tournament_play_layout=QGridLayout(play)
+        self.tournament_play_layout.setContentsMargins(12,8,12,8); self.tournament_play_layout.setSpacing(12)
+        self.tournament_play_layout.setAlignment(Qt.AlignTop)
+        self.tournament_tabs.addWidget(play); self.tournament_play_page = play
+        self.tournament_view.addWidget(active); self.tournament_active = active
+
+        self.tournament_pair_overlay = QWidget(root)
+        self.tournament_pair_overlay.setObjectName("TournamentPairOverlay")
+        self.tournament_pair_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.tournament_pair_overlay.setStyleSheet(
+            "QWidget#TournamentPairOverlay{background-color:rgba(0,0,0,220);}"
+            "QFrame#TournamentPairCard{background:#111116;border:3px solid #ffe000;border-radius:20px;}"
+            "QLabel{font-size:36px;font-weight:900;color:white;}"
+            "QComboBox{font-size:30px;font-weight:900;min-height:70px;padding:2px 14px;"
+            "background:#25252d;color:white;border:2px solid #70707a;border-radius:12px;}"
+            "QComboBox QAbstractItemView{font-size:26px;min-width:760px;selection-background-color:#40404c;}"
+        )
+        pair_outer = QVBoxLayout(self.tournament_pair_overlay)
+        pair_outer.setContentsMargins(70, 24, 70, 24)
+        pair_card = QFrame(); pair_card.setObjectName("TournamentPairCard")
+        pair_card.setMinimumWidth(980)
+        pair_lay = QVBoxLayout(pair_card); pair_lay.setContentsMargins(34, 28, 34, 28); pair_lay.setSpacing(18)
+        pair_title = QLabel("ODABERI PAR"); pair_title.setAlignment(Qt.AlignCenter); pair_lay.addWidget(pair_title)
+        self.tournament_pair_first = QComboBox(); self.tournament_pair_second = QComboBox()
+        self.tournament_pair_first.setMaxVisibleItems(16)
+        self.tournament_pair_second.setMaxVisibleItems(16)
+        self.tournament_pair_first.currentTextChanged.connect(self._tournament_pair_first_changed)
+        pair_lay.addWidget(self.tournament_pair_first); pair_lay.addWidget(self.tournament_pair_second)
+        pair_buttons = QHBoxLayout(); pair_buttons.setSpacing(16)
+        self.tournament_pair_cancel = _btn("NAZAD", "", role="Footer", tall=False)
+        self.tournament_pair_save = _btn("SPREMI", "", role="Accent", tall=False)
+        for button in (self.tournament_pair_cancel, self.tournament_pair_save):
+            button.setFixedHeight(92)
+            button.setStyleSheet("QPushButton{min-height:92px;max-height:92px;font-size:40px;font-weight:900;padding:2px 10px;}")
+            pair_buttons.addWidget(button, 1)
+        self.tournament_pair_cancel.clicked.connect(self._tournament_hide_pair_editor)
+        self.tournament_pair_save.clicked.connect(self._tournament_save_pair)
+        pair_lay.addLayout(pair_buttons); pair_outer.addWidget(pair_card, 0, Qt.AlignCenter)
+        self.tournament_pair_overlay.hide()
+
+        self.tournament_board_overlay = QWidget(root)
+        self.tournament_board_overlay.setObjectName("TournamentBoardOverlay")
+        self.tournament_board_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.tournament_board_overlay.setStyleSheet(
+            "QWidget#TournamentBoardOverlay{background-color:rgba(0,0,0,220);}"
+            "QFrame#TournamentBoardCard{background:#111116;border:3px solid #ffe000;border-radius:20px;}"
+            "QLabel{font-size:34px;font-weight:900;color:white;}"
+        )
+        board_outer=QVBoxLayout(self.tournament_board_overlay); board_outer.setAlignment(Qt.AlignCenter)
+        board_card=QFrame(); board_card.setObjectName("TournamentBoardCard"); board_card.setMinimumWidth(850)
+        board_lay=QVBoxLayout(board_card); board_lay.setContentsMargins(42,34,42,34); board_lay.setSpacing(24)
+        self.tournament_board_message=QLabel(""); self.tournament_board_message.setAlignment(Qt.AlignCenter)
+        self.tournament_board_message.setWordWrap(True); board_lay.addWidget(self.tournament_board_message)
+        board_ok=_btn("U REDU","",role="Accent",tall=False); board_ok.setFixedHeight(92)
+        board_ok.setStyleSheet("QPushButton{min-height:92px;max-height:92px;font-size:40px;font-weight:900;}")
+        board_ok.clicked.connect(self.tournament_board_overlay.hide); board_lay.addWidget(board_ok)
+        board_outer.addWidget(board_card); self.tournament_board_overlay.hide()
+        return root
+
+    def _ensure_tournament_api(self):
+        api = getattr(self, "_tournament_api", None)
+        if api is None or not hasattr(api, "snapshot"):
+            from tournament import Tournament
+            api = Tournament()
+            self._tournament_api = api
+        return api
+
+    def _show_tournament_home(self) -> None:
+        self.tournament_view.setCurrentWidget(self.tournament_home)
+        try:
+            api = self._ensure_tournament_api()
+            state = api.snapshot()
+            self.tournament_continue_btn.setVisible(bool(state.get("id")))
+        except Exception as exc:
+            self.tournament_continue_btn.hide()
+            print(f"[tournament] initialization failed: {exc}", flush=True)
+            self._show_tournament_board_modal(
+                "TURNIR NIJE DOSTUPAN\n\n"
+                "Provjeri je li prenesena cijela nova verzija aplikacije i ponovno pokreni instalaciju autostarta."
+            )
+
+    def _tournament_continue(self) -> None:
+        api=getattr(self,"_tournament_api",None)
+        state=api.snapshot() if hasattr(api,"snapshot") else {}
+        if not state.get("id"):
+            return
+        self._tournament_is_client = False
+        self._tournament_cleanup_done = False
+        self.session.state["_tournament_active"]=True
+        self.session.state["_tournament_draft"]=list(state.get("players") or [])
+        self._tournament_game=str(state.get("game") or "501")
+        self._tournament_rules=dict(state.get("rules") or {})
+        self.session.state["screen"]="tournament"
+        self.tournament_view.setCurrentWidget(self.tournament_active)
+        self._tournament_show_tab("bracket")
+
+    def _tournament_draft_players(self) -> list:
+        draft = self.session.state.setdefault("_tournament_draft", [])
+        if not isinstance(draft, list):
+            draft = []; self.session.state["_tournament_draft"] = draft
+        return draft
+
+    def _tournament_new_local(self) -> None:
+        try:
+            from tournament import Tournament
+            self._tournament_is_client = False
+            self._tournament_cleanup_done = False
+            self._tournament_api = Tournament(); self._tournament_api.close()
+        except Exception as exc:
+            print(f"[tournament] create failed: {exc}", flush=True)
+            self._show_tournament_board_modal(
+                "NE MOGU POKRENUTI TURNIR\n\n"
+                "Provjeri je li prenesena cijela nova verzija aplikacije."
+            )
+            return
+        self.session.state["_tournament_draft"] = []
+        self._tournament_game = "501"
+        self._tournament_rules = {"double_in": False, "double_out": False}
+        self._tournament_rules_selecting = False
+        self.session.state["_tournament_active"] = True
+        self._tournament_refresh_force = True
+        self.tournament_view.setCurrentWidget(self.tournament_active)
+        self._tournament_show_tab("settings")
+
+    def _tournament_join_existing(self) -> None:
+        if getattr(self, "_tournament_join_running", False): return
+        self._tournament_join_running = True
+        self._show_loading("TRAŽIM DRUGE PIKADO PLOČE", "Automatsko traženje može trajati do 30 sekundi.")
+
+        def worker() -> None:
+            from tournament import Client
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                try:
+                    found = Client.discover(timeout=2.0)
+                    if found:
+                        api = Client(found[0]["host"]); state = api.call()
+                        if state:
+                            self.tournament_join_result.emit({"api": api, "state": state})
+                            return
+                except Exception:
+                    pass
+                if sys.platform.startswith("linux"):
+                    try:
+                        scan = subprocess.run(
+                            ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "--rescan", "yes"],
+                            capture_output=True, text=True, timeout=8, check=False,
+                        )
+                        ssids = sorted({line.strip() for line in scan.stdout.splitlines()
+                                       if line.strip().startswith("SMARTDARTS-")})
+                        if ssids:
+                            subprocess.run(
+                                ["nmcli", "device", "wifi", "connect", ssids[0],
+                                 "password", "SmartDarts8765", "name", "smartdarts-tournament-client"],
+                                capture_output=True, text=True, timeout=15, check=True,
+                            )
+                            api = Client("10.42.0.1"); state = api.call()
+                            if state:
+                                self.tournament_join_result.emit({"api": api, "state": state})
+                                return
+                    except Exception:
+                        pass
+            self.tournament_join_result.emit({"error": "NEMA DRUGIH PIKADO PLOČA U BLIZINI"})
+
+        threading.Thread(target=worker, daemon=True, name="tournament-join-search").start()
+
+    def _on_tournament_join_result(self, result: object) -> None:
+        self._tournament_join_running = False
+        self._hide_loading()
+        data = result if isinstance(result, dict) else {}
+        if data.get("error"):
+            self._show_tournament_board_modal(str(data["error"]))
+            return
+        self._tournament_api = data.get("api")
+        self._tournament_is_client = True
+        self._tournament_cleanup_done = False
+        self._tournament_remote_state = dict(data.get("state") or {})
+        self._tournament_client_poll_running = False
+        self._tournament_last_remote_updated = self._tournament_remote_state.get("updated")
+        self._tournament_last_heartbeat = 0.0
+        self._tournament_client_poll_errors = 0
+        self._tournament_leave_pending = False
+        self.session.state["_tournament_active"] = True
+        self.tournament_view.setCurrentWidget(self.tournament_active)
+        self._tournament_show_tab("bracket")
+
+    def _tournament_show_tab(self, name: str) -> None:
+        if name == "settings" and getattr(self, "_tournament_is_client", False):
+            name = "bracket"
+        page = {"settings": self.tournament_settings_page, "bracket": self.tournament_bracket_page,
+                "play": self.tournament_play_page}.get(name, self.tournament_settings_page)
+        self.tournament_tabs.setCurrentWidget(page)
+        self._tournament_refresh_force = True
+        self._refresh_tournament_page()
+
+    def _tournament_add_player(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        draft = self._tournament_draft_players()
+        if len(draft) >= 16: QMessageBox.warning(self, "TURNIR", "Najviše je dopušteno 16 igrača."); return
+        self._name_tournament_mode = True
+        self._tournament_edit_index = None
+        self.session.state["_tournament_name_edit_index"] = -1
+        self._name_slot = -1
+        self._name_buf = ""
+        self.name_title.setText("IME IGRAČA")
+        self.name_ok_btn.setText("DODAJ")
+        self.name_cancel_btn.setText("NAZAD")
+        self.name_remove_btn.hide()
+        self._name_refresh_display()
+        self.name_overlay.show(); self.name_overlay.raise_()
+        self._place_chrome(); self._update_settings_fab_visibility()
+
+    def _tournament_edit_player(self, item: QListWidgetItem) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        if item is None: return
+        api = getattr(self, "_tournament_api", None)
+        state = api.snapshot() if hasattr(api, "snapshot") else {}
+        if any(m.get("status") == "playing" or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2) for m in state.get("matches", [])):
+            return
+        index = self.tournament_players_list.row(item)
+        draft = self._tournament_draft_players()
+        if index < 0 or index >= len(draft): return
+        self._name_tournament_mode = True
+        self._tournament_edit_index = index
+        self.session.state["_tournament_name_edit_index"] = index
+        self._name_slot = -1
+        self._name_buf = str(draft[index])
+        self.name_title.setText("UREDI IME IGRAČA")
+        self.name_ok_btn.setText("SPREMI")
+        self.name_cancel_btn.setText("NAZAD")
+        self.name_remove_btn.setText("OBRIŠI")
+        can_change = not any(
+            m.get("status") == "playing"
+            or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2)
+            for m in state.get("matches", [])
+        )
+        self.name_remove_btn.setVisible(can_change)
+        self.name_remove_btn.setEnabled(can_change)
+        self._name_refresh_display()
+        self.name_overlay.show(); self.name_overlay.raise_()
+        self._place_chrome(); self._update_settings_fab_visibility()
+
+    def _tournament_choose_game(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        state = self._tournament_api.snapshot() if hasattr(self._tournament_api, "snapshot") else {}
+        if any(
+            m.get("status") == "playing"
+            or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2)
+            for m in state.get("matches", [])
+        ):
+            return
+        self._tournament_rules_selecting = True
+        self.session.state["screen"] = "select_game"
+        self.session.state["selected_game_mode"] = None
+        self._last_ui_sig = None; self.refresh()
+
+    def _tournament_randomize(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        draft = list(self._tournament_draft_players())
+        try:
+            api = self._tournament_api
+            state = api.snapshot() if hasattr(api, "snapshot") else api.call()
+            players = draft or list(state.get("players") or [])
+            if not 2 <= len(players) <= 16:
+                return
+            if not state.get("id"):
+                self._tournament_create_bracket(True)
+            elif hasattr(api, "shuffle"):
+                api.shuffle(); self._tournament_refresh_force = True; self._refresh_tournament_page()
+            else:
+                api.call("shuffle"); self._tournament_refresh_force = True; self._refresh_tournament_page()
+        except Exception as exc:
+            QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_undo(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        api = getattr(self, "_tournament_api", None)
+        if api is None:
+            return
+        try:
+            if hasattr(api, "undo"):
+                state = api.undo()
+            else:
+                state = api.call("undo")
+            if isinstance(state, dict) and state.get("players"):
+                self.session.state["_tournament_draft"] = list(state["players"])
+            self._tournament_refresh_force = True
+            self._refresh_tournament_page()
+        except Exception as exc:
+            QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_create_bracket(self, shuffle: bool) -> None:
+        draft = list(self._tournament_draft_players())
+        if not 2 <= len(draft) <= 16:
+            return
+        try:
+            self._tournament_api.create(
+                draft,
+                game=getattr(self, "_tournament_game", "501"),
+                shuffle=shuffle,
+                rules=dict(getattr(self, "_tournament_rules", {}) or {}),
+            )
+            self._tournament_refresh_force = True
+            self._tournament_show_tab("bracket")
+        except Exception as exc: QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_sync_bracket_to_players(self) -> None:
+        """Keep the bracket visible while players are added or removed."""
+        api = getattr(self, "_tournament_api", None)
+        if api is None:
+            return
+        draft = list(self._tournament_draft_players())
+        state = api.snapshot() if hasattr(api, "snapshot") else api.call()
+        locked = any(
+            m.get("status") == "playing"
+            or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2)
+            for m in state.get("matches", [])
+        )
+        if locked:
+            return
+        if len(draft) < 2:
+            if hasattr(api, "close"):
+                api.close()
+            self._tournament_refresh_force = True
+            return
+        if hasattr(api, "create"):
+            api.create(
+                draft,
+                game=getattr(self, "_tournament_game", "501"),
+                shuffle=False,
+                rules=dict(getattr(self, "_tournament_rules", {}) or {}),
+            )
+        self._tournament_refresh_force = True
+
+    def _tournament_edit_match(self, match_id: str) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        api = getattr(self, "_tournament_api", None)
+        if api is None:
+            return
+        try:
+            state = api.snapshot() if hasattr(api, "snapshot") else api.call()
+            match = next((m for m in state.get("matches", []) if m.get("id") == match_id), None)
+            if not match or int(match.get("round") or 0) != 1:
+                return
+            if any(m.get("status") == "playing" or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2) for m in state.get("matches", [])):
+                return
+            players = list(state.get("players") or [])
+            if len(players) < 2:
+                return
+            self._tournament_pair_match_id = match_id
+            self._tournament_pair_players = players
+            self.tournament_pair_first.blockSignals(True)
+            self.tournament_pair_first.clear(); self.tournament_pair_first.addItems(players)
+            current = list(match.get("players") or [])
+            if current and current[0] in players:
+                self.tournament_pair_first.setCurrentText(current[0])
+            self.tournament_pair_first.blockSignals(False)
+            preferred = current[1] if len(current) > 1 else ""
+            self._tournament_pair_first_changed(self.tournament_pair_first.currentText(), preferred)
+            self.tournament_pair_overlay.setGeometry(self.pages["tournament"].rect())
+            self.tournament_pair_overlay.show(); self.tournament_pair_overlay.raise_()
+        except Exception as exc:
+            QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_pair_first_changed(self, first: str, preferred: str = "") -> None:
+        if not hasattr(self, "tournament_pair_second"):
+            return
+        choices = [p for p in getattr(self, "_tournament_pair_players", []) if p != first]
+        old = preferred or self.tournament_pair_second.currentText()
+        self.tournament_pair_second.blockSignals(True)
+        self.tournament_pair_second.clear(); self.tournament_pair_second.addItems(choices)
+        if old in choices:
+            self.tournament_pair_second.setCurrentText(old)
+        self.tournament_pair_second.blockSignals(False)
+
+    def _tournament_hide_pair_editor(self) -> None:
+        self.tournament_pair_overlay.hide()
+        self._tournament_pair_match_id = None
+
+    def _tournament_save_pair(self) -> None:
+        api = getattr(self, "_tournament_api", None)
+        match_id = getattr(self, "_tournament_pair_match_id", None)
+        if api is None or not match_id:
+            return
+        try:
+            a = self.tournament_pair_first.currentText()
+            b = self.tournament_pair_second.currentText()
+            if hasattr(api, "assign"):
+                api.assign(match_id, a, b)
+            else:
+                api.call("assign", match_id=match_id, player_a=a, player_b=b)
+            self._tournament_hide_pair_editor()
+            self._tournament_refresh_force = True
+            self._refresh_tournament_page()
+        except Exception as exc:
+            QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_enable_host(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        from tournament import Host
+        try:
+            hotspot_note = "na lokalnoj mreži"
+            state = self._tournament_api.snapshot() if hasattr(self._tournament_api, "snapshot") else {}
+            if not state.get("id"):
+                return
+            if sys.platform.startswith("linux"):
+                suffix = str(state.get("id") or "TURNIR").upper()
+                ssid = f"SMARTDARTS-{suffix}"
+                try:
+                    subprocess.run(
+                        ["nmcli", "connection", "delete", "smartdarts-tournament-hotspot"],
+                        capture_output=True, text=True, timeout=5, check=False,
+                    )
+                    subprocess.run(
+                        ["nmcli", "device", "wifi", "hotspot", "ifname", "wlan0",
+                         "con-name", "smartdarts-tournament-hotspot", "ssid", ssid,
+                         "password", "SmartDarts8765"],
+                        capture_output=True, text=True, timeout=15, check=True,
+                    )
+                    hotspot_note = f"preko hotspota {ssid}"
+                    self._tournament_hotspot_active = True
+                except Exception as exc:
+                    print(f"[TURNIR] hotspot nije pokrenut, koristi se LAN: {exc}", flush=True)
+            host = getattr(self, "_tournament_host", None)
+            if host is None or host.server is None:
+                host = Host(self._tournament_api); host.start(); self._tournament_host = host
+            self._show_tournament_board_modal(
+                f"Turnir je dostupan {hotspot_note}.\n\nNa drugoj ploči odaberite PRIDRUŽI SE."
+            )
+        except Exception as exc:
+            self._show_tournament_board_modal(str(exc))
+
+    def _show_tournament_board_modal(self, message: str) -> None:
+        self.tournament_board_message.setText(str(message))
+        self.tournament_board_overlay.setGeometry(self.pages["tournament"].rect())
+        self.tournament_board_overlay.show(); self.tournament_board_overlay.raise_()
+
+    def _tournament_close(self) -> None:
+        host = getattr(self, "_tournament_host", None)
+        if host is not None: host.stop(); self._tournament_host = None
+        self._restore_tournament_internet(background=True)
+        api = getattr(self, "_tournament_api", None)
+        if hasattr(api, "close"): api.close()
+        self._tournament_api = None; self._tournament_match = None
+        self._tournament_is_client = False
+        self._tournament_remote_state = {}
+        self._tournament_client_poll_running = False
+        self.session.state.pop("_tournament_active", None)
+        self.session.state.pop("_tournament_draft", None)
+        self._show_tournament_home(); self._refresh_tournament_page()
+
+    def _cancel_tournament_match(self) -> None:
+        tm = getattr(self, "_tournament_match", None)
+        if not tm:
+            return
+        if tm.get("reported"):
+            self._tournament_match = None
+            return
+        try:
+            api = getattr(self, "_tournament_api", None)
+            if hasattr(api, "cancel"):
+                state = api.cancel(tm["id"], tm["board"])
+            elif api is not None:
+                state = api.call("cancel", match_id=tm["id"], board=tm["board"])
+                if isinstance(state, dict): self._tournament_remote_state = state
+        except Exception as exc:
+            print(f"[TURNIR] otključavanje meča nije uspjelo: {exc}", flush=True)
+        self._tournament_match = None
+
+    def _restore_tournament_internet(self, *, background: bool) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        if getattr(self, "_tournament_wifi_restore_running", False):
+            return
+        self._tournament_wifi_restore_running = True
+        self._tournament_hotspot_active = False
+
+        def reconnect() -> None:
+            tournament_connections = (
+                "smartdarts-tournament-hotspot",
+                "smartdarts-tournament-client",
+            )
+
+            def run(args, timeout=15):
+                return subprocess.run(
+                    ["nmcli", *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+
+            try:
+                # A tournament client/hotspot profile must not remain eligible
+                # for autoconnect, otherwise NetworkManager can immediately
+                # select it again instead of the remembered internet network.
+                for connection in tournament_connections:
+                    run(["connection", "down", connection], timeout=8)
+                    run(["connection", "delete", connection], timeout=8)
+
+                run(["networking", "on"], timeout=8)
+                run(["radio", "wifi", "on"], timeout=8)
+                run(["device", "set", "wlan0", "managed", "yes"], timeout=8)
+                run(["device", "disconnect", "wlan0"], timeout=8)
+                time.sleep(1.0)
+                run(["device", "wifi", "rescan", "ifname", "wlan0"], timeout=12)
+
+                automatic = run(
+                    ["--wait", "20", "device", "connect", "wlan0"],
+                    timeout=25,
+                )
+                if automatic.returncode == 0:
+                    print("[TURNIR] internet vraćen automatskim odabirom mreže", flush=True)
+                    return
+
+                # Prefer remembered wireless profiles with autoconnect enabled,
+                # ordered by their NetworkManager priority. `connection up`
+                # explicitly activates the saved credentials; `device connect`
+                # alone was unreliable after leaving AP mode on Raspberry Pi.
+                profiles_result = run(
+                    ["-t", "-f", "NAME,TYPE,AUTOCONNECT,AUTOCONNECT-PRIORITY",
+                     "connection", "show"],
+                    timeout=10,
+                )
+                profiles = []
+                for raw in (profiles_result.stdout or "").splitlines():
+                    cols = self._wifi_split_nmcli(raw.strip())
+                    if len(cols) < 3:
+                        continue
+                    name, kind, auto = cols[:3]
+                    if name in tournament_connections or kind not in (
+                        "802-11-wireless", "wifi", "wireless"
+                    ):
+                        continue
+                    try:
+                        priority = int(cols[3]) if len(cols) > 3 and cols[3] else 0
+                    except ValueError:
+                        priority = 0
+                    profiles.append((auto.lower() in ("yes", "da", "true"), priority, name))
+
+                connected = False
+                for _auto, _priority, name in sorted(profiles, reverse=True):
+                    result = run(
+                        ["--wait", "15", "connection", "up", "id", name,
+                         "ifname", "wlan0"],
+                        timeout=20,
+                    )
+                    if result.returncode == 0:
+                        connected = True
+                        print(f"[TURNIR] internet vraćen preko mreže {name}", flush=True)
+                        break
+
+                if not connected:
+                    detail = (automatic.stderr or automatic.stdout or "nepoznata greška").strip()
+                    print(f"[TURNIR] nema dostupne zapamćene mreže: {detail}", flush=True)
+            except Exception as exc:
+                print(f"[TURNIR] povratak na internet nije uspio: {exc}",flush=True)
+            finally:
+                self._tournament_wifi_restore_running = False
+        if background:
+            try:
+                threading.Thread(target=reconnect,daemon=False,name="tournament-wifi-reconnect").start()
+            except Exception:
+                self._tournament_wifi_restore_running = False
+                raise
+        else:
+            reconnect()
+
+    def _tournament_leave_client(self) -> None:
+        if not getattr(self, "_tournament_is_client", False):
+            return
+        self._tournament_leave_pending=False
+        self._cancel_tournament_match()
+        self.session.clear_to_standby(mqtt_off=False)
+        self.session.state.pop("_tournament_active", None)
+        self.session.state.pop("_tournament_draft", None)
+        self._tournament_api = None
+        self._tournament_is_client = False
+        self._tournament_remote_state = {}
+        self._tournament_client_poll_running = False
+        self._restore_tournament_internet(background=True)
+        self.session.state["screen"] = "tournament"
+        self._show_tournament_home()
+        self._last_ui_sig = None
+        self.refresh()
+
+    def _tournament_confirm_leave_client(self) -> None:
+        if not getattr(self,"_tournament_is_client",False):
+            return
+        self._tournament_leave_pending=True
+        self.session.state["screen"]="exit_confirm"
+        self._last_ui_sig=None
+        self.refresh()
+        self.exit_title.setText("IZAĆI IZ TURNIRA?")
+
+    def _tournament_host_closed(self) -> None:
+        if not getattr(self,"_tournament_is_client",False):
+            return
+        self._tournament_leave_pending=False
+        # Host is gone, so a network cancel is no longer possible. Clear the
+        # local game and return this board to the tournament home screen.
+        self._tournament_match=None
+        self.session.clear_to_standby(mqtt_off=False)
+        self.session.state.pop("_tournament_active",None)
+        self._tournament_api=None
+        self._tournament_is_client=False
+        self._tournament_remote_state={}
+        self._tournament_client_poll_running=False
+        self._restore_tournament_internet(background=True)
+        self.session.state["screen"]="tournament"
+        self._show_tournament_home()
+        self._last_ui_sig=None
+        self.refresh()
+        self._show_tournament_board_modal("HOST JE UGASIO TURNIR")
+
+    def _tournament_shutdown_cleanup(self) -> None:
+        if getattr(self,"_tournament_cleanup_done",False):
+            return
+        self._tournament_cleanup_done=True
+        self._cancel_tournament_match()
+        host = getattr(self, "_tournament_host", None)
+        if host is not None:
+            host.stop(); self._tournament_host = None
+        # Always remove stale tournament profiles on application exit. This
+        # also repairs a previous run that was killed before it could clean up.
+        self._restore_tournament_internet(background=False)
+
+    def _tournament_confirm_close(self) -> None:
+        if getattr(self, "_tournament_is_client", False): return
+        self._tournament_close_pending = True
+        self.session.state["screen"] = "exit_confirm"
+        self._last_ui_sig = None
+        self.refresh()
+        self.exit_title.setText("UGASITI TURNIR?")
+
+    def _poll_tournament_client(self) -> None:
+        if getattr(self, "_tournament_client_poll_running", False):
+            return
+        api = getattr(self, "_tournament_api", None)
+        if api is None:
+            return
+        self._tournament_client_poll_running = True
+        def worker() -> None:
+            try:
+                self.tournament_state_result.emit({"state": api.call()})
+            except Exception as exc:
+                self.tournament_state_result.emit({"error": str(exc)})
+        threading.Thread(target=worker, daemon=True, name="tournament-state-poll").start()
+
+    def _on_tournament_state_result(self, result: object) -> None:
+        self._tournament_client_poll_running = False
+        data = result if isinstance(result, dict) else {}
+        if data.get("error"):
+            self._tournament_client_poll_errors=int(getattr(self,"_tournament_client_poll_errors",0))+1
+            if self._tournament_client_poll_errors>=3:
+                self._tournament_host_closed()
+            return
+        state = data.get("state")
+        if not isinstance(state, dict):
+            return
+        self._tournament_client_poll_errors=0
+        if not state.get("id"):
+            self._tournament_host_closed()
+            return
+        previous = getattr(self, "_tournament_remote_state", {})
+        self._tournament_remote_state = state
+        if state.get("updated") != previous.get("updated"):
+            self._tournament_refresh_force = True
+            self._refresh_tournament_page()
+
+    def _refresh_tournament_page(self) -> None:
+        if not hasattr(self, "tournament_bracket"): return
+        try:
+            now = time.monotonic()
+            force = bool(getattr(self, "_tournament_refresh_force", False))
+            client = bool(getattr(self, "_tournament_is_client", False))
+            if client and now - float(getattr(self, "_tournament_last_poll", 0.0)) >= 1.0:
+                self._tournament_last_poll = now
+                self._poll_tournament_client()
+            if not force and not client and now - float(getattr(self, "_tournament_last_poll", 0.0)) < 0.5:
+                return
+            self._tournament_refresh_force = False
+            if not client:
+                self._tournament_last_poll = now
+            api = getattr(self, "_tournament_api", None)
+            state = (dict(getattr(self, "_tournament_remote_state", {}) or {}) if client
+                     else (api.snapshot() if hasattr(api, "snapshot") else (api.call() if api else {})))
+            self._tournament_tv_state = dict(state or {})
+            draft = [] if client else list(self._tournament_draft_players())
+            shown_players = draft or list((state or {}).get("players") or [])
+            render_key = (repr(state), tuple(draft))
+            if not force and render_key == getattr(self, "_tournament_last_render_key", None):
+                return
+            self._tournament_last_render_key = render_key
+            self.tournament_players_list.clear()
+            if shown_players:
+                for index, name in enumerate(shown_players, 1):
+                    self.tournament_players_list.addItem(f"{index}.  {name}")
+            shown_game = str((state or {}).get("game") or getattr(self, "_tournament_game", "501")).upper().replace("_", " ")
+            if shown_game in ("101", "301", "501", "701"):
+                shown_game = f"X01 ({shown_game})"
+            self.tournament_game_btn.setText(f"IGRA: {shown_game}")
+            bracket_started = bool((state or {}).get("id"))
+            valid_players = 2 <= len(shown_players) <= 16
+            playable_count = 2 <= len(shown_players) <= 16
+            locked = any(m.get("status") == "playing" or (m.get("status") == "finished" and len([p for p in m.get("players", []) if p]) == 2) for m in state.get("matches", []))
+            self.tournament_game_btn.setEnabled(not locked)
+            self.tournament_add_player_btn.setEnabled(not locked and len(draft) < 16)
+            self.tournament_seed_ordered_btn.setEnabled(bool(state.get("can_undo")) and not locked)
+            self.tournament_seed_random_btn.setEnabled(valid_players and not locked)
+            self.tournament_seed_ordered_btn.setVisible(not locked)
+            self.tournament_seed_random_btn.setVisible(not locked)
+            self.tournament_add_board_btn.setEnabled(bracket_started)
+            self.tournament_tab_buttons["settings"].setVisible(True)
+            self.tournament_tab_buttons["settings"].setText("IZAĐI" if client else "POSTAVKE")
+            self.tournament_seed_ordered_btn.setVisible(not client and not locked)
+            self.tournament_seed_random_btn.setVisible(not client and not locked)
+            if not state:
+                self._tournament_render_text = "BRACKET JOŠ NIJE POSTAVLJEN\n\nDodajte igrače pa ih postavite redom ili nasumično."
+            rounds = {}
+            for m in state.get("matches", []): rounds.setdefault(m["round"], []).append(m)
+            lines = []
+            for rnd in sorted(rounds):
+                lines.append("FINALE" if len(rounds[rnd]) == 1 else f"RUNDA {rnd}")
+                for m in rounds[rnd]:
+                    a, b = m["players"]
+                    winner = m.get("winner")
+                    result = f"  →  {winner}" if winner else f"  [{m['status'].upper()}]"
+                    lines.append(f"{a or '—'}   VS   {b or '—'}{result}")
+            if state.get("winner"): lines += ["", f"POBJEDNIK TURNIRA: {state['winner']}"]
+            if lines:
+                self._tournament_render_text = "\n".join(lines)
+            self.tournament_bracket.set_state(state)
+
+            # The control screen may stay on the same page while results
+            # change. Send the structured bracket directly to the TV. Until a
+            # bracket has actually been created, the TV keeps the normal
+            # SmartDarts standby logo/title.
+            spectator = getattr(self, "_spectator_display", None)
+            if spectator is not None:
+                tv_snap = self.session.snapshot_for_ui()
+                if state.get("id") and state.get("matches"):
+                    tv_snap.update(screen="tournament", tournament_state=dict(state))
+                else:
+                    tv_snap.update(screen="standby", tournament_state={})
+                spectator.update_snapshot(tv_snap)
+
+            while self.tournament_play_layout.count():
+                item = self.tournament_play_layout.takeAt(0)
+                if item.widget() is not None: item.widget().deleteLater()
+            heading = QLabel("ODABERI MEČ")
+            heading.setAlignment(Qt.AlignCenter); heading.setStyleSheet("font-size:48px;font-weight:900;color:#ffe14a;")
+            self.tournament_play_layout.addWidget(heading,0,0,1,2)
+            ready = [m for m in state.get("matches", []) if m.get("status") == "ready"
+                     and len([p for p in m.get("players",[]) if p and str(p).strip().upper()!="NONE"])==2]
+            self.tournament_tab_buttons["play"].setEnabled(bool(ready) and playable_count)
+            left_count=len(ready) if len(ready)<=4 else (len(ready)+1)//2
+            for index,match in enumerate(ready):
+                a, b = match["players"]
+                button = TournamentMatchButton(a, b)
+                button.setFocusPolicy(Qt.NoFocus)
+                button.clicked.connect(lambda _=False, mid=match["id"]: self._tournament_start_match(mid))
+                if len(ready)<=4:
+                    self.tournament_play_layout.addWidget(button,index+1,0,1,2)
+                elif index<left_count:
+                    self.tournament_play_layout.addWidget(button,index+1,0)
+                else:
+                    self.tournament_play_layout.addWidget(button,index-left_count+1,1)
+            if not ready:
+                empty = QLabel("NEMA SLOBODNIH MEČEVA" if not state.get("winner") else f"POBJEDNIK: {state['winner']}")
+                empty.setAlignment(Qt.AlignCenter); empty.setStyleSheet("font-size:36px;font-weight:800;")
+                self.tournament_play_layout.addWidget(empty,1,0,1,2)
+            self.tournament_play_layout.setRowStretch(9, 1)
+        except Exception as exc:
+            self._tournament_render_text = f"Turnir nije dostupan: {exc}"
+            self._tournament_tv_state = {}
+            self.tournament_bracket.set_state({})
+
+    def _tournament_start_match(self, match_id: str) -> None:
+        try:
+            api = self._tournament_api
+            state = (api.snapshot() if hasattr(api, "snapshot") else
+                     dict(getattr(self, "_tournament_remote_state", {}) or api.call()))
+            match = next(m for m in state.get("matches", []) if m["id"] == match_id)
+            real_players=[p for p in match.get("players",[]) if p and str(p).strip().upper()!="NONE"]
+            if len(real_players)!=2:
+                raise ValueError("Meč se može pokrenuti tek kada ima dva igrača")
+            board = get_settings().device_id
+            if hasattr(api, "claim"):
+                claimed_state = api.claim(match_id, board)
+            else:
+                claimed_state = api.call("claim", match_id=match_id, board=board)
+                if isinstance(claimed_state, dict): self._tournament_remote_state = claimed_state
+            self._tournament_match = {"id": match_id, "players": match["players"], "board": board, "reported": False}
+            self.session.state["_tournament_active"] = True
+            self.session.state["selected_game_mode"] = str(state.get("game") or "501").lower()
+            self.session.state["rules_pending"] = dict(state.get("rules") or {})
+            self.session.state["player_slots"] = [{"name": match["players"][0]}, {"name": match["players"][1]}, None, None]
+            led_ring_on()
+            self.session.start_from_player_slots()
+            self._last_ui_sig = None; self.refresh()
+        except Exception as exc:
+            QMessageBox.warning(self, "TURNIR", str(exc))
+
+    def _tournament_cancel_match_and_return(self) -> None:
+        """Cancel an unstarted claimed match and return straight to its tournament."""
+        self._cancel_tournament_match()
+        self.session.clear_to_standby(mqtt_off=False)
+        self.session.state["screen"] = "tournament"
+        self.session.state["_tournament_active"] = True
+        self.tournament_view.setCurrentWidget(self.tournament_active)
+        self._tournament_show_tab("play")
+        led_ring_off()
+        self._last_ui_sig = None
+        self.refresh()
+
+    def _tournament_report_winner(self) -> bool:
+        """Commit a completed tournament game exactly once."""
+        tm = getattr(self, "_tournament_match", None)
+        g = self.session.ctx.get("game")
+        if not tm or tm.get("reported") or not g or not mm._winner_screen_ready(g):
+            return False
+        winner_idx = g.get("winner_player_idx")
+        if winner_idx is None:
+            return False
+        try:
+            player = (g.get("players") or [])[int(winner_idx)]
+            winner_name = str(player.get("name") or tm["players"][int(winner_idx)])
+            api = self._tournament_api
+            if hasattr(api, "finish"):
+                finished_state = api.finish(tm["id"], winner_name, tm["board"])
+            else:
+                finished_state = api.call("finish", match_id=tm["id"], winner=winner_name, board=tm["board"])
+                if isinstance(finished_state, dict): self._tournament_remote_state = finished_state
+            tm["reported"] = True
+            self.session.state["_tournament_active"] = True
+            self._tournament_refresh_force = True
+            led_ring_off()
+            print(f"[TURNIR] rezultat poslan: {tm['id']} -> {winner_name}", flush=True)
+            return True
+        except Exception as exc:
+            print(f"[TURNIR] slanje rezultata nije uspjelo: {exc}", flush=True)
+            return False
+
     def _open_settings(self) -> None:
+        self._settings_return_tournament = self.session.screen == "tournament" or bool(
+            self.session.state.get("_tournament_active") and self.stack.currentWidget() is self.pages.get("tournament")
+        )
         self.session.enter_settings()
         self._last_ui_sig = None
         self._i18n_screen = None
@@ -4629,6 +5988,788 @@ class MainWindow(QMainWindow):
         self.stats_overlay.raise_()
         self._place_chrome(wallpaper=False)
 
+    def _build_performance_overlay(self, root: QWidget) -> None:
+        self._performance_collector = PerformanceCollector()
+        self._performance_collecting = False
+        self._performance_bridge = PerformanceBridge(self)
+        self._performance_bridge.ready.connect(self._performance_ready)
+        self._performance_timer = QTimer(self)
+        self._performance_timer.setInterval(2000)
+        self._performance_timer.timeout.connect(self._request_performance_sample)
+
+        self.performance_overlay = QWidget(root)
+        self.performance_overlay.setObjectName("PerformanceOverlay")
+        self.performance_overlay.hide()
+        self.performance_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.performance_overlay.setStyleSheet(
+            "QWidget#PerformanceOverlay { background-color: rgba(0,0,0,215); }"
+        )
+        outer = QVBoxLayout(self.performance_overlay)
+        outer.setContentsMargins(34, 28, 34, 28)
+        outer.setAlignment(Qt.AlignCenter)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(1280)
+        card.setMaximumWidth(1540)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(34, 26, 34, 28)
+        layout.setSpacing(18)
+
+        title = QLabel("PERFORMANSE SUSTAVA")
+        title.setObjectName("SettingsTitle")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        self.performance_health = QLabel("MJERENJE…")
+        self.performance_health.setAlignment(Qt.AlignCenter)
+        self.performance_health.setMinimumHeight(66)
+        self.performance_health.setStyleSheet(
+            "font-size: 34px; font-weight: 900; color: #ffe14a; "
+            "background: #18181e; border: 3px solid #555560; border-radius: 14px;"
+        )
+        layout.addWidget(self.performance_health)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(18)
+        for column in range(3):
+            grid.setColumnStretch(column, 1)
+        self._performance_values: Dict[str, QLabel] = {}
+        self._performance_details: Dict[str, QLabel] = {}
+
+        def _metric(key: str, heading: str, row: int, col: int) -> None:
+            box = QFrame()
+            box.setObjectName("PerfMetric")
+            box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            box.setStyleSheet(
+                "QFrame#PerfMetric { background: #0d0d12; border: 2px solid #44444e; "
+                "border-radius: 16px; }"
+            )
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(20, 14, 20, 14)
+            box_layout.setSpacing(4)
+            head = QLabel(heading)
+            head.setAlignment(Qt.AlignCenter)
+            head.setWordWrap(True)
+            head.setMinimumHeight(54)
+            head.setStyleSheet("font-size: 22px; font-weight: 800; color: #b8b8c2;")
+            value = QLabel("—")
+            value.setAlignment(Qt.AlignCenter)
+            value.setStyleSheet("font-size: 46px; font-weight: 900; color: white;")
+            detail = QLabel("")
+            detail.setAlignment(Qt.AlignCenter)
+            detail.setWordWrap(True)
+            detail.setMinimumHeight(42)
+            detail.setStyleSheet("font-size: 22px; color: #b8b8c2;")
+            box_layout.addWidget(head)
+            box_layout.addWidget(value, 1)
+            box_layout.addWidget(detail)
+            grid.addWidget(box, row, col)
+            self._performance_values[key] = value
+            self._performance_details[key] = detail
+
+        _metric("cpu", "CPU", 0, 0)
+        _metric("temperature", "TEMPERATURA", 0, 1)
+        _metric("memory", "RAM", 0, 2)
+        _metric("gpu", "GPU", 1, 0)
+        _metric("throttled", "NAPAJANJE / THROTTLING", 1, 1)
+        _metric("system", "SUSTAV", 1, 2)
+        layout.addLayout(grid, 1)
+
+        note = QLabel("Automatsko osvježavanje svake 2 sekunde")
+        note.setAlignment(Qt.AlignCenter)
+        note.setStyleSheet("font-size: 22px; color: #8f8f99;")
+        layout.addWidget(note)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(16)
+        refresh = QPushButton("OSVJEŽI")
+        refresh.setObjectName("Accent")
+        refresh.setFocusPolicy(Qt.NoFocus)
+        refresh.clicked.connect(self._request_performance_sample)
+        close = QPushButton("ZATVORI")
+        close.setObjectName("Footer")
+        close.setFocusPolicy(Qt.NoFocus)
+        close.clicked.connect(self._hide_performance_overlay)
+        refresh.setStyleSheet(
+            "QPushButton#Accent { min-height: 76px; max-height: 76px; "
+            "padding: 0px 20px; font-size: 42px; }"
+        )
+        close.setStyleSheet(
+            "QPushButton#Footer { min-height: 76px; max-height: 76px; "
+            "padding: 0px 20px; font-size: 42px; }"
+        )
+        actions.addWidget(refresh, 1)
+        actions.addWidget(close, 2)
+        layout.addLayout(actions)
+        outer.addWidget(card, 0, Qt.AlignCenter)
+
+    @staticmethod
+    def _format_bytes(value: object) -> str:
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        return f"{amount / (1024 ** 3):.1f} GB"
+
+    @staticmethod
+    def _format_uptime(seconds: object) -> str:
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return "—"
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        return f"{days} d {hours} h" if days else f"{hours} h {minutes} min"
+
+    def _show_performance_overlay(self) -> None:
+        self.performance_overlay.show()
+        self.performance_overlay.raise_()
+        self._place_chrome(wallpaper=False)
+        self._performance_timer.start()
+        self._request_performance_sample()
+
+    def _hide_performance_overlay(self) -> None:
+        self._performance_timer.stop()
+        self.performance_overlay.hide()
+
+    def _request_performance_sample(self) -> None:
+        if self._performance_collecting:
+            return
+        self._performance_collecting = True
+
+        def _collect() -> None:
+            try:
+                result = self._performance_collector.collect()
+            except Exception as exc:
+                result = {"error": str(exc)}
+            try:
+                self._performance_bridge.ready.emit(result)
+            except RuntimeError:
+                # The application may close while the background sample finishes.
+                pass
+
+        threading.Thread(target=_collect, name="smartdarts-performance", daemon=True).start()
+
+    def _performance_ready(self, metrics: dict) -> None:
+        self._performance_collecting = False
+        if metrics.get("error"):
+            self.performance_health.setText("MJERENJE NIJE DOSTUPNO")
+            self.performance_health.setStyleSheet(
+                "font-size: 34px; font-weight: 900; color: #ff6868; "
+                "background: #18181e; border: 3px solid #8a3030; border-radius: 14px;"
+            )
+            return
+
+        def _number(value: object, suffix: str, decimals: int = 0) -> str:
+            try:
+                return f"{float(value):.{decimals}f}{suffix}"
+            except (TypeError, ValueError):
+                return "—"
+
+        cpu = metrics.get("cpu_percent")
+        cpu_clock = metrics.get("cpu_clock_mhz")
+        self._performance_values["cpu"].setText(
+            "MJERENJE…" if cpu is None else _number(cpu, "%")
+        )
+        self._performance_details["cpu"].setText(
+            f"Takt: {_number(cpu_clock, ' MHz')}"
+        )
+
+        temp = metrics.get("temperature_c")
+        self._performance_values["temperature"].setText(_number(temp, " °C", 1))
+        try:
+            temp_value = float(temp)
+        except (TypeError, ValueError):
+            temp_value = 0.0
+        temp_level = "Visoka temperatura" if temp_value >= 80 else (
+            "Povišena temperatura" if temp_value >= 70 else "Temperatura je u redu"
+        )
+        self._performance_details["temperature"].setText(temp_level)
+        temp_color = "#ff6262" if temp_value >= 80 else (
+            "#ffe14a" if temp_value >= 70 else "#66ff8a"
+        )
+        self._performance_values["temperature"].setStyleSheet(
+            f"font-size: 46px; font-weight: 900; color: {temp_color};"
+        )
+
+        used = metrics.get("memory_used")
+        total = metrics.get("memory_total")
+        try:
+            ram_percent = 100.0 * float(used) / float(total)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ram_percent = None
+        self._performance_values["memory"].setText(
+            "—" if ram_percent is None else f"{ram_percent:.0f}%"
+        )
+        self._performance_details["memory"].setText(
+            f"{self._format_bytes(used)} / {self._format_bytes(total)}"
+        )
+
+        self._performance_values["gpu"].setText(
+            _number(metrics.get("gpu_clock_mhz"), " MHz")
+        )
+        gpu_mem = str(metrics.get("gpu_memory") or "—")
+        self._performance_details["gpu"].setText(f"Rezervirana memorija: {gpu_mem}")
+
+        throttle = metrics.get("throttled") or {}
+        level = str(throttle.get("level") or "neutral")
+        colors = {"good": "#66ff8a", "warn": "#ffe14a", "bad": "#ff6262", "neutral": "#b8b8c2"}
+        self._performance_values["throttled"].setText(str(throttle.get("status") or "—"))
+        self._performance_values["throttled"].setStyleSheet(
+            f"font-size: 34px; font-weight: 900; color: {colors.get(level, '#b8b8c2')};"
+        )
+        self._performance_details["throttled"].setText(str(throttle.get("detail") or ""))
+
+        self._performance_values["system"].setText(str(metrics.get("platform") or "—"))
+        self._performance_details["system"].setText(
+            f"Uptime: {self._format_uptime(metrics.get('uptime_seconds'))}"
+        )
+
+        unhealthy = level == "bad" or temp_value >= 80
+        warning = level == "warn" or temp_value >= 70
+        if unhealthy:
+            health_text, health_color, border = "POTREBNA PROVJERA", "#ff6262", "#8a3030"
+        elif warning:
+            health_text, health_color, border = "SUSTAV RADI — POSTOJI UPOZORENJE", "#ffe14a", "#8a7720"
+        else:
+            health_text, health_color, border = "SUSTAV JE U REDU", "#66ff8a", "#287a3a"
+        self.performance_health.setText(health_text)
+        self.performance_health.setStyleSheet(
+            f"font-size: 34px; font-weight: 900; color: {health_color}; "
+            f"background: #18181e; border: 3px solid {border}; border-radius: 14px;"
+        )
+        if cpu is None and self.performance_overlay.isVisible():
+            QTimer.singleShot(650, self._request_performance_sample)
+
+    @staticmethod
+    def _wifi_split_nmcli(line: str) -> List[str]:
+        """Split nmcli terse output while preserving escaped ':' and '\\'."""
+        fields: List[str] = []
+        buf: List[str] = []
+        escaped = False
+        for ch in str(line):
+            if escaped:
+                buf.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == ":":
+                fields.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+        if escaped:
+            buf.append("\\")
+        fields.append("".join(buf))
+        return fields
+
+    @classmethod
+    def _wifi_parse_scan(cls, output: str) -> List[dict]:
+        """Deduplicate SSIDs, preferring active and strongest access points."""
+        by_ssid: Dict[str, dict] = {}
+        for raw in str(output or "").splitlines():
+            cols = cls._wifi_split_nmcli(raw.strip())
+            if len(cols) < 4:
+                continue
+            active, ssid, signal, security = cols[0], cols[1], cols[2], ":".join(cols[3:])
+            if not ssid:
+                continue
+            try:
+                strength = max(0, min(100, int(signal or 0)))
+            except (TypeError, ValueError):
+                strength = 0
+            row = {
+                "ssid": ssid,
+                "active": str(active).strip() in ("*", "yes", "da"),
+                "signal": strength,
+                "security": security.strip(),
+            }
+            previous = by_ssid.get(ssid)
+            if previous is None or row["active"] or (
+                not previous["active"] and strength > int(previous["signal"])
+            ):
+                by_ssid[ssid] = row
+        return sorted(
+            by_ssid.values(),
+            key=lambda row: (not bool(row["active"]), -int(row["signal"]), row["ssid"].lower()),
+        )
+
+    def _build_wifi_overlay(self, root: QWidget) -> None:
+        self._wifi_operation = ""
+        self._wifi_case_upper = False
+        self._wifi_password_value = ""
+        self._wifi_selected_ssid = ""
+        self._wifi_proc = QProcess(self)
+        self._wifi_proc.finished.connect(self._wifi_process_finished)
+        self._wifi_proc.errorOccurred.connect(self._wifi_process_error)
+
+        self.wifi_overlay = QWidget(root)
+        self.wifi_overlay.setObjectName("WifiOverlay")
+        self.wifi_overlay.hide()
+        self.wifi_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.wifi_overlay.setStyleSheet(
+            "QWidget#WifiOverlay { background-color: rgba(0,0,0,205); }"
+        )
+        outer = QVBoxLayout(self.wifi_overlay)
+        outer.setContentsMargins(28, 24, 28, 24)
+        outer.setAlignment(Qt.AlignCenter)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(1320)
+        card.setMaximumWidth(1580)
+        card.setMinimumHeight(820)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(34, 24, 34, 26)
+        layout.setSpacing(14)
+
+        title_row = QHBoxLayout()
+        self.wifi_title = QLabel("WIFI")
+        self.wifi_title.setObjectName("SettingsTitle")
+        self.wifi_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        title_row.addWidget(self.wifi_title, 1)
+        self.wifi_refresh_btn = QPushButton("OSVJEŽI")
+        self.wifi_refresh_btn.setObjectName("WifiRefresh")
+        self.wifi_refresh_btn.setFixedSize(200, 68)
+        self.wifi_refresh_btn.setStyleSheet(
+            "QPushButton#WifiRefresh { background: #2be600; color: #050505; "
+            "border: 3px solid #159700; border-radius: 15px; padding: 2px 10px; "
+            "font-size: 30px; font-weight: 900; min-height: 56px; max-height: 56px; }"
+            "QPushButton#WifiRefresh:pressed { background: #20b900; }"
+            "QPushButton#WifiRefresh:disabled { background: #254622; color: #777; }"
+        )
+        self.wifi_refresh_btn.setFocusPolicy(Qt.NoFocus)
+        self.wifi_refresh_btn.clicked.connect(self._wifi_scan)
+        title_row.addWidget(self.wifi_refresh_btn, 0)
+        layout.addLayout(title_row)
+
+        body = QHBoxLayout()
+        body.setSpacing(24)
+        self.wifi_list = QListWidget()
+        self.wifi_list.setMinimumWidth(610)
+        self.wifi_list.setSpacing(3)
+        self.wifi_list.setUniformItemSizes(True)
+        self.wifi_list.setWordWrap(False)
+        self.wifi_list.setTextElideMode(Qt.ElideRight)
+        self.wifi_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.wifi_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.wifi_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        QScroller.grabGesture(self.wifi_list.viewport(), QScroller.TouchGesture)
+        self.wifi_list.setStyleSheet(
+            "QListWidget { background: #09090c; border: 3px solid #44444e;"
+            " border-radius: 14px; padding: 8px; font-size: 30px; color: #f4f4f7; }"
+            "QListWidget::item { padding: 4px 12px; border-radius: 9px; "
+            "color: #f4f4f7; background-color: #09090c; }"
+            "QListWidget::item:selected { background: #34343e; color: white; }"
+            "QScrollBar:vertical { background: #111116; width: 22px; margin: 8px 3px; "
+            "border-radius: 10px; }"
+            "QScrollBar::handle:vertical { background: #ffe000; min-height: 54px; "
+            "border-radius: 9px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+        )
+        self.wifi_list.itemSelectionChanged.connect(self._wifi_selection_changed)
+        self.wifi_list.itemClicked.connect(self._wifi_item_clicked)
+        body.addWidget(self.wifi_list, 1)
+
+        controls = QVBoxLayout()
+        controls.setSpacing(12)
+        self.wifi_selected = QLabel("Odaberite mrežu")
+        self.wifi_selected.setAlignment(Qt.AlignCenter)
+        self.wifi_selected.setWordWrap(True)
+        self.wifi_selected.setStyleSheet("font-size: 34px; font-weight: 800;")
+        controls.addWidget(self.wifi_selected)
+        self.wifi_password_btn = QPushButton("UPIŠI ZAPORKU")
+        self.wifi_password_btn.setObjectName("Footer")
+        self.wifi_password_btn.setMinimumHeight(84)
+        self.wifi_password_btn.setFocusPolicy(Qt.NoFocus)
+        self.wifi_password_btn.setStyleSheet(
+            "QPushButton#Footer { font-size: 32px; font-weight: 800; padding: 8px 18px; }"
+        )
+        self.wifi_password_btn.clicked.connect(self._show_wifi_keyboard)
+        self.wifi_password_btn.hide()
+        controls.addWidget(self.wifi_password_btn)
+        controls.addStretch(1)
+
+        self.wifi_status = QLabel("")
+        self.wifi_status.setAlignment(Qt.AlignCenter)
+        self.wifi_status.setWordWrap(True)
+        self.wifi_status.setMinimumHeight(54)
+        self.wifi_status.setStyleSheet("font-size: 25px; color: #d0d0d8;")
+        controls.addWidget(self.wifi_status)
+        self.wifi_connect_btn = QPushButton("SPOJI SE")
+        self.wifi_connect_btn.setObjectName("Primary")
+        self.wifi_connect_btn.setMinimumHeight(76)
+        self.wifi_connect_btn.setEnabled(False)
+        self.wifi_connect_btn.setFocusPolicy(Qt.NoFocus)
+        self.wifi_connect_btn.clicked.connect(self._wifi_connect)
+        controls.addWidget(self.wifi_connect_btn)
+        body.addLayout(controls, 1)
+        layout.addLayout(body, 1)
+
+        self.wifi_close_btn = QPushButton("ZATVORI")
+        self.wifi_close_btn.setObjectName("Footer")
+        self.wifi_close_btn.setMinimumHeight(72)
+        self.wifi_close_btn.setFocusPolicy(Qt.NoFocus)
+        self.wifi_close_btn.clicked.connect(self._hide_wifi_overlay)
+        layout.addWidget(self.wifi_close_btn)
+        outer.addWidget(card, 0, Qt.AlignCenter)
+
+    def _build_wifi_keyboard_overlay(self, root: QWidget) -> None:
+        self._wifi_keyboard_buf = ""
+        self._wifi_password_visible = False
+        self._wifi_key_buttons: List[QPushButton] = []
+        self.wifi_keyboard_overlay = QWidget(root)
+        self.wifi_keyboard_overlay.setObjectName("WifiKeyboardOverlay")
+        self.wifi_keyboard_overlay.hide()
+        self.wifi_keyboard_overlay.setAttribute(Qt.WA_StyledBackground, True)
+        self.wifi_keyboard_overlay.setStyleSheet(
+            "QWidget#WifiKeyboardOverlay { background-color: rgba(0,0,0,220); }"
+        )
+        outer = QVBoxLayout(self.wifi_keyboard_overlay)
+        outer.setContentsMargins(24, 18, 24, 18)
+        outer.setAlignment(Qt.AlignCenter)
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(1500)
+        card.setMaximumWidth(1720)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(28, 20, 28, 24)
+        layout.setSpacing(12)
+
+        title = QLabel("UNESITE WIFI ZAPORKU")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 42px; font-weight: 800;")
+        layout.addWidget(title)
+        password_row = QHBoxLayout()
+        password_row.setSpacing(12)
+        self.wifi_keyboard_display = QLabel("—")
+        self.wifi_keyboard_display.setAlignment(Qt.AlignCenter)
+        self.wifi_keyboard_display.setStyleSheet(
+            "font-size: 44px; font-weight: 800; color: #ffe14a; min-height: 68px;"
+            " background: #111116; border: 2px solid #44444e; border-radius: 12px;"
+        )
+        password_row.addWidget(self.wifi_keyboard_display, 1)
+        self.wifi_password_visibility_btn = QPushButton("PRIKAŽI")
+        self.wifi_password_visibility_btn.setObjectName("Footer")
+        self.wifi_password_visibility_btn.setFixedSize(220, 68)
+        self.wifi_password_visibility_btn.setFocusPolicy(Qt.NoFocus)
+        self.wifi_password_visibility_btn.setStyleSheet(
+            "QPushButton#Footer { font-size: 27px; font-weight: 800; padding: 2px 10px; }"
+        )
+        self.wifi_password_visibility_btn.clicked.connect(
+            self._wifi_toggle_password_visibility
+        )
+        password_row.addWidget(self.wifi_password_visibility_btn)
+        layout.addLayout(password_row)
+
+        key_w, key_h, gap = 120, 100, 10
+        def _page(rows: tuple[str, ...]) -> QWidget:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(gap)
+            for chars in rows:
+                row = QHBoxLayout()
+                row.setSpacing(gap)
+                row.addStretch(1)
+                for ch in chars:
+                    button = QPushButton(ch)
+                    button.setObjectName("KeyNum")
+                    button.setFixedSize(key_w, key_h)
+                    button.setFocusPolicy(Qt.NoFocus)
+                    button.setProperty("wifiChar", ch)
+                    button.setStyleSheet(
+                        "QPushButton#KeyNum { font-size: 38px; font-weight: 800; padding: 0px; }"
+                    )
+                    button.clicked.connect(
+                        lambda _=False, b=button: self._wifi_type_key(b)
+                    )
+                    self._wifi_key_buttons.append(button)
+                    row.addWidget(button)
+                row.addStretch(1)
+                page_layout.addLayout(row)
+            return page
+
+        self.wifi_keyboard_stack = QStackedWidget()
+        self.wifi_keyboard_alpha = _page(("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"))
+        self.wifi_keyboard_symbols = _page(("1234567890", "-_.@!#$%&*", "+?()[]{}:;", ",'\"/\\="))
+        self.wifi_keyboard_stack.addWidget(self.wifi_keyboard_alpha)
+        self.wifi_keyboard_stack.addWidget(self.wifi_keyboard_symbols)
+        layout.addWidget(self.wifi_keyboard_stack)
+
+        key_actions = QHBoxLayout()
+        key_actions.setSpacing(10)
+        self.wifi_mode_btn = QPushButton("123#?")
+        self.wifi_case_btn = QPushButton("CAPS")
+        self.wifi_space_btn = QPushButton("RAZMAK")
+        self.wifi_backspace_btn = QPushButton("⌫")
+        for button, stretch, font_size in (
+            (self.wifi_mode_btn, 1, 30),
+            (self.wifi_case_btn, 1, 30),
+            (self.wifi_space_btn, 2, 30),
+            (self.wifi_backspace_btn, 1, 38),
+        ):
+            button.setObjectName("KeyNum")
+            button.setFixedHeight(100)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setStyleSheet(
+                f"QPushButton#KeyNum {{ font-size: {font_size + 4}px; font-weight: 800; padding: 2px 10px; }}"
+            )
+            key_actions.addWidget(button, stretch)
+        self.wifi_mode_btn.clicked.connect(self._wifi_toggle_keyboard)
+        self.wifi_case_btn.clicked.connect(self._wifi_toggle_case)
+        self.wifi_space_btn.clicked.connect(lambda _=False: self._wifi_keyboard_append(" "))
+        self.wifi_backspace_btn.clicked.connect(self._wifi_keyboard_backspace)
+        layout.addLayout(key_actions)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        cancel = QPushButton("ODUSTANI")
+        accept = QPushButton("OK")
+        for button, obj in ((cancel, "Footer"), (accept, "Footer")):
+            button.setObjectName(obj)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setStyleSheet(
+                f"QPushButton#{obj} {{ min-height: 88px; max-height: 88px; "
+                "font-size: 44px; font-weight: 800; padding: 6px 18px; }"
+            )
+            button.setFixedHeight(112)
+            actions.addWidget(button, 1)
+        cancel.clicked.connect(self._hide_wifi_keyboard)
+        accept.clicked.connect(self._wifi_keyboard_accept)
+        layout.addLayout(actions)
+        outer.addWidget(card, 0, Qt.AlignCenter)
+
+    def _wifi_set_busy(self, busy: bool) -> None:
+        self.wifi_refresh_btn.setEnabled(not busy)
+        self.wifi_list.setEnabled(not busy)
+        self.wifi_connect_btn.setEnabled(not busy and self.wifi_list.currentItem() is not None)
+
+    def _show_wifi_overlay(self) -> None:
+        self._wifi_password_value = ""
+        self._wifi_selected_ssid = ""
+        self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+        self.wifi_password_btn.hide()
+        self.wifi_overlay.show()
+        self.wifi_overlay.raise_()
+        self._place_chrome(wallpaper=False)
+        self._wifi_scan()
+
+    def _hide_wifi_overlay(self) -> None:
+        self._wifi_operation = ""
+        if self._wifi_proc.state() != QProcess.NotRunning:
+            self._wifi_proc.kill()
+            self._wifi_proc.waitForFinished(500)
+        self._hide_wifi_keyboard()
+        self._wifi_password_value = ""
+        self._wifi_selected_ssid = ""
+        self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+        self.wifi_overlay.hide()
+
+    def _show_wifi_keyboard(self) -> None:
+        self._wifi_keyboard_buf = self._wifi_password_value
+        self._wifi_case_upper = False
+        self._wifi_password_visible = False
+        self.wifi_password_visibility_btn.setText("PRIKAŽI")
+        self.wifi_keyboard_stack.setCurrentWidget(self.wifi_keyboard_alpha)
+        self.wifi_mode_btn.setText("123#?")
+        self.wifi_case_btn.setText("CAPS")
+        self.wifi_case_btn.show()
+        self._wifi_refresh_keyboard_keys()
+        self._wifi_update_keyboard_display()
+        self.wifi_keyboard_overlay.show()
+        self.wifi_keyboard_overlay.raise_()
+        self._place_chrome(wallpaper=False)
+
+    def _hide_wifi_keyboard(self) -> None:
+        if hasattr(self, "wifi_keyboard_overlay"):
+            self.wifi_keyboard_overlay.hide()
+
+    def _wifi_update_keyboard_display(self) -> None:
+        shown = self._wifi_keyboard_buf if self._wifi_password_visible else "●" * len(self._wifi_keyboard_buf)
+        self.wifi_keyboard_display.setText(shown or "—")
+
+    def _wifi_toggle_password_visibility(self) -> None:
+        self._wifi_password_visible = not self._wifi_password_visible
+        self.wifi_password_visibility_btn.setText(
+            "SAKRIJ" if self._wifi_password_visible else "PRIKAŽI"
+        )
+        self._wifi_update_keyboard_display()
+
+    def _wifi_keyboard_append(self, text: str) -> None:
+        if len(self._wifi_keyboard_buf) >= 63:
+            return
+        self._wifi_keyboard_buf += text
+        self._wifi_update_keyboard_display()
+
+    def _wifi_keyboard_backspace(self) -> None:
+        self._wifi_keyboard_buf = self._wifi_keyboard_buf[:-1]
+        self._wifi_update_keyboard_display()
+
+    def _wifi_keyboard_accept(self) -> None:
+        self._wifi_password_value = self._wifi_keyboard_buf
+        if self._wifi_password_value:
+            self.wifi_password_btn.setText(f"ZAPORKA  {'●' * min(len(self._wifi_password_value), 12)}")
+        else:
+            self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+        self._hide_wifi_keyboard()
+
+    def _wifi_scan(self) -> None:
+        if self._wifi_proc.state() != QProcess.NotRunning:
+            return
+        self._wifi_operation = "scan"
+        self.wifi_status.setStyleSheet("font-size: 25px; color: #d0d0d8;")
+        self.wifi_status.setText("Tražim dostupne mreže…")
+        self._wifi_set_busy(True)
+        self._wifi_proc.start(
+            "nmcli",
+            ["--terse", "--escape", "yes", "--fields", "IN-USE,SSID,SIGNAL,SECURITY",
+             "device", "wifi", "list", "--rescan", "yes"],
+        )
+
+    def _wifi_selection_changed(self) -> None:
+        self._wifi_apply_selection(self.wifi_list.currentItem())
+
+    def _wifi_item_clicked(self, item: QListWidgetItem) -> None:
+        # Touch scrolling can update the current row without consistently
+        # emitting itemSelectionChanged on all Qt/Raspberry Pi combinations.
+        self._wifi_apply_selection(item)
+
+    @staticmethod
+    def _wifi_is_protected(data: dict) -> bool:
+        security = str(data.get("security") or "").strip().upper()
+        return security not in ("", "--", "NONE", "OPEN", "OWE")
+
+    @classmethod
+    def _wifi_requires_password(cls, data: dict) -> bool:
+        return not bool(data.get("active")) and cls._wifi_is_protected(data)
+
+    def _wifi_apply_selection(self, item: Optional[QListWidgetItem]) -> None:
+        data = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(data, dict):
+            self.wifi_selected.setText("Odaberite mrežu")
+            self.wifi_password_btn.hide()
+            self._wifi_selected_ssid = ""
+            self._wifi_password_value = ""
+            self.wifi_connect_btn.setEnabled(False)
+            return
+        ssid = str(data.get("ssid") or "")
+        if ssid != self._wifi_selected_ssid:
+            self._wifi_selected_ssid = ssid
+            self._wifi_password_value = ""
+            self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+        self.wifi_selected.setText(ssid)
+        if self._wifi_requires_password(data):
+            self.wifi_password_btn.show()
+        else:
+            self._wifi_password_value = ""
+            self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+            self.wifi_password_btn.hide()
+        active = bool(data.get("active"))
+        self.wifi_connect_btn.setText("POVEZANO" if active else "SPOJI SE")
+        self.wifi_connect_btn.setEnabled(not active and self._wifi_proc.state() == QProcess.NotRunning)
+
+    def _wifi_type_key(self, button: QPushButton) -> None:
+        ch = str(button.property("wifiChar") or "")
+        if ch.isalpha() and self._wifi_case_upper:
+            ch = ch.upper()
+        self._wifi_keyboard_append(ch)
+
+    def _wifi_refresh_keyboard_keys(self) -> None:
+        for button in self._wifi_key_buttons:
+            ch = str(button.property("wifiChar") or "")
+            button.setText(ch.upper() if self._wifi_case_upper and ch.isalpha() else ch)
+
+    def _wifi_toggle_case(self) -> None:
+        self._wifi_case_upper = not self._wifi_case_upper
+        self.wifi_case_btn.setText("CAPS ●" if self._wifi_case_upper else "CAPS")
+        self._wifi_refresh_keyboard_keys()
+
+    def _wifi_toggle_keyboard(self) -> None:
+        symbols = self.wifi_keyboard_stack.currentWidget() is self.wifi_keyboard_symbols
+        if symbols:
+            self.wifi_keyboard_stack.setCurrentWidget(self.wifi_keyboard_alpha)
+            self.wifi_mode_btn.setText("123#?")
+            self.wifi_case_btn.show()
+        else:
+            self.wifi_keyboard_stack.setCurrentWidget(self.wifi_keyboard_symbols)
+            self.wifi_mode_btn.setText("ABC")
+            self.wifi_case_btn.hide()
+
+    def _wifi_connect(self) -> None:
+        item = self.wifi_list.currentItem()
+        data = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(data, dict) or data.get("active"):
+            return
+        ssid = str(data.get("ssid") or "")
+        if not ssid or self._wifi_proc.state() != QProcess.NotRunning:
+            return
+        args = ["--wait", "25", "device", "wifi", "connect", ssid]
+        password = self._wifi_password_value
+        if password:
+            args.extend(["password", password])
+        self._wifi_operation = "connect"
+        self.wifi_status.setStyleSheet("font-size: 25px; color: #ffe14a;")
+        self.wifi_status.setText(f"Spajanje na {ssid}…")
+        self._wifi_set_busy(True)
+        self._wifi_proc.start("nmcli", args)
+
+    def _wifi_process_error(self, _error) -> None:
+        if not self._wifi_operation:
+            return
+        self.wifi_status.setStyleSheet("font-size: 25px; color: #ff6a6a;")
+        self.wifi_status.setText("Wi‑Fi upravljanje nije dostupno (nmcli/NetworkManager).")
+        self._wifi_operation = ""
+        self._wifi_set_busy(False)
+
+    def _wifi_process_finished(self, exit_code: int, _status) -> None:
+        operation = self._wifi_operation
+        self._wifi_operation = ""
+        stdout = bytes(self._wifi_proc.readAllStandardOutput()).decode("utf-8", "replace")
+        stderr = bytes(self._wifi_proc.readAllStandardError()).decode("utf-8", "replace").strip()
+        self._wifi_set_busy(False)
+        if operation == "scan":
+            rows = self._wifi_parse_scan(stdout) if int(exit_code) == 0 else []
+            self.wifi_list.setUpdatesEnabled(False)
+            self.wifi_list.clear()
+            for row in rows:
+                lock = "🔒" if self._wifi_is_protected(row) else ""
+                connected = "  ✓ POVEZANO" if row["active"] else ""
+                item = QListWidgetItem(
+                    f"{row['ssid']}   {lock}   {row['signal']}%{connected}"
+                )
+                item.setData(Qt.UserRole, row)
+                item.setSizeHint(QSize(0, 68))
+                item.setForeground(QBrush(QColor("#f4f4f7")))
+                self.wifi_list.addItem(item)
+            self.wifi_list.clearSelection()
+            self.wifi_list.setCurrentRow(-1)
+            self.wifi_list.scrollToTop()
+            self.wifi_list.setUpdatesEnabled(True)
+            self.wifi_list.doItemsLayout()
+            self.wifi_list.viewport().update()
+            self.wifi_list.repaint()
+            if rows:
+                self.wifi_status.setText(f"Pronađeno mreža: {len(rows)}")
+            else:
+                self.wifi_status.setStyleSheet("font-size: 25px; color: #ff6a6a;")
+                self.wifi_status.setText(stderr or "Nema dostupnih Wi‑Fi mreža.")
+            return
+        if operation == "connect":
+            if int(exit_code) == 0:
+                self._wifi_password_value = ""
+                self.wifi_password_btn.setText("UPIŠI ZAPORKU")
+                self.wifi_status.setStyleSheet("font-size: 25px; color: #6dff8a;")
+                self.wifi_status.setText("Uspješno povezano.")
+                QTimer.singleShot(900, self._wifi_scan)
+            else:
+                self.wifi_status.setStyleSheet("font-size: 25px; color: #ff6a6a;")
+                self.wifi_status.setText(stderr or "Spajanje nije uspjelo. Provjerite lozinku.")
+
     def _build_idle_overlay(self, root: QWidget) -> None:
         self.idle_overlay = QWidget(root)
         self.idle_overlay.setObjectName("IdleOverlay")
@@ -4692,6 +6833,7 @@ class MainWindow(QMainWindow):
         self._name_slot: Optional[int] = None
         self._name_buf = ""
         self._name_was_selected = False
+        self._name_tournament_mode = False
         self.name_overlay = QWidget(root)
         self.name_overlay.setObjectName("NameOverlay")
         self.name_overlay.hide()
@@ -4832,6 +6974,9 @@ class MainWindow(QMainWindow):
         self.name_overlay.hide()
         self._name_slot = None
         self._name_buf = ""
+        self._name_tournament_mode = False
+        self._tournament_edit_index = None
+        self.session.state.pop("_tournament_name_edit_index", None)
         self._update_settings_fab_visibility()
 
     def _name_refresh_display(self) -> None:
@@ -4851,6 +6996,33 @@ class MainWindow(QMainWindow):
             self._name_refresh_display()
 
     def _name_ok(self) -> None:
+        tournament_edit = self.session.state.get("_tournament_name_edit_index")
+        if self._name_tournament_mode or self._name_slot == -1 or tournament_edit is not None:
+            clean = self._name_buf.strip().upper()[:16]
+            draft = self._tournament_draft_players()
+            edit_index = getattr(self, "_tournament_edit_index", None)
+            if edit_index is None and tournament_edit not in (None, -1):
+                edit_index = int(tournament_edit)
+            if clean:
+                duplicate = any(name == clean and i != edit_index for i, name in enumerate(draft))
+                if not duplicate:
+                    if edit_index is not None and 0 <= int(edit_index) < len(draft):
+                        old_name = str(draft[int(edit_index)])
+                        api = getattr(self, "_tournament_api", None)
+                        state = api.snapshot() if hasattr(api, "snapshot") else {}
+                        if state.get("id") and old_name != clean:
+                            if hasattr(api, "rename"):
+                                api.rename(old_name, clean)
+                            else:
+                                api.call("rename", old_name=old_name, new_name=clean)
+                        draft[int(edit_index)] = clean
+                        self._tournament_refresh_force = True
+                    elif len(draft) < 16:
+                        draft.append(clean)
+                        self._tournament_sync_bracket_to_players()
+            self._hide_name_editor(); self._refresh_tournament_page()
+            self._last_ui_sig = None; self.refresh()
+            return
         if self._name_slot is None:
             return
         self.session.set_player_slot(self._name_slot, self._name_buf)
@@ -4859,6 +7031,18 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _name_remove(self) -> None:
+        tournament_edit = self.session.state.get("_tournament_name_edit_index")
+        if self._name_tournament_mode or self._name_slot == -1 or tournament_edit is not None:
+            draft = self._tournament_draft_players()
+            edit_index = getattr(self, "_tournament_edit_index", None)
+            if edit_index is None and tournament_edit not in (None, -1):
+                edit_index = int(tournament_edit)
+            if edit_index is not None and 0 <= int(edit_index) < len(draft):
+                draft.pop(int(edit_index))
+                self._tournament_sync_bracket_to_players()
+            self._hide_name_editor(); self._refresh_tournament_page()
+            self._last_ui_sig = None; self.refresh()
+            return
         if self._name_slot is None:
             return
         self.session.clear_player_slot(self._name_slot)
@@ -5106,6 +7290,9 @@ class MainWindow(QMainWindow):
         phase = str(snap.get("ingame_cal_phase") or "prompt")
         status = str(snap.get("ingame_cal_status") or "")
         busy = phase == "busy"
+        if busy and self._is_loading():
+            self.ingame_cal_overlay.hide()
+            return
         self.ingame_cal_status.setText(status)
         self.ingame_cal_result_status.setText(status)
         self.ingame_cal_empty_btn.setEnabled(not busy)
@@ -5130,18 +7317,29 @@ class MainWindow(QMainWindow):
         self._update_settings_fab_visibility()
 
     def _run_deferred_ingame_cal(self) -> None:
-        try:
-            if not self.session.is_in_game_calibrating():
-                return
-            if str(self.session.ctx.get("_ingame_cal_phase") or "") != "busy":
-                return
-            self.session.run_in_game_calibrate()
-            self._last_ui_sig = None
-            self._ingame_cal_stills_loaded = False
-            self._sync_ingame_cal_overlay()
-            self.refresh()
-        finally:
-            self._hide_loading()
+        if getattr(self,"_ingame_calibration_worker_running",False):
+            return
+        if not self.session.is_in_game_calibrating() or str(self.session.ctx.get("_ingame_cal_phase") or "")!="busy":
+            self._hide_loading(); return
+        self._ingame_calibration_worker_running=True
+        def worker() -> None:
+            try:
+                self.session.run_in_game_calibrate()
+                self.ingame_calibration_result.emit({"ok":True})
+            except Exception as exc:
+                self.ingame_calibration_result.emit({"error":str(exc)})
+        threading.Thread(target=worker,daemon=True,name="ingame-calibration").start()
+
+    def _on_ingame_calibration_result(self, _result: object) -> None:
+        self._ingame_calibration_worker_running=False
+        self._last_ui_sig=None
+        self._ingame_cal_stills_loaded=False
+        self._hide_loading()
+        QTimer.singleShot(_LOADING_FADE_MS+20,self._finish_ingame_calibration_ui)
+
+    def _finish_ingame_calibration_ui(self) -> None:
+        self._sync_ingame_cal_overlay()
+        self.refresh()
 
     def _run_deferred_settings_calibrate(self) -> None:
         try:
@@ -5217,14 +7415,16 @@ class MainWindow(QMainWindow):
         return self._idle_active()
 
     def _idle_active(self) -> bool:
+        # Turniri mogu dugo čekati između mečeva, a sami mečevi ne smiju biti
+        # prekinuti inactivity timerom.
+        if self.session.state.get("_tournament_active"):
+            return False
         screen = self.session.screen
         if screen not in _IDLE_SCREENS:
             return False
         if screen == "playing":
             g = self.session.ctx.get("game")
             if not g:
-                return False
-            if g.get("winner_player_idx") is not None:
                 return False
             if self.session.is_in_game_calibrating():
                 return False
@@ -5263,6 +7463,23 @@ class MainWindow(QMainWindow):
         self._update_settings_fab_visibility()
 
     def _idle_tick(self) -> None:
+        # Tournament games disable inactivity handling, but their result still
+        # has to be committed as soon as the winner screen becomes ready.
+        self._tournament_report_winner()
+        self._tournament_heartbeat_tick()
+        tm = getattr(self, "_tournament_match", None)
+        if tm and not tm.get("reported") and not self.session.ctx.get("game"):
+            try:
+                api = self._tournament_api
+                if hasattr(api, "cancel"):
+                    api.cancel(tm["id"], tm["board"])
+                else:
+                    api.call("cancel", match_id=tm["id"], board=tm["board"])
+                print(f"[TURNIR] meč otkazan: {tm['id']}", flush=True)
+            except Exception as exc:
+                print(f"[TURNIR] otkazivanje nije uspjelo: {exc}", flush=True)
+            self._tournament_match = None
+            led_ring_off()
         if not self._idle_playing():
             if self._idle_deadline is not None or (
                 hasattr(self, "idle_overlay") and self.idle_overlay.isVisible()
@@ -5270,6 +7487,7 @@ class MainWindow(QMainWindow):
                 self._hide_idle_overlay()
             self._idle_last = time.monotonic()
             self._idle_hits_sig = None
+            self._idle_winner_sig = None
             return
         snap_hits = None
         g = self.session.ctx.get("game")
@@ -5278,6 +7496,15 @@ class MainWindow(QMainWindow):
                 None if h is None else str(h)
                 for h in (g.get("turn_hits") or [None, None, None])
             )
+        winner_sig = None
+        if g and mm._winner_screen_ready(g):
+            winner_sig = g.get("winner_player_idx")
+        previous_winner = getattr(self, "_idle_winner_sig", None)
+        self._idle_winner_sig = winner_sig
+        if winner_sig is not None and winner_sig != previous_winner:
+            # Leaderboard gets its own full inactivity period, starting when
+            # the completed game first becomes visible.
+            self._idle_note_activity()
         status = str(self.session.ctx.get("_dart_status") or "")
         if snap_hits != self._idle_hits_sig:
             self._idle_hits_sig = snap_hits
@@ -5295,6 +7522,32 @@ class MainWindow(QMainWindow):
         if now - self._idle_last >= _IDLE_WARN_SEC:
             self._idle_deadline = now + _IDLE_EXIT_SEC
             self._show_idle_overlay()
+
+    def _tournament_heartbeat_tick(self) -> None:
+        tm = getattr(self, "_tournament_match", None)
+        if not tm or tm.get("reported") or getattr(self, "_tournament_heartbeat_running", False):
+            return
+        now=time.monotonic()
+        if now-float(getattr(self,"_tournament_last_heartbeat",0.0)) < 8.0:
+            return
+        api=getattr(self,"_tournament_api",None)
+        if api is None:
+            return
+        self._tournament_last_heartbeat=now
+        self._tournament_heartbeat_running=True
+        def worker() -> None:
+            try:
+                if hasattr(api,"heartbeat"):
+                    api.heartbeat(tm["id"],tm["board"])
+                else:
+                    api.call("heartbeat",match_id=tm["id"],board=tm["board"])
+            except Exception as exc:
+                print(f"[TURNIR] heartbeat nije uspio: {exc}",flush=True)
+                if getattr(self,"_tournament_is_client",False):
+                    self.tournament_state_result.emit({"error":str(exc)})
+            finally:
+                self._tournament_heartbeat_running=False
+        threading.Thread(target=worker,daemon=True,name="tournament-match-heartbeat").start()
 
     def _is_user_pointer_event(self, event) -> bool:
         try:
@@ -5317,6 +7570,8 @@ class MainWindow(QMainWindow):
 
     def _quit_application(self) -> None:
         self._hide_quit_confirm()
+        led_ring_off()
+        self._tournament_shutdown_cleanup()
         try:
             self.session.shutdown()
         except Exception:
@@ -5329,6 +7584,10 @@ class MainWindow(QMainWindow):
 
     def _system_power(self, kind: str) -> None:
         """Raspberry: ugasi ili reboot. Na Windowsu samo izlaz iz programa."""
+        # Drop the relay before asking the OS to power off; shutdown can begin
+        # before Qt gets a chance to emit aboutToQuit.
+        led_ring_off()
+        self._tournament_shutdown_cleanup()
         try:
             self.session.shutdown()
         except Exception:
@@ -5451,20 +7710,28 @@ class MainWindow(QMainWindow):
             )
 
     def _run_deferred_clear_board_calibrate(self) -> None:
-        try:
-            if self.session.screen != "clear_board":
-                return
-            if not self.session.ctx.get("_clear_board_pending_run"):
-                return
-            self.session.ctx["_clear_board_pending_run"] = False
-            self.session.ctx["_clear_board_pending_at"] = None
-            self.session.confirm_clear_board_and_start()
-            self._last_ui_sig = None
-            self.refresh()
-        finally:
-            if hasattr(self, "clear_confirm_btn"):
-                self.clear_confirm_btn.setEnabled(True)
-            self._hide_loading()
+        if getattr(self,"_clear_board_calibration_worker_running",False):
+            return
+        if self.session.screen!="clear_board" or not self.session.ctx.get("_clear_board_pending_run"):
+            self._hide_loading(); return
+        self.session.ctx["_clear_board_pending_run"]=False
+        self.session.ctx["_clear_board_pending_at"]=None
+        self._clear_board_calibration_worker_running=True
+        def worker() -> None:
+            try:
+                self.session.confirm_clear_board_and_start()
+                self.clear_board_calibration_result.emit({"ok":True})
+            except Exception as exc:
+                self.clear_board_calibration_result.emit({"error":str(exc)})
+        threading.Thread(target=worker,daemon=True,name="clear-board-calibration").start()
+
+    def _on_clear_board_calibration_result(self, _result: object) -> None:
+        self._clear_board_calibration_worker_running=False
+        if hasattr(self,"clear_confirm_btn"):
+            self.clear_confirm_btn.setEnabled(True)
+        self._hide_loading()
+        self._last_ui_sig=None
+        self.refresh()
 
     def _ensure_mqtt_client(self) -> None:
         """Pokreni MQTT subscriber ako je način mqtt_qr (npr. nakon promjene u postavkama)."""
@@ -5514,27 +7781,8 @@ class MainWindow(QMainWindow):
             print(f"[MQTT] GUI subscriber failed (ensure): {e}", flush=True)
 
     def _mqtt_on(self) -> None:
-        """Tipka 3: objavi MQTT 'on' (LED ring + wake preko subscribera)."""
-        if get_settings().start_mode == "always_on":
-            print("[MQTT] tipka 3 skipped (always_on)", flush=True)
-            return
-        try:
-            from mqtt import TOPIC
-
-            client = getattr(self, "_mqtt_client", None)
-            if client is not None:
-                # Ne čekaj PUBACK na UI threadu — loop već radi u pozadini.
-                client.publish(TOPIC, "on", qos=1)
-                print(f"[MQTT] tipka 3: published 'on' -> {TOPIC}", flush=True)
-                return
-        except Exception as e:
-            print(f"[MQTT] tipka 3 persistent publish failed: {e}", flush=True)
-        try:
-            import main_manual as mm
-
-            mm.send_mqtt_on()
-        except Exception as e:
-            print(f"[MQTT] tipka 3 fallback send_mqtt_on failed: {e}", flush=True)
+        """Servisna tipka 3 pali LED prsten samo preko lokalnog GPIO-a."""
+        led_ring_on()
 
     def _toggle_cal(self) -> None:
         if self.session.screen == "calibration":
@@ -5629,6 +7877,17 @@ class MainWindow(QMainWindow):
             print(f"[debug] kiosk screenshot error: {e}", flush=True)
 
     def _on_tick(self) -> None:
+        screen = self.session.screen
+        # Samo igra i živi prikaz kamera trebaju brzi timer. Ostali ekrani
+        # mijenjaju se na klik/signal i imaju tek rijedak servisni tick.
+        if screen in ("playing", "calibration"):
+            wanted_interval = _UI_TICK_MS
+        elif screen == "clear_board":
+            wanted_interval = 100
+        else:
+            wanted_interval = 1000
+        if self.timer.interval() != wanted_interval:
+            self.timer.setInterval(wanted_interval)
         if bool(getattr(self.session, "kiosk", False)):
             self._lock_kiosk_display()
         try:
@@ -5646,7 +7905,16 @@ class MainWindow(QMainWindow):
             self._flush_dart_commit()
             self._idle_tick()
             return
-        self.refresh()
+        if self.session.screen in ("playing", "clear_board"):
+            # Provjeri stanje bez slanja ikakvog update/repaint zahtjeva Qt-u.
+            # Pravi refresh radi se samo kada se sadržaj ekrana promijenio.
+            snap=self.session.snapshot_for_ui()
+            if self._ui_signature(snap)!=self._last_ui_sig:
+                self.refresh()
+        elif self.session.screen=="tournament":
+            # Ova metoda ima vlastiti ključ stanja i ne dira widgete dok je
+            # spremljeni/udaljeni bracket potpuno jednak prethodnom.
+            self._refresh_tournament_page()
         dart_det = self.session.ctx.get("dart_detector")
         if dart_det is not None and getattr(dart_det, "_pending_ui_commit", False):
             self.repaint()
@@ -5719,6 +7987,7 @@ class MainWindow(QMainWindow):
                 snap.get("editing_hit_slot"),
                 snap.get("input_multiplier"),
                 snap.get("manual_mode"),
+                snap.get("manual_only"),
                 snap.get("can_submit"),
                 snap.get("is_early_finish"),
                 snap.get("is_bust"),
@@ -5853,17 +8122,18 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(24, 24, 24, 24)
         lay.setAlignment(Qt.AlignCenter)
 
-        title_h = 108
-        title_row = QHBoxLayout()
+        title_h = 360 if self._spectator else 108
+        title_row = QVBoxLayout() if self._spectator else QHBoxLayout()
         title_row.setSpacing(18)
         title_row.setAlignment(Qt.AlignCenter)
         standby_logo = _make_logo_label(title_h)
         title = QLabel("SMARTDARTS")
         title.setObjectName("Title")
         title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        title.setStyleSheet("font-size: 108px; font-weight: 800;")
-        title_row.addWidget(standby_logo, 0, Qt.AlignVCenter)
-        title_row.addWidget(title, 0, Qt.AlignVCenter)
+        title.setStyleSheet(f"font-size: {164 if self._spectator else 108}px; font-weight: 800;")
+        align = Qt.AlignCenter if self._spectator else Qt.AlignVCenter
+        title_row.addWidget(standby_logo, 0, align)
+        title_row.addWidget(title, 0, align)
 
         self.standby_sub = QLabel("Skeniraj QR za početak igre!")
         self.standby_sub.setObjectName("Subtitle")
@@ -5909,12 +8179,12 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(18)
         grid.setVerticalSpacing(18)
         modes = [
-            ("301", "game:301"),
-            ("501", "game:501"),
+            ("X01", "game:x01"),
             ("AROUND", "game:around"),
             ("CRICKET", "game:cricket"),
             ("KILLER", "game:killer"),
             ("HALVE IT", "game:halve"),
+            ("COUNT UP", "game:count_up"),
         ]
         for i, (lab, act) in enumerate(modes):
             b = _btn(lab, act, role="Primary")
@@ -5932,6 +8202,21 @@ class MainWindow(QMainWindow):
         self.rules_x01_title.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.rules_x01_title)
         lay.addStretch(1)
+        lbl_start = QLabel("POČETNI REZULTAT")
+        lbl_start.setObjectName("SectionLabel")
+        lbl_start.setAlignment(Qt.AlignLeft)
+        lay.addWidget(lbl_start)
+        start_row = QHBoxLayout()
+        start_row.setSpacing(14)
+        self.x01_start_buttons = {}
+        for score in (101, 301, 501, 701):
+            button = _btn(str(score), f"x01_mode:{score}", role="RuleOff")
+            button.setMinimumHeight(72)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.x01_start_buttons[score] = button
+            start_row.addWidget(button, 1)
+        lay.addLayout(start_row)
+        lay.addSpacing(8)
         lbl_mode = QLabel("GAME MODE")
         lbl_mode.setObjectName("SectionLabel")
         lbl_mode.setAlignment(Qt.AlignLeft)
@@ -6105,6 +8390,60 @@ class MainWindow(QMainWindow):
                 back_btn=self.rules_killer_back,
                 middle=self.rules_killer_tutorial,
                 continue_btn=self.rules_killer_continue,
+            )
+        )
+        return w
+
+    def _build_rules_count_up(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(18)
+        title = QLabel("COUNT UP PRAVILA")
+        title.setObjectName("Title")
+        title.setAlignment(Qt.AlignCenter)
+        self.rules_count_up_title = title
+        lay.addWidget(title)
+        lay.addStretch(1)
+
+        def _rule_btn(text: str, action: str) -> AnimButton:
+            b = _btn(text, action, role="RuleOff")
+            b.setMinimumHeight(88)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            return b
+
+        rounds_label = QLabel("BROJ RUNDI")
+        rounds_label.setObjectName("SectionLabel")
+        lay.addWidget(rounds_label)
+        rounds_row = QHBoxLayout()
+        rounds_row.setSpacing(16)
+        self.btn_count_up_rounds = {}
+        for rounds in (8, 12, 20):
+            b = _rule_btn(str(rounds), f"rule:count_up_rounds:{rounds}")
+            self.btn_count_up_rounds[rounds] = b
+            rounds_row.addWidget(b)
+        lay.addLayout(rounds_row)
+
+        mode_label = QLabel("GAME MODE")
+        mode_label.setObjectName("SectionLabel")
+        lay.addWidget(mode_label)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(16)
+        self.btn_count_up_normal = _rule_btn("MAX", "rule:count_up_mode:normal")
+        self.btn_count_up_reverse = _rule_btn("MIN", "rule:count_up_mode:reverse")
+        mode_row.addWidget(self.btn_count_up_normal)
+        mode_row.addWidget(self.btn_count_up_reverse)
+        lay.addLayout(mode_row)
+        lay.addStretch(1)
+
+        self.rules_count_up_tutorial = _rules_footer_btn("UPUTE", "tutorial_open")
+        self.rules_count_up_continue = _rules_continue_btn("NASTAVI", "rules_continue")
+        self.rules_count_up_back = _rules_back_btn("NAZAD", "nav_back")
+        lay.addLayout(
+            _rules_footer_block(
+                back_btn=self.rules_count_up_back,
+                middle=self.rules_count_up_tutorial,
+                continue_btn=self.rules_count_up_continue,
             )
         )
         return w
@@ -6553,9 +8892,25 @@ class MainWindow(QMainWindow):
             return row
 
         left = QVBoxLayout()
-        left.setSpacing(36)
+        left.setSpacing(28)
         right = QVBoxLayout()
-        right.setSpacing(36)
+        right.setSpacing(28)
+        settings_action_style = (
+            "QPushButton#SettingsPw {"
+            "  background-color: #2a2a32;"
+            "  color: #ffffff;"
+            "  border: 3px solid #5a5a66;"
+            "  border-radius: 12px;"
+            "  font-size: 32px;"
+            "  font-weight: 700;"
+            "  padding: 0px;"
+            "  min-height: 64px;"
+            "  max-height: 72px;"
+            "}"
+            "QPushButton#SettingsPw:hover, QPushButton#SettingsPw:focus {"
+            "  background-color: #32323a;"
+            "}"
+        )
 
         self.settings_lang_lbl = QLabel("Jezik")
         self.settings_lang_lbl.setObjectName("SettingsSection")
@@ -6592,6 +8947,24 @@ class MainWindow(QMainWindow):
         self.settings_start.activated.connect(lambda _=None: self._on_settings_combo("start"))
         left.addLayout(_row(self.settings_start_lbl, self.settings_start))
 
+        self.settings_tournament_lbl = QLabel("Turniri")
+        self.settings_tournament_lbl.setObjectName("SettingsSection")
+        self.settings_tournament_btn = _btn("TURNIR", "settings_tournament", role="", tall=False)
+        self.settings_tournament_btn.setObjectName("SettingsPw")
+        self.settings_tournament_btn.setStyleSheet(settings_action_style)
+        left.addLayout(_row(self.settings_tournament_lbl, self.settings_tournament_btn))
+
+        self.settings_performance_lbl = QLabel("Sustav")
+        self.settings_performance_lbl.setObjectName("SettingsSection")
+        self.settings_performance_btn = _btn(
+            "PERFORMANSE", "settings_performance", role="", tall=False
+        )
+        self.settings_performance_btn.setObjectName("SettingsPw")
+        self.settings_performance_btn.setStyleSheet(settings_action_style)
+        left.addLayout(
+            _row(self.settings_performance_lbl, self.settings_performance_btn)
+        )
+
         self.settings_quit_lbl = QLabel("Aplikacija")
         self.settings_quit_lbl.setObjectName("SettingsSection")
         self.settings_power = SettingsChoiceButton()
@@ -6611,6 +8984,17 @@ class MainWindow(QMainWindow):
             lambda _=None: self._on_settings_combo("device")
         )
         right.addLayout(_row(self.settings_device_lbl, self.settings_device))
+
+        self.settings_input_mode_lbl = QLabel("Auto/Manual")
+        self.settings_input_mode_lbl.setObjectName("SettingsSection")
+        self.settings_input_mode_lbl.setStyleSheet("font-size: 26px;")
+        self.settings_input_mode = SettingsChoiceButton()
+        self.settings_input_mode.add_item("Auto", "auto")
+        self.settings_input_mode.add_item("Manual", "manual")
+        self.settings_input_mode.activated.connect(
+            lambda _=None: self._on_settings_combo("input_mode")
+        )
+        right.addLayout(_row(self.settings_input_mode_lbl, self.settings_input_mode))
 
         self.settings_league_qr_lbl = QLabel("Ligaški QR")
         self.settings_league_qr_lbl.setObjectName("SettingsSection")
@@ -6638,23 +9022,15 @@ class MainWindow(QMainWindow):
             "Promijeni", "settings_change_password", role="", tall=False
         )
         self.settings_pw_btn.setObjectName("SettingsPw")
-        self.settings_pw_btn.setStyleSheet(
-            "QPushButton#SettingsPw {"
-            "  background-color: #2a2a32;"
-            "  color: #ffffff;"
-            "  border: 3px solid #5a5a66;"
-            "  border-radius: 12px;"
-            "  font-size: 32px;"
-            "  font-weight: 700;"
-            "  padding: 0px;"
-            "  min-height: 64px;"
-            "  max-height: 72px;"
-            "}"
-            "QPushButton#SettingsPw:hover, QPushButton#SettingsPw:focus {"
-            "  background-color: #32323a;"
-            "}"
-        )
+        self.settings_pw_btn.setStyleSheet(settings_action_style)
         right.addLayout(_row(self.settings_pw_lbl, self.settings_pw_btn))
+
+        self.settings_wifi_lbl = QLabel("Internet")
+        self.settings_wifi_lbl.setObjectName("SettingsSection")
+        self.settings_wifi_btn = _btn("WIFI", "settings_wifi", role="", tall=False)
+        self.settings_wifi_btn.setObjectName("SettingsPw")
+        self.settings_wifi_btn.setStyleSheet(self.settings_pw_btn.styleSheet())
+        right.addLayout(_row(self.settings_wifi_lbl, self.settings_wifi_btn))
         right.addStretch(1)
 
         cols = QHBoxLayout()
@@ -6682,6 +9058,7 @@ class MainWindow(QMainWindow):
         self.settings_bg.set_current_data(s.bg_color)
         self.settings_btn.set_current_data(s.button_color)
         self.settings_start.set_current_data(s.start_mode)
+        self.settings_input_mode.set_current_data(s.input_mode)
         for i, (_mode, key) in enumerate(START_MODES):
             if i < self.settings_start.count():
                 self.settings_start.set_item_text(i, s.t(key))
@@ -6734,6 +9111,14 @@ class MainWindow(QMainWindow):
                 self.settings_pw_lbl.setText(t("password"))
             if hasattr(self, "settings_pw_btn"):
                 self.settings_pw_btn.setText(t("change_password_short"))
+            if hasattr(self, "settings_wifi_lbl"):
+                self.settings_wifi_lbl.setText("Internet")
+            if hasattr(self, "settings_wifi_btn"):
+                self.settings_wifi_btn.setText("WIFI")
+            if hasattr(self, "settings_performance_lbl"):
+                self.settings_performance_lbl.setText("Sustav")
+            if hasattr(self, "settings_performance_btn"):
+                self.settings_performance_btn.setText("PERFORMANSE")
             if hasattr(self, "settings_quit_lbl"):
                 self.settings_quit_lbl.setText(t("application"))
         if hasattr(self, "select_game_title"):
@@ -6806,11 +9191,16 @@ class MainWindow(QMainWindow):
             self.rules_halve_continue.setText(t("continue").upper())
         if hasattr(self, "rules_halve_back"):
             self.rules_halve_back.setText(t("back").upper())
+        if hasattr(self, "rules_count_up_tutorial"):
+            self.rules_count_up_tutorial.setText(t("tutorial").upper())
+            self.rules_count_up_continue.setText(t("continue").upper())
+            self.rules_count_up_back.setText(t("back").upper())
+            self.rules_count_up_title.setText(f"COUNT UP {t('rules')}".upper())
         if hasattr(self, "lbl_halve_mode"):
             self.lbl_halve_mode.setText(t("halve_rounds").upper())
             self.btn_halve_standard.setText(t("halve_standard").upper())
             self.btn_halve_extended.setText(t("halve_extended").upper())
-        for kind in ("x01", "cricket", "killer", "around", "halve"):
+        for kind in ("x01", "cricket", "killer", "around", "halve", "count_up"):
             title = getattr(self, f"tutorial_{kind}_title", None)
             back = getattr(self, f"tutorial_{kind}_back", None)
             if title is not None:
@@ -7130,12 +9520,106 @@ class MainWindow(QMainWindow):
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self.cal_label.setPixmap(QPixmap.fromImage(qimg.copy()))
 
+    def render_spectator(self, snapshot: dict) -> None:
+        """Render a read-only TV snapshot without advancing or animating it."""
+        snap = dict(snapshot)
+        snap["players"] = [dict(player, score_halved=False)
+                           for player in (snapshot.get("players") or [])]
+        raw_screen = snap.get("screen")
+        tournament_state = snap.get("tournament_state")
+        if not isinstance(tournament_state, dict):
+            tournament_state = {}
+        bracket_exists = bool(
+            tournament_state.get("id")
+            and tournament_state.get("matches")
+        )
+        screen = ("playing" if raw_screen in ("playing", "exit_confirm")
+                  else ("tournament" if raw_screen == "tournament" and bracket_exists
+                        else "standby"))
+        if screen == "tournament" and hasattr(self, "tournament_bracket"):
+            # TournamentBracketWidget paints structured state; it is not a
+            # QLabel and has no setText(). Calling setText here used to abort
+            # the control-screen click whenever a TV was connected.
+            self.tournament_bracket.set_state(tournament_state)
+            self.tournament_view.setCurrentWidget(self.tournament_active)
+            self.tournament_tabs.setCurrentWidget(self.tournament_bracket_page)
+        snap.update(screen=screen, manual_mode=False, editing_hit_slot=None,
+                    league_qr_payload=None, killer_bull_pending=None,
+                    killer_bull_targets=[], killer_life_flash=None,
+                    turn_anim_reverse=False, ingame_cal_open=False)
+        sig = self._ui_signature(snap)
+        if sig == self._last_ui_sig:
+            return
+        self._last_ui_sig = sig
+        if getattr(self, "_ui_screen", None) != screen:
+            self._teardown_scoreboard_ui()
+        self._ui_screen = screen
+        self.stack.setCurrentWidget(self.pages[screen])
+        if screen == "playing":
+            self._refresh_playing(snap)
+        for button in self.findChildren(QPushButton):
+            if button not in self.hit_btns:
+                button.hide()
+            else:
+                button.setFocusPolicy(Qt.NoFocus)
+                button.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.standby_sub.hide()
+        self.qr_frame.hide()
+        self.footer_block.hide()
+        self.keypad_wrap.hide()
+        self.manual_hits_wrap.hide()
+        self.killer_bull_overlay.hide()
+        if screen == "playing" and snap.get("winner") is None:
+            self.play_body.setStretch(0, 1)
+            self.play_body.setStretch(1, 1)
+            self.live_stack.hide()
+            self.score_suggest_sep.hide()
+            status = snap.get("board_clear_message") or snap.get("live_score_line") or ""
+            if snap.get("is_bust"):
+                status = get_settings().t("bust")
+            if snap.get("mode") == "cricket":
+                rules = snap.get("rules") or {}
+                round_text = f"{get_settings().t('round')}: {snap.get('round_number', 1)}"
+                if rules.get("max_rounds_20"):
+                    round_text += f"/{rules.get('max_rounds_limit', 20)}"
+                status = f"{round_text}   {status}".strip()
+            if snap.get("is_bust"):
+                status_css = "font-size: 72px; font-weight: 900; color: #ff5050;"
+            elif snap.get("live_score_line"):
+                status_css = "font-size: 58px; font-weight: 900; color: #00ff78;"
+            else:
+                status_css = "font-size: 48px; font-weight: 800; color: #ffd040;"
+            self._tv_status.setStyleSheet(status_css)
+            self._tv_status.setText(str(status))
+        self._place_chrome()
+
     def refresh(self) -> None:
+        if self._spectator:
+            return
         snap = self.session.snapshot_for_ui()
+        if snap.get("screen") == "tournament":
+            self._refresh_tournament_page()
+            snap["tournament_text"] = getattr(self, "_tournament_render_text", "")
+            snap["tournament_state"] = dict(
+                getattr(self, "_tournament_tv_state", {}) or {}
+            )
         sig = self._ui_signature(snap)
         if sig == self._last_ui_sig and snap.get("screen") != "calibration":
             self._update_settings_fab_visibility()
             return
+        spectator = getattr(self, "_spectator_display", None)
+        if spectator is not None and sig != self._last_ui_sig:
+            spectator_snap = snap
+            if self.session.state.get("_tournament_active") and snap.get("screen") in ("standby", "exit_confirm"):
+                tournament_state = dict(getattr(self, "_tournament_tv_state", {}) or {})
+                if tournament_state.get("id") and tournament_state.get("matches"):
+                    spectator_snap = dict(
+                        snap,
+                        screen="tournament",
+                        tournament_text=getattr(self, "_tournament_render_text", ""),
+                        tournament_state=tournament_state,
+                    )
+            spectator.update_snapshot(spectator_snap)
         self._last_ui_sig = sig
         screen = snap["screen"]
         prev_screen = getattr(self, "_ui_screen", None)
@@ -7155,7 +9639,7 @@ class MainWindow(QMainWindow):
         self._sync_ingame_cal_overlay(snap)
         if screen != "playing" and hasattr(self, "killer_bull_overlay"):
             self.killer_bull_overlay.hide()
-        if screen != "select_players" and hasattr(self, "name_overlay"):
+        if screen not in ("select_players", "tournament") and hasattr(self, "name_overlay"):
             self.name_overlay.hide()
         # Exit / menu: cancel score anims and drop cached card scores.
         # Enter playing: also rebuild so a new match never tweens from leftovers.
@@ -7188,8 +9672,8 @@ class MainWindow(QMainWindow):
             self._sync_settings_combos()
 
         if screen == "rules_x01":
-            mode = snap.get("selected_game_mode") or "X01"
-            self.rules_x01_title.setText(f"{str(mode).upper()} {get_settings().t('rules')}")
+            mode = str(snap.get("selected_game_mode") or "301")
+            self.rules_x01_title.setText(f"X01 {get_settings().t('rules')}")
             rp = snap["rules_pending"]
             di_on = bool(rp.get("double_in"))
             do_on = bool(rp.get("double_out"))
@@ -7198,7 +9682,9 @@ class MainWindow(QMainWindow):
             self.btn_double_out.setText(f"{get_settings().t('double_out')}: {yn[0] if do_on else yn[1]}")
             self.btn_double_in.setObjectName("RuleOn" if di_on else "RuleOff")
             self.btn_double_out.setObjectName("RuleOn" if do_on else "RuleOff")
-            for b in (self.btn_double_in, self.btn_double_out):
+            for score, button in self.x01_start_buttons.items():
+                button.setObjectName("RuleOn" if mode == str(score) else "RuleOff")
+            for b in (self.btn_double_in, self.btn_double_out, *self.x01_start_buttons.values()):
                 b.style().unpolish(b)
                 b.style().polish(b)
                 b.update()
@@ -7249,6 +9735,28 @@ class MainWindow(QMainWindow):
                 self.btn_killer_act_double,
                 self.btn_killer_act_triple,
             ]:
+                b.style().unpolish(b)
+                b.style().polish(b)
+                b.update()
+                b.repaint()
+
+        if screen == "rules_count_up":
+            rp = snap["rules_pending"]
+            rounds = int(rp.get("count_up_rounds", 8) or 8)
+            mode = str(rp.get("count_up_mode", "normal")).lower()
+            buttons = list(self.btn_count_up_rounds.values()) + [
+                self.btn_count_up_normal,
+                self.btn_count_up_reverse,
+            ]
+            for value, b in self.btn_count_up_rounds.items():
+                b.setObjectName("RuleOn" if value == rounds else "RuleOff")
+            self.btn_count_up_normal.setObjectName(
+                "RuleOn" if mode == "normal" else "RuleOff"
+            )
+            self.btn_count_up_reverse.setObjectName(
+                "RuleOn" if mode == "reverse" else "RuleOff"
+            )
+            for b in buttons:
                 b.style().unpolish(b)
                 b.style().polish(b)
                 b.update()
@@ -7340,6 +9848,8 @@ class MainWindow(QMainWindow):
                     title_w.setText(f"AROUND {t('tutorial')}".upper())
                 elif kind == "halve":
                     title_w.setText(f"HALVE IT {t('tutorial')}".upper())
+                elif kind == "count_up":
+                    title_w.setText(f"COUNT UP {t('tutorial')}".upper())
             self._fill_tutorial(kind, snap)
 
         if screen == "clear_board":
@@ -7437,11 +9947,22 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._tutorial_section_label(t("tutorial_basics")))
         if kind == "x01":
             body_txt = self._tutorial_x01_body_text(snap)
+        elif kind == "count_up":
+            body_txt = (
+                "Svaki igrač baca tri strelice po rundi. Bodovi svih pogodaka "
+                "zbrajaju se na njegov ukupan rezultat. Igra završava nakon "
+                "odabranih 8, 12 ili 20 rundi. Može igrati od 1 do 4 igrača."
+            )
         else:
             body_txt = t(f"tutorial_{kind}_body")
         lay.addWidget(self._tutorial_body_label(body_txt))
         # Options
-        opts = t(f"tutorial_{kind}_opts")
+        opts = (
+            "MAX: pobjeđuje igrač s najvećim rezultatom.\n"
+            "MIN: pobjeđuje igrač s najmanjim rezultatom."
+            if kind == "count_up"
+            else t(f"tutorial_{kind}_opts")
+        )
         if opts and opts != f"tutorial_{kind}_opts":
             lay.addWidget(self._tutorial_section_label(t("tutorial_options")))
             lay.addWidget(self._tutorial_body_label(opts))
@@ -7452,7 +9973,7 @@ class MainWindow(QMainWindow):
             body.setText(body_txt)
 
     def _tutorial_x01_body_text(self, snap: Optional[dict] = None) -> str:
-        """X01 tutorial with the actual selected start score (301 or 501)."""
+        """X01 tutorial with the selected start score."""
         mode = ""
         if snap is not None:
             mode = str(snap.get("selected_game_mode") or "")
@@ -7464,13 +9985,17 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 mode = ""
-        start = mode.strip() if str(mode).strip() in ("301", "501") else "501"
+        start = mode.strip() if str(mode).strip() in ("101", "301", "501", "701") else "301"
         return get_settings().t("tutorial_x01_body").format(start=start)
 
     def _clear_score_box(self) -> None:
         self._stop_x01_turn_anim()
         self._stop_cricket_turn_anim()
         self._stop_killer_turn_anim()
+        grid = getattr(self, "_tv_cards", None)
+        if grid is not None:
+            grid.clear_cards()
+            self._tv_cards = None
         # Stop score countdown/halve anims before deleteLater (deferred destroy).
         for card in list(self._x01_cards_by_pi.values()):
             card.reset_score_display()
@@ -7492,6 +10017,7 @@ class MainWindow(QMainWindow):
         self._cricket_rows_by_pi = {}
         self._cricket_hdr = None
         self._cricket_round_lab = None
+        self._count_up_round_lab = None
         self._cricket_last_active_pi = None
         self._killer_rows_by_pi = {}
         self._killer_hdr = None
@@ -8012,7 +10538,7 @@ class MainWindow(QMainWindow):
                 card.deleteLater()
 
         prev_active = self._x01_last_active_pi
-        will_anim = (
+        will_anim = _TURN_CARD_ANIMATIONS and (
             prev_active is not None
             and prev_active != active_pi
             and n > 1
@@ -8048,7 +10574,8 @@ class MainWindow(QMainWindow):
             and set(self._x01_cards_by_pi.keys()) == keep_pis
             and getattr(self, "_x01_last_waiting_pis", None) == waiting_pis_expected
             and getattr(self, "_x01_last_finished_pis", None) == finished_pis_expected
-            and self.score_box.indexOf(self._x01_cards_by_pi.get(active_pi)) == 0
+            and self.score_box.indexOf(self._x01_cards_by_pi.get(active_pi))
+            == (1 if self._count_up_round_lab is not None else 0)
         )
         if structure_stable:
             active_card = self._x01_cards_by_pi[active_pi]
@@ -8275,6 +10802,23 @@ class MainWindow(QMainWindow):
             self._cricket_rows_by_pi[pi] = row
         return row
 
+    def _sync_count_up_round_label(self, snap: dict, rules: dict) -> None:
+        limit = int(rules.get("count_up_rounds", 8) or 8)
+        current = min(int(snap.get("round_number", 1) or 1), limit)
+        txt = f"{get_settings().t('round')}: {current}/{limit}"
+        if self._count_up_round_lab is None:
+            self._count_up_round_lab = QLabel(txt)
+            self._count_up_round_lab.setObjectName("RoundLabel")
+            self._count_up_round_lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        else:
+            self._count_up_round_lab.setText(txt)
+        current_index = self.score_box.indexOf(self._count_up_round_lab)
+        if current_index != 0:
+            if current_index >= 0:
+                self.score_box.removeWidget(self._count_up_round_lab)
+            self.score_box.insertWidget(0, self._count_up_round_lab)
+        self._count_up_round_lab.raise_()
+
     def _cricket_ensure_header(self, *, show_pts: bool, snap: dict, rules: dict) -> None:
         if rules.get("max_rounds_20"):
             lim = int(rules.get("max_rounds_limit", 20))
@@ -8308,7 +10852,7 @@ class MainWindow(QMainWindow):
                 h.setAlignment(Qt.AlignCenter)
                 h.setFixedWidth(MarkStack.COL_W)
                 h.setStyleSheet(
-                    "font-size: 40px; font-weight: 800; color: #d0d0d8; padding-right: 4px;"
+                    "font-size: 40px; font-weight: 800; color: #d0d0d8; padding: 0px;"
                 )
                 hdr_row.addWidget(h, 0)
             hdr_row.addStretch(1)
@@ -8599,13 +11143,13 @@ class MainWindow(QMainWindow):
         active_i = next((i for i, p in enumerate(players) if p.get("active")), 0)
         active_pi = int(players[active_i].get("index", active_i))
         prev_active = self._cricket_last_active_pi
-        active_changed = (
+        active_changed = _TURN_CARD_ANIMATIONS and (
             prev_active is not None
             and int(prev_active) != int(active_pi)
             and not bool(snap.get("turn_anim_reverse"))
         )
         # Undo: also animate border (incoming = prev, outgoing = current).
-        undo_border = (
+        undo_border = _TURN_CARD_ANIMATIONS and (
             prev_active is not None
             and int(prev_active) != int(active_pi)
             and bool(snap.get("turn_anim_reverse"))
@@ -8790,7 +11334,8 @@ class MainWindow(QMainWindow):
     def _killer_player_finished(p: dict) -> bool:
         # Dead = eliminated (0 lives). Winner keeps lives > 0 and must NOT get
         # strike-X / finished chrome even when placements assign them rank #1.
-        return int(p.get("lives") or 0) <= 0
+        lives = p.get("lives")
+        return lives is not None and int(lives) <= 0
 
     def _stop_killer_turn_anim(self) -> None:
         if self._killer_turn_anim is not None:
@@ -9274,7 +11819,7 @@ class MainWindow(QMainWindow):
                 row.deleteLater()
 
         prev_active = self._killer_last_active_pi
-        will_anim = (
+        will_anim = _TURN_CARD_ANIMATIONS and (
             prev_active is not None
             and prev_active != active_pi
             and n > 1
@@ -9302,7 +11847,7 @@ class MainWindow(QMainWindow):
             for p in finished_display
             if int(p.get("index", -1)) >= 0
             and int(p.get("index", -1)) not in prev_finished
-        }
+        } if _TURN_CARD_ANIMATIONS else set()
 
         starts: Dict[int, QRect] = {}
         pixmaps: Dict[int, QPixmap] = {}
@@ -9685,10 +12230,13 @@ class MainWindow(QMainWindow):
             old_tag = self._hit_tags_prev[i] if i < len(self._hit_tags_prev) else "-"
             b.setText(new_tag)
             b.setEnabled(bool(enabled[i]))
-            _style_hit_btn(b, new_tag, font_px=128)
+            _style_hit_btn(b, new_tag, font_px=176 if self._spectator else 128)
             if new_tag != old_tag:
-                b.repaint()
-                if new_tag != "-":
+                # Let the event loop paint the complete TV snapshot at once;
+                # synchronous repaint exposed a partial one-frame hit update.
+                if not self._spectator:
+                    b.repaint()
+                if new_tag != "-" and not self._spectator:
                     self._animate_hit(i)
         if hasattr(self, "manual_hit_btns"):
             editing_slot = snap.get("editing_hit_slot")
@@ -9803,7 +12351,8 @@ class MainWindow(QMainWindow):
                     lab.setStyleSheet(
                         f"font-size: {font_px}px; font-weight: 900; color: {fg};"
                     )
-                    self._start_winner_pulse(lab)
+                    if not self._spectator:
+                        self._start_winner_pulse(lab)
                 else:
                     lab.setObjectName("WinnerSub")
                     lab.setStyleSheet(
@@ -9967,9 +12516,9 @@ class MainWindow(QMainWindow):
             self.live_stack.show()
         self.undo_btn.show()
         if hasattr(self, "mode_toggle_btn"):
-            self.mode_toggle_btn.show()
+            self.mode_toggle_btn.setVisible(not snap.get("manual_only"))
         if hasattr(self, "play_cal_btn"):
-            self.play_cal_btn.show()
+            self.play_cal_btn.setVisible(not snap.get("manual_only"))
         self.action_stack.show()
         self.exit_btn.setText("X")
         self.exit_btn.setObjectName("PlayExit")
@@ -9993,7 +12542,17 @@ class MainWindow(QMainWindow):
         players = snap.get("players") or []
         rules = snap.get("rules") or {}
 
-        if mode == "cricket":
+        if self._spectator:
+            from spectator_cards import SpectatorCards
+            if getattr(self, "_tv_cards", None) is None:
+                self._tv_cards = SpectatorCards()
+                self.score_box.setAlignment(Qt.AlignmentFlag(0))
+                self.score_box.setSpacing(0)
+                self.score_box.addWidget(self._tv_cards, 1)
+            self._tv_cards.update_snapshot(snap)
+            if mode == "count_up":
+                self._sync_count_up_round_label(snap, rules)
+        elif mode == "cricket":
             self._sync_cricket_rows(players, rules, snap)
         elif mode == "killer":
             self._sync_killer_rows(players, snap)
@@ -10002,6 +12561,8 @@ class MainWindow(QMainWindow):
             known = set(self._x01_cards_by_pi.values())
             if self._x01_waiting_wrap is not None:
                 known.add(self._x01_waiting_wrap)
+            if self._count_up_round_lab is not None:
+                known.add(self._count_up_round_lab)
             for i in range(self.score_box.count()):
                 w = self.score_box.itemAt(i).widget()
                 if w is not None and w not in known:
@@ -10012,6 +12573,8 @@ class MainWindow(QMainWindow):
                 reverse=bool(snap.get("turn_anim_reverse")),
                 around_mode=mode in ("around", "around_the_world"),
             )
+            if mode == "count_up":
+                self._sync_count_up_round_label(snap, rules)
 
         if mode == "killer":
             # Lives are on the cards — hide under-card roster / suggest area.
@@ -10125,6 +12688,19 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
         except AttributeError:
             pass
     app = QApplication(sys.argv)
+    led_ring_setup_low()
+    # labwc can start the kiosk before the Pi GPIO backend is ready. Retrying
+    # preserves the latest requested HIGH/LOW state, so it is safe if a game
+    # starts while these delayed attempts are pending.
+    for delay_ms in (1000, 3000, 8000, 15000):
+        QTimer.singleShot(delay_ms, led_ring_retry)
+    app.aboutToQuit.connect(led_ring_shutdown)
+    from spectator_display import control_screen_name
+
+    control_name = control_screen_name()
+    startup_screen = next(
+        (s for s in app.screens() if s.name() == control_name), app.primaryScreen()
+    )
     app.setStyle("Fusion")
     # Touchscreen: bez sticky hover highlighta
     app.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents, True)
@@ -10154,7 +12730,7 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
                 Qt.KeepAspectRatioByExpanding,
                 _PIXMAP_TRANSFORM,
             )
-        splash = QSplashScreen(splash_pm)
+        splash = QSplashScreen(startup_screen, splash_pm)
         splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         if kiosk:
             splash.showFullScreen()
@@ -10184,7 +12760,7 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
 
     mqtt_client = None
     start_mode = get_settings().start_mode
-    # button/always_on: ne blokiraj boot na MQTT (do ~2.5s).
+    # Local START mode does not block boot on an MQTT connection.
     if start_mode == "mqtt_qr":
         try:
             import ssl
@@ -10214,6 +12790,7 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
         app.processEvents()
 
     win = MainWindow(session)
+    app.aboutToQuit.connect(win._tournament_shutdown_cleanup)
     win._mqtt_client = mqtt_client
     win._mqtt_bridge = bridge
 
@@ -10226,9 +12803,14 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
     def _on_cmd(cmd: str) -> None:
         # MQTT 'on' budi select_game samo u mqtt_qr načinu.
         if cmd == "on":
-            if get_settings().start_mode == "mqtt_qr":
+            if get_settings().start_mode == "mqtt_qr" and session.screen == "standby":
                 session.mqtt_wake()
         elif cmd == "off":
+            # QR sustav smije prekinuti igru. Otpusti eventualno zauzeti
+            # turnirski meč kako ostale ploče ne bi ostale zaključane.
+            if getattr(win, "_tournament_match", None):
+                win._cancel_tournament_match()
+            session.state.pop("_tournament_active", None)
             session.clear_to_standby(mqtt_off=False)
         win._last_ui_sig = None
         win.refresh()
@@ -10237,12 +12819,23 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
 
     if kiosk:
         win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        if control_name and startup_screen is not None:
+            win._control_screen = startup_screen
+            win.winId()
+            win.windowHandle().setScreen(startup_screen)
+            if not app.platformName().startswith("wayland"):
+                win.setGeometry(startup_screen.geometry())
         win.showFullScreen()
         win._lock_kiosk_display(force=True)
         app.installEventFilter(win)
     else:
         win.resize(1280, 720)
         win.show()
+
+    if kiosk:
+        from spectator_display import SpectatorDisplay
+
+        win._spectator_display = SpectatorDisplay(win)
 
     if splash is not None:
         splash.finish(win)
@@ -10253,6 +12846,7 @@ def run_qt_app(*, kiosk: bool = False, fake_cams_dir: Optional[str] = None) -> i
     win.refresh()
 
     code = app.exec()
+    led_ring_shutdown()
 
     try:
         if mqtt_client is not None:

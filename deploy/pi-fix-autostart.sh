@@ -19,7 +19,7 @@ fi
 if ! ./venv/bin/python -c "import cv2, PySide6" 2>/dev/null; then
   ./venv/bin/pip install -r requirements.txt
 fi
-exec ./venv/bin/python main_manual.py --gui --kiosk "$@"
+exec ./venv/bin/python main_manual.py --gui --kiosk --fitline "$@"
 EOF
 chmod +x "$APP/run.sh"
 

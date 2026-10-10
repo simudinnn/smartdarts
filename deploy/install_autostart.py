@@ -70,7 +70,7 @@ if [ ! -x "venv/bin/python" ]; then
   ./venv/bin/pip install -r requirements.txt
 fi
 
-if ! ./venv/bin/python -c "import cv2, PySide6" 2>/dev/null; then
+if ! ./venv/bin/python -c "import cv2, PySide6, gpiozero, paho.mqtt.client, qrcode" 2>/dev/null; then
   echo "[smartdarts] installing requirements..." | tee -a "$LOG"
   ./venv/bin/pip install -r requirements.txt
 fi
@@ -82,11 +82,24 @@ export QT_WAYLAND_DISABLE_WINDOWDECORATION="${{QT_WAYLAND_DISABLE_WINDOWDECORATI
 export QT_OPENGL="${{QT_OPENGL:-es2}}"
 export QT_QPA_EGLFS_INTEGRATION="${{QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}}"
 
+# Očisti turnirski AP/klijent i nakon nasilnog gašenja prethodne instance.
+# Tako je internet vraćen prije pokretanja MQTT pretplatnika aplikacije.
+if command -v nmcli >/dev/null 2>&1; then
+  nmcli connection down smartdarts-tournament-hotspot >/dev/null 2>&1 || true
+  nmcli connection down smartdarts-tournament-client >/dev/null 2>&1 || true
+  nmcli connection delete smartdarts-tournament-hotspot >/dev/null 2>&1 || true
+  nmcli connection delete smartdarts-tournament-client >/dev/null 2>&1 || true
+  nmcli networking on >/dev/null 2>&1 || true
+  nmcli radio wifi on >/dev/null 2>&1 || true
+  nmcli device set wlan0 managed yes >/dev/null 2>&1 || true
+  nmcli --wait 20 device connect wlan0 >/dev/null 2>&1 || true
+fi
+
 # Direktno python — ne ovisi o run.sh line endings
 if [ -t 1 ]; then
-  exec ./venv/bin/python main_manual.py --gui --kiosk "$@"
+  exec ./venv/bin/python main_manual.py --gui --kiosk --fitline "$@"
 fi
-exec ./venv/bin/python main_manual.py --gui --kiosk "$@" >>"$LOG" 2>&1
+exec ./venv/bin/python main_manual.py --gui --kiosk --fitline "$@" >>"$LOG" 2>&1
 """
 
 
@@ -146,8 +159,14 @@ def _splash_image() -> Path | None:
 
 
 def main() -> int:
-    if not (APP_DIR / "main_manual.py").is_file():
-        print(f"ERROR: nema main_manual.py u {APP_DIR}", file=sys.stderr)
+    required_files = ("main_manual.py", "qt_ui.py", "kiosk_session.py", "tournament.py")
+    missing = [name for name in required_files if not (APP_DIR / name).is_file()]
+    if missing:
+        print(
+            f"ERROR: nedostaju datoteke nove verzije u {APP_DIR}: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        print("Prenesi cijeli smartdarts folder, ne samo pojedine datoteke.", file=sys.stderr)
         return 1
 
     print(f"APP_DIR = {APP_DIR}")
@@ -212,7 +231,8 @@ exec python3 "$DIR/install_splash.py" "$@"
         print(f"  sudo python3 {APP_DIR / 'deploy' / 'install_splash.py'}")
     print("  Zatim:   sudo reboot")
     print()
-    print("Update foldera: ne treba ponovo install (osim nove putanje).")
+    print("Nakon prelaska sa stare verzije pokreni ovaj installer još jednom.")
+    print("Za kasnije obične nadogradnje iste instalacije dovoljno je zamijeniti cijeli folder.")
     return 0
 
 

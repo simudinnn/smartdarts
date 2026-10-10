@@ -12,31 +12,41 @@ import cv2
 import numpy as np
 
 from board_calibration import BoardCalibrator
+from camera_capture_config import (
+    CAPTURE_FPS,
+    CAPTURE_HEIGHT,
+    CAPTURE_WIDTH,
+    open_limited_camera,
+)
 
 # UVC na Linuxu: video0/2/4 = capture; 1/3/5 = metadata (nije capture → hang).
 CAMERA_INDICES: Tuple[int, ...] = (0, 2, 4)
 CAMERA_LABELS: Tuple[str, ...] = ("Kamera 0", "Kamera 2", "Kamera 4")
-CALIBRATION_FPS = 15
+CALIBRATION_FPS = CAPTURE_FPS
 CALIBRATION_FRAME_INTERVAL = 1.0 / CALIBRATION_FPS
 
 # Live preview / detekcija: niska rezolucija da Pi izdrži 3 USB kamere.
-# Veća točnost kalibracije ide softverskim 2× upscaleom u calibrate_board —
-# NE native 640 (USB renegotiation smrzava 3 kamere).
-CAPTURE_WIDTH = 320
-CAPTURE_HEIGHT = 240
+# USB feed ostaje normaliziran na 320x240. Kalibracija može softverski povećati
+# samo kopiju jednog kadra; nikad ne mijenja hardware format kamere.
 _CAPTURE_LOOP_SLEEP_SEC = 0.05
 
 
 def normalize_capture_frame(frame: np.ndarray) -> np.ndarray:
-    """Soft resize na 320x240 — ne dira hardware format/exposure."""
+    """Soft scale into the capture canvas without changing aspect ratio."""
     if frame is None or frame.size == 0:
         return frame
     h, w = frame.shape[:2]
     if int(w) == CAPTURE_WIDTH and int(h) == CAPTURE_HEIGHT:
         return frame
-    return cv2.resize(
-        frame, (CAPTURE_WIDTH, CAPTURE_HEIGHT), interpolation=cv2.INTER_AREA
-    )
+    scale = min(float(CAPTURE_WIDTH) / float(w), float(CAPTURE_HEIGHT) / float(h))
+    dst_w = max(1, min(CAPTURE_WIDTH, int(round(float(w) * scale))))
+    dst_h = max(1, min(CAPTURE_HEIGHT, int(round(float(h) * scale))))
+    resized = cv2.resize(frame, (dst_w, dst_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((CAPTURE_HEIGHT, CAPTURE_WIDTH, frame.shape[2]), dtype=frame.dtype)
+    x0 = (CAPTURE_WIDTH - dst_w) // 2
+    y0 = (CAPTURE_HEIGHT - dst_h) // 2
+    canvas[y0:y0 + dst_h, x0:x0 + dst_w] = resized
+    return canvas
 
 
 def _open_camera(index: int) -> Optional[cv2.VideoCapture]:
@@ -45,17 +55,10 @@ def _open_camera(index: int) -> Optional[cv2.VideoCapture]:
     Feed se ionako soft-resizea na 320x240. Ne forsira fourcc/exposure.
     Ako postoji camera_controls.json (iz camera_controls.py), primijeni spremljene V4L2 kontrole.
     """
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap.release()
-        cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
+    cap = open_limited_camera(index)
+    if cap is None:
         print(f"[cam] OPEN FAIL index={index}", flush=True)
         return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FPS, CALIBRATION_FPS)
     try:
         from camera_controls import apply_saved_controls
 
@@ -67,10 +70,32 @@ def _open_camera(index: int) -> Optional[cv2.VideoCapture]:
     actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
     fourcc_text = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4))
+    # isOpened() only means that /dev/videoX was acquired.  Validate that the
+    # negotiated UVC mode actually produces pixels before publishing OPEN OK.
+    first_ok = False
+    first_shape = ""
+    for _ in range(12):
+        try:
+            ok, probe = cap.read()
+        except Exception:
+            ok, probe = False, None
+        if ok and probe is not None and probe.size:
+            first_ok = True
+            first_shape = f"{probe.shape[1]}x{probe.shape[0]}"
+            break
+        time.sleep(0.04)
+    if not first_ok:
+        print(
+            f"[cam] STREAM FAIL index={index} prop={prop_w}x{prop_h} "
+            f"@ {actual_fps:.1f} FPS, {fourcc_text}",
+            flush=True,
+        )
+        if cap is not None:
+            cap.release()
+        return None
     print(
-        f"[cam] OPEN OK index={index} "
-        f"prop={prop_w}x{prop_h} @ {actual_fps:.1f} FPS, {fourcc_text} "
-        f"(soft->{CAPTURE_WIDTH}x{CAPTURE_HEIGHT})",
+        f"[cam] OPEN OK index={index} frame={first_shape} "
+        f"@ {actual_fps:.1f} FPS, {fourcc_text}",
         flush=True,
     )
     return cap
@@ -198,6 +223,7 @@ class CameraManager:
         self._thread: Optional[threading.Thread] = None
         self._flush_request = 0
         self._open_done = False
+        self._read_failures: Dict[int, int] = {i: 0 for i in CAMERA_INDICES}
 
     @property
     def active(self) -> bool:
@@ -211,6 +237,11 @@ class CameraManager:
         """Pokreni capture nit. Za kalibraciju zovi wait_for_frames() prije prvog crtanja."""
         if self._active:
             return
+        retiring = self._thread
+        if retiring is not None and retiring.is_alive():
+            # A slow UVC read from the previous screen is still unwinding.
+            # ensure_cameras() retries start on the next UI tick.
+            return
         self._active = True
         self._open_done = False
         with self._lock:
@@ -219,7 +250,8 @@ class CameraManager:
             self._start_fake()
             self._open_done = True
             return
-        print("[cam] start (open 0/2/4)...", flush=True)
+        requested = "/".join(str(i) for i in CAMERA_INDICES)
+        print(f"[cam] start (open {requested})...", flush=True)
         self._thread = threading.Thread(
             target=self._capture_loop, name="cam-capture", daemon=True
         )
@@ -302,8 +334,23 @@ class CameraManager:
         except Exception as exc:
             print(f"[cam] capture loop ERR: {exc}", flush=True)
         finally:
+            self._release_caps()
             self._open_done = True
+            if self._thread is threading.current_thread():
+                self._thread = None
             print("[cam] capture loop exit", flush=True)
+
+    def _release_caps(self) -> None:
+        caps = list(self._caps.values())
+        self._caps.clear()
+        for cap in caps:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+        with self._lock:
+            self._latest = {i: None for i in CAMERA_INDICES}
 
     def _publish_from_caps(self, *, flush: int = 0) -> None:
         frames: Dict[int, Optional[np.ndarray]] = {}
@@ -319,8 +366,25 @@ class CameraManager:
                     ok, frame = False, None
                 if ok and frame is not None:
                     frames[idx] = normalize_capture_frame(frame)
+                    self._read_failures[idx] = 0
                 else:
                     frames[idx] = None
+                    failures = int(self._read_failures.get(idx, 0)) + 1
+                    self._read_failures[idx] = failures
+                    if failures == 1:
+                        print(f"[cam] READ FAIL index={idx}; cekam stream", flush=True)
+                    elif failures >= 12 and self._active:
+                        print(f"[cam] stream index={idx} ne daje frame; ponovno otvaram", flush=True)
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        try:
+                            self._caps[idx] = _open_camera(idx)
+                        except Exception as exc:
+                            print(f"[cam] REOPEN ERR index={idx}: {exc}", flush=True)
+                            self._caps[idx] = None
+                        self._read_failures[idx] = 0
             else:
                 frames[idx] = None
         with self._lock:
@@ -331,19 +395,18 @@ class CameraManager:
         self._open_done = False
         t = self._thread
         if t is not None and t.is_alive() and t is not threading.current_thread():
-            t.join(timeout=8.0)
-        self._thread = None
-        for cap in list(self._caps.values()):
-            if cap is not None:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-        self._caps.clear()
+            # Normal 15 FPS read exits within one or two frames. Never freeze a
+            # page transition for seconds if a broken USB device blocks read().
+            t.join(timeout=0.25)
+        # The capture thread owns VideoCapture and releases it in finally.
+        # Never release a device from the UI thread while cap.read() is active.
+        if t is not None and t.is_alive():
+            print("[cam] stop timeout; capture nit ce osloboditi kamere", flush=True)
+        else:
+            self._thread = None
+            self._release_caps()
         self._fake_hits = []
         self._fake_hit_index = -1
-        with self._lock:
-            self._latest = {i: None for i in CAMERA_INDICES}
 
     def frames_ready_count(self) -> int:
         with self._lock:
@@ -437,11 +500,17 @@ class CameraManager:
             return {i: (None if f is None else f.copy()) for i, f in self._latest.items()}
 
     def opened_indices(self) -> List[int]:
-        return [
-            idx
-            for idx in CAMERA_INDICES
-            if self._caps.get(idx) is not None and self._caps[idx].isOpened()
-        ]
+        opened: List[int] = []
+        for idx in CAMERA_INDICES:
+            cap = self._caps.get(idx)
+            if cap is None:
+                continue
+            try:
+                if cap.isOpened():
+                    opened.append(idx)
+            except Exception:
+                continue
+        return opened
 
     def status_text(self) -> str:
         ok_count = sum(

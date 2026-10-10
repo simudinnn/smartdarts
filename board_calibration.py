@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from compact_log import print
+
 import json
 import math
 import os
@@ -64,8 +66,10 @@ HOMOGRAPHY_RING_MAX_DEV_PX = 5.0
 BOARD_SISAL_EDGE_FRAC = 225.0 / 170.0
 DOUBLE_RING_SAMPLE_INNER = 1
 DOUBLE_RING_SAMPLE_OUTER = 1
-# Kalibracija: privremeni upscale kad je capture mali (tanki double bolje vidljiv).
-CALIBRATE_UPSCALE_IF_MIN_DIM_LT = 400
+# Kamera i USB stream ostaju 320x240. Samo jedan već snimljeni kadar privremeno
+# povećaj u RAM-u radi preciznijih maski, elipse i žica; rezultat se na kraju
+# skalira natrag u izvorne 320x240 koordinate.
+CALIBRATE_UPSCALE_IF_MIN_DIM_LT = 300
 CALIBRATE_UPSCALE = 2
 CALIBRATION_BLEND_ALPHA = 0.28
 # Max bull shift (px / frame-diag fraction) for soft recover / stabilize.
@@ -85,7 +89,7 @@ SEG20_OVERLAY_ALPHA = 0.60
 SEG20_LEFT_WIRE_DST_DEG = (360.0 - SEGMENT_STEP_DEG * 0.5) % 360.0
 DEBUG_WARP_SIZE = 200
 # Must match dart_detection.FITLINE_SIZE — scoring theta/rings/wires live here.
-FINAL_GEOM_DEBUG_SIZE = 300
+FINAL_GEOM_DEBUG_SIZE = 200
 EDGE_REFINE_RANGE_DEG = 6.0
 EDGE_REFINE_STEP_DEG = 0.5
 CANNY_LOW = 40
@@ -264,7 +268,16 @@ def save_calibration_input_snapshot(
             continue
         path = os.path.join(d, f"input_cam{cam_i}.png")
         try:
-            cv2.imwrite(path, frame)
+            save_frame = frame
+            fh, fw = frame.shape[:2]
+            scale = min(1.0, 320.0 / float(max(1, fw)), 240.0 / float(max(1, fh)))
+            if scale < 1.0:
+                save_frame = cv2.resize(
+                    frame,
+                    (max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            cv2.imwrite(path, save_frame)
         except Exception:
             continue
     for hk, hv in (bull_hints or {}).items():
@@ -5678,7 +5691,13 @@ def calibrate_board(
         if p is None or len(p) < 2:
             continue
         hint_pts_up.append((float(p[0]) * upscale, float(p[1]) * upscale))
-    hint_ell = _ellipse_from_hint_points(hint_pts_up, min_dim) if len(hint_pts_up) >= 3 else None
+    # Ručne točke su samo približna smjernica. Prihvati i grublje postavljenu
+    # elipsu; detekcija boja i žica je zatim sama precizira.
+    hint_ell = (
+        _ellipse_from_hint_points(hint_pts_up, min_dim, strict=False)
+        if len(hint_pts_up) >= 3
+        else None
+    )
 
     # 1) Najveća R/G elipsa ploce (gdje god u kadru) → 2) bull SAMO unutar nje.
     # Ručne točke vanjske elipse: maskiraj surround (npr. crvena spužva).
@@ -5724,7 +5743,9 @@ def calibrate_board(
         green_rx = cv2.morphologyEx(green_rx, cv2.MORPH_OPEN, kernel)
         green_rx = cv2.morphologyEx(green_rx, cv2.MORPH_CLOSE, kernel)
 
-        for frac in (0.25, 0.35, 0.42):
+        # Start close to the manual guide. The old 0.25..0.42 search could
+        # include the triple ring and let it beat the real bull.
+        for frac in (0.10, 0.16, 0.23):
             radius = max(36.0, min_dim * frac)
             roi = _hint_roi_mask((h, w), hint_xy, radius)
             # Unmasked full-frame colors in ROI first (board_guess can wipe true bull).
@@ -5875,10 +5896,62 @@ def calibrate_board(
             print(f"[cal] {cam_tag} bull hint failed (no candidate)", flush=True)
         return None
 
+    if hint_xy is not None:
+        detected_center, detected_r, detected_conf = bull_hit
+        # Bull klik je smjernica, ne stroga koordinata. Veća tolerancija dopušta
+        # stvarnom R/G bull kandidatu da pobijedi i kod grubog dodira prstom.
+        guide_limit = max(18.0 * upscale, min_dim * 0.15)
+        guide_dist = math.hypot(
+            float(detected_center[0]) - float(hint_xy[0]),
+            float(detected_center[1]) - float(hint_xy[1]),
+        )
+        if guide_dist > guide_limit:
+            # The guide is approximate, but a candidate outside its local area
+            # is usually triple/surround colour. Use the click only as a final
+            # seed rather than accepting that distant false bull.
+            bull_hit = (
+                (float(hint_xy[0]), float(hint_xy[1])),
+                float(detected_r),
+                max(0.30, min(0.55, float(detected_conf))),
+            )
+            print(
+                f"[cal] {cam_tag} bull candidate rejected outside guide "
+                f"({guide_dist / upscale:.1f}px)",
+                flush=True,
+            )
+
     center, bull_r, bull_conf = bull_hit
+    ellipse_red, ellipse_green = red, green
+    if hint_ell is not None:
+        # Search only in a generous band around the approximate outer-double
+        # guide. This excludes triple pixels inside and surround/number pixels
+        # outside while still allowing image detection to refine the ellipse.
+        outer_mask = _board_ellipse_mask((h, w), hint_ell, shrink=1.32)
+        inner_mask = _board_ellipse_mask((h, w), hint_ell, shrink=0.58)
+        guide_band = cv2.bitwise_and(outer_mask, cv2.bitwise_not(inner_mask))
+        ellipse_red = cv2.bitwise_and(red, red, mask=guide_band)
+        ellipse_green = cv2.bitwise_and(green, green, mask=guide_band)
     ellipse, board_conf = _detect_double_ellipse(
-        red, green, center, bull_r, min_dim, extra_points=hint_pts_up or None
+        ellipse_red,
+        ellipse_green,
+        center,
+        bull_r,
+        min_dim,
+        extra_points=hint_pts_up or None,
     )
+    if hint_ell is not None and ellipse is not None:
+        hint_semi = _ellipse_mean_semi(hint_ell)
+        found_semi = _ellipse_mean_semi(ellipse)
+        hc = _ellipse_center(hint_ell)
+        fc = _ellipse_center(ellipse)
+        centre_delta = math.hypot(hc[0] - fc[0], hc[1] - fc[1])
+        ratio = found_semi / max(hint_semi, 1.0)
+        if centre_delta > hint_semi * 0.35 or not 0.60 <= ratio <= 1.45:
+            ellipse = _refine_ellipse_to_outer_double(
+                hint_ell, center, bull_r, ellipse_red, ellipse_green
+            )
+            board_conf = max(0.45, float(board_conf))
+            print(f"[cal] {cam_tag} distant ellipse rejected outside guide", flush=True)
     if ellipse is None and board_guess is not None:
         # Ako classic double-fit padne, koristi najveću RG elipsu (bez outside-scale).
         ellipse = board_guess
@@ -7222,6 +7295,10 @@ class BoardCalibrator:
     ) -> Dict[int, Optional[np.ndarray]]:
         """Stage2 topdown warp + overlay (segment fill + prsteni/žice) za sve kamere."""
         out: Dict[int, Optional[np.ndarray]] = {}
+        # Detection stays in its established 200x200 coordinate system.  The
+        # one-camera calibration preview may use the available source detail
+        # instead of enlarging a 200x200 image across the touchscreen.
+        preview_size = 720 if os.environ.get("SMARTDARTS_SINGLE_CAMERA") == "1" else DEBUG_WARP_SIZE
         for cam_idx, frame in frames.items():
             if frame is None:
                 out[cam_idx] = None
@@ -7230,7 +7307,7 @@ class BoardCalibrator:
             if cal is None or not cal.is_valid():
                 out[cam_idx] = frame
                 continue
-            warped = self.warp_topdown(int(cam_idx), frame, out_size=DEBUG_WARP_SIZE)
+            warped = self.warp_topdown(int(cam_idx), frame, out_size=preview_size)
             if warped is None:
                 out[cam_idx] = frame
                 continue

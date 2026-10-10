@@ -45,7 +45,6 @@ BTN_PRESETS: List[Tuple[str, str]] = [
 START_MODES: List[Tuple[str, str]] = [
     ("mqtt_qr", "start_mqtt_qr"),
     ("button", "start_button"),
-    ("always_on", "start_always"),
 ]
 
 # League QR <device> field — one kiosk per Pi.
@@ -1552,6 +1551,8 @@ class KioskSettings:
     ml_tip_save_dataset: bool = False
     # When True, playing screen keeps keypad always visible (manual scoring).
     manual_mode: bool = False
+    # Installation mode. Manual games never require cameras or permit AUTO.
+    input_mode: str = "auto"
     # When True, recalibrate board on "PLOČA JE PRAZNA" before each game.
     auto_calibrate: bool = True
     # League QR device id (no pipe). Matches Pi: pikado-1 / pikado-2 / pikado-3.
@@ -1672,6 +1673,7 @@ def load_settings() -> KioskSettings:
         fitline_scale=float(fl_scale),
         ml_tip_save_dataset=ds_save,
         manual_mode=manual_on,
+        input_mode="manual" if data.get("input_mode") == "manual" else "auto",
         auto_calibrate=auto_cal,
         device_id=sanitize_device_id(
             data["device_id"] if "device_id" in data else _default_device_id()
@@ -1680,7 +1682,8 @@ def load_settings() -> KioskSettings:
     )
     if s.language not in _I18N:
         s.language = "hr"
-    if s.start_mode not in ("mqtt_qr", "button", "always_on"):
+    # "always_on" was removed; migrate existing installations to local START.
+    if s.start_mode not in ("mqtt_qr", "button"):
         s.start_mode = "button"
     if not s.device_id:
         s.device_id = _default_device_id()
@@ -1738,6 +1741,8 @@ def update_settings(**kwargs: Any) -> KioskSettings:
     for k, v in kwargs.items():
         if hasattr(s, k) and v is not None:
             setattr(s, k, v)
+    if "start_mode" in kwargs and s.start_mode not in ("mqtt_qr", "button"):
+        s.start_mode = "button"
     if "fitline_scale" in kwargs and kwargs["fitline_scale"] is not None:
         try:
             fl = float(s.fitline_scale)
